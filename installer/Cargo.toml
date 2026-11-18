@@ -1,0 +1,16 @@
+[package]
+name = "am-light-setup"
+version = "0.2.0"
+edition = "2021"
+description = "Native Windows installer and uninstaller for AM Light"
+
+[[bin]]
+name = "AM-Light-Setup"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

@@ -1,0 +1,16 @@
+# Build & runtime outputs (keep c_proxy/amp_proxy.dll tracked; ignore root runtime copy)
+/AM-Light.exe
+/amp_proxy.dll
+/dist/
+/target/
+/installer/target/
+*.pdb
+*.lib
+*.exp
+
+# Local workspace / agent metadata & shortcuts
+/.agents/
+/GEMINI.md
+/*.lnk
+*.etl
+*.log

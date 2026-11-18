@@ -1,0 +1,144 @@
+import "unknwn.idl";
+import "inspectable.idl";
+import "hstring.idl";
+import "eventtoken.idl";
+
+typedef [v1_enum] enum AMPLibraryAppKinds {
+    AMPLibraryAppKind_Music = 1,
+    AMPLibraryAppKind_TV = 2
+} AMPLibraryAppKinds;
+
+typedef [v1_enum] enum AMPLibraryMediaDomains {
+    AMPLibraryMediaDomainsNone = 0,
+    AMPLibraryMediaDomainsMusic = 1,
+    AMPLibraryMediaDomainsTVAndMovies = 2,
+    AMPLibraryMediaDomainsWinAll = 3,
+    AMPLibraryMediaDomainsPodcasts = 4,
+    AMPLibraryMediaDomainsBooks = 8,
+    AMPLibraryMediaDomainsAll = 15
+} AMPLibraryMediaDomains;
+
+typedef [v1_enum] enum AMPLibraryState {
+    eUnknown = 0,
+    eSetup = 1,
+    eStarting = 2,
+    eStarted = 3,
+    eStopping = 4,
+    eStopped = 5,
+    eShutdown = 6
+} AMPLibraryState;
+
+typedef struct RegisterClientResult {
+    UINT32 clientID;
+    UINT64 persistentMachineID;
+    INT32 status;
+} RegisterClientResult;
+
+[object, uuid(3e1fe603-f897-5263-b328-0806426b8a79), pointer_default(unique)]
+interface IAsyncOperation_HSTRING : IInspectable {
+}
+
+[object, uuid(0a180672-967f-5b4e-9d67-8146d1200522), pointer_default(unique)]
+interface IActvityStateEventDelegate : IUnknown {
+    HRESULT Invoke([in] HSTRING stateDict);
+}
+
+[object, uuid(6f89c3b3-0c25-50c5-beca-3d5086210e34), pointer_default(unique)]
+interface IBusyChangedEventDelegate : IUnknown {
+    HRESULT Invoke([in] boolean busy);
+}
+
+[object, uuid(c4c9de7b-de44-59db-9805-54686c6dc298), pointer_default(unique)]
+interface ICloudLibraryEventDelegate : IUnknown {
+    HRESULT Invoke([in] HSTRING eventDict);
+}
+
+[object, uuid(897b3128-5d81-4bd0-8a53-7bb9eed8346a), pointer_default(unique)]
+interface IDeviceEventDelegate : IUnknown {
+    HRESULT Invoke([in] HSTRING eventDict);
+}
+
+[object, uuid(e9ae66d5-042e-5058-beaa-1355425c739a), pointer_default(unique)]
+interface IFetchInvalidationEventDelegate : IUnknown {
+    HRESULT Invoke([in] HSTRING invalidationDict);
+}
+
+[object, uuid(7923015c-75c0-5732-86cc-ab09c471a674), pointer_default(unique)]
+interface ILibraryEventDelegate : IUnknown {
+    HRESULT Invoke([in] HSTRING eventDict);
+}
+
+[object, uuid(e4712eb5-60a2-513d-b6e9-71c0ed973e52), pointer_default(unique)]
+interface ILibraryRevisionChangedEventDelegate : IUnknown {
+    HRESULT Invoke([in] UINT32 newRevision);
+}
+
+[object, uuid(f0e209be-7fb1-5e1e-9879-b622ae7cca41), pointer_default(unique)]
+interface IPlaybackEventDelegate : IUnknown {
+    HRESULT Invoke([in] UINT32 message, [in] HSTRING paramsDict);
+}
+
+[object, uuid(c153db3c-a412-5a70-a8f9-55ef31878ee3), pointer_default(unique)]
+interface IPlaybackEventWithCallbackDelegate : IUnknown {
+    HRESULT Invoke([in] UINT32 eventID, [in] UINT32 message, [in] HSTRING paramsDict);
+}
+
+[object, uuid(5b4f4f5d-5672-51f2-82da-cd4c1bbfb42a), pointer_default(unique)]
+interface IStoreServicesUIEventDelegate : IUnknown {
+    HRESULT Invoke([in] UINT32 eventID, [in] HSTRING eventDict);
+}
+
+[object, uuid(68e7097c-f969-4006-aac3-95115f0ed1c4), pointer_default(unique)]
+interface IAMPMusicLibrary : IInspectable {
+}
+
+[object, uuid(f707a913-e0ce-4fd4-bce3-425dd153285b), pointer_default(unique)]
+interface IAMPLibrary : IInspectable {
+    HRESULT get_Version([out, retval] HSTRING* value);
+    HRESULT get_ServerInfo([out, retval] HSTRING* value);
+    HRESULT get_State([out, retval] INT32* value);
+    HRESULT Setup([in] UINT32 inAppProcessID, [out] UINT32* outAgentProcessID, [out, retval] INT32* result);
+    HRESULT Cleanup([in] UINT32 inAppProcessID, [out, retval] INT32* result);
+    HRESULT MediaAppStarting([in] INT32 inAppKind, [out, retval] HSTRING* result);
+    HRESULT MediaAppQuitting([out, retval] INT32* result);
+    HRESULT MediaAppGetLibraryInfoAsync([out, retval] IAsyncOperation_HSTRING** operation);
+    HRESULT MediaAppOpenLibraryAsync([out, retval] IAsyncOperation_HSTRING** operation);
+    HRESULT MediaAppSetLibraryLocationAsync([in] HSTRING paramsDict, [out, retval] IAsyncOperation_HSTRING** operation);
+    HRESULT MediaAppExecFetchRequestAsync([in] HSTRING fetchDataVec, [out, retval] IAsyncOperation_HSTRING** operation);
+    HRESULT MediaAppReleaseFetchRequestWriteStream([in] UINT64 inDBID, [in] UINT64 inFID, [out, retval] INT32* result);
+    HRESULT MediaAppCloseFetchRequest([in] UINT64 inDBID, [in] UINT64 inFID, [out, retval] INT32* result);
+    HRESULT MediaAppExecAgentCommandAsync([in] HSTRING cmdDataDict, [out, retval] IAsyncOperation_HSTRING** operation);
+    HRESULT get_ClientID([out, retval] UINT32* value);
+    HRESULT get_MediaDomainsOpened([out, retval] boolean* value);
+    HRESULT get_ServerProtocolVersion([out, retval] HSTRING* value);
+    HRESULT RegisterLibraryClient([in] HSTRING clientName, [in] UINT32 clientID, [out, retval] RegisterClientResult* result);
+    HRESULT GetDomainInfoAsync([in] UINT32 mediaDomains, [in] UINT32 clientID, [in] HSTRING paramsDict, [out, retval] IAsyncOperation_HSTRING** operation);
+    HRESULT OpenDomainsAsync([in] UINT32 mediaDomains, [in] UINT32 clientID, [in] HSTRING paramsDict, [out, retval] IAsyncOperation_HSTRING** operation);
+    HRESULT CloseDomainsForClientID([in] UINT32 clientID, [out, retval] INT32* result);
+    HRESULT SendDBChangesToLibraryAsync([in] UINT32 fromRevision, [in] HSTRING paramsDict, [out, retval] IAsyncOperation_HSTRING** operation);
+    HRESULT FetchLibraryFromRevsionAsync([in] UINT32 fromRevision, [in] UINT32 mediaDomains, [in] boolean initialLoad, [out, retval] IAsyncOperation_HSTRING** operation);
+    HRESULT SaveAgentLogToFileAsync([in] HSTRING logFolder, [in] HSTRING logFilename, [out, retval] IAsyncOperation_HSTRING** operation);
+    HRESULT add_PlaybackEventHandler([in] IPlaybackEventDelegate* handler, [out, retval] EventRegistrationToken* token);
+    HRESULT remove_PlaybackEventHandler([in] EventRegistrationToken token);
+    HRESULT add_PlaybackEventWithCallbackHandler([in] IPlaybackEventWithCallbackDelegate* handler, [out, retval] EventRegistrationToken* token);
+    HRESULT remove_PlaybackEventWithCallbackHandler([in] EventRegistrationToken token);
+    HRESULT PlaybackEventResponse([in] UINT32 inEventID, [in] HSTRING inResponseDict);
+    HRESULT add_FetchInvalidationHandler([in] IFetchInvalidationEventDelegate* handler, [out, retval] EventRegistrationToken* token);
+    HRESULT remove_FetchInvalidationHandler([in] EventRegistrationToken token);
+    HRESULT add_ActivityStateHandler([in] IActvityStateEventDelegate* handler, [out, retval] EventRegistrationToken* token);
+    HRESULT remove_ActivityStateHandler([in] EventRegistrationToken token);
+    HRESULT add_CloudLibraryEventHandler([in] ICloudLibraryEventDelegate* handler, [out, retval] EventRegistrationToken* token);
+    HRESULT remove_CloudLibraryEventHandler([in] EventRegistrationToken token);
+    HRESULT add_LibraryEventHandler([in] ILibraryEventDelegate* handler, [out, retval] EventRegistrationToken* token);
+    HRESULT remove_LibraryEventHandler([in] EventRegistrationToken token);
+    HRESULT add_StoreServicesUIEventHandler([in] IStoreServicesUIEventDelegate* handler, [out, retval] EventRegistrationToken* token);
+    HRESULT remove_StoreServicesUIEventHandler([in] EventRegistrationToken token);
+    HRESULT StoreServicesUIEventResponse([in] UINT32 inEventID, [in] HSTRING inResponseDict);
+    HRESULT add_BusyChangedHandler([in] IBusyChangedEventDelegate* handler, [out, retval] EventRegistrationToken* token);
+    HRESULT remove_BusyChangedHandler([in] EventRegistrationToken token);
+    HRESULT add_LibraryRevisionChangedHandler([in] ILibraryRevisionChangedEventDelegate* handler, [out, retval] EventRegistrationToken* token);
+    HRESULT remove_LibraryRevisionChangedHandler([in] EventRegistrationToken token);
+    HRESULT add_DeviceEventHandler([in] IDeviceEventDelegate* handler, [out, retval] EventRegistrationToken* token);
+    HRESULT remove_DeviceEventHandler([in] EventRegistrationToken token);
+    HRESULT Kill();
+}

@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0" xmlns:asmv3="urn:schemas-microsoft-com:asm.v3">
+  <assemblyIdentity type="win32" name="AMLight.Desktop" version="0.2.0.0" processorArchitecture="amd64" />
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false" />
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+        type="win32"
+        name="Microsoft.Windows.Common-Controls"
+        version="6.0.0.0"
+        processorArchitecture="*"
+        publicKeyToken="6595b64144ccf1df"
+        language="*"
+      />
+    </dependentAssembly>
+  </dependency>
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}" />
+    </application>
+  </compatibility>
+  <asmv3:application>
+    <asmv3:windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2, PerMonitor</dpiAwareness>
+    </asmv3:windowsSettings>
+  </asmv3:application>
+  <file name="amp_proxy.dll">
+    <comClass clsid="{F707A913-E0CE-4FD4-BCE3-425DD153285B}" threadingModel="Both" />
+  </file>
+  <comInterfaceExternalProxyStub name="IAMPLibrary" iid="{F707A913-E0CE-4FD4-BCE3-425DD153285B}" proxyStubClsid32="{F707A913-E0CE-4FD4-BCE3-425DD153285B}" />
+  <comInterfaceExternalProxyStub name="IAMPMusicLibrary" iid="{68E7097C-F969-4006-AAC3-95115F0ED1C4}" proxyStubClsid32="{F707A913-E0CE-4FD4-BCE3-425DD153285B}" />
+  <comInterfaceExternalProxyStub name="IPlaybackEventDelegate" iid="{F0E209BE-7FB1-5E1E-9879-B622AE7CCA41}" proxyStubClsid32="{F707A913-E0CE-4FD4-BCE3-425DD153285B}" />
+  <comInterfaceExternalProxyStub name="IPlaybackEventWithCallbackDelegate" iid="{C153DB3C-A412-5A70-A8F9-55EF31878EE3}" proxyStubClsid32="{F707A913-E0CE-4FD4-BCE3-425DD153285B}" />
+  <comInterfaceExternalProxyStub name="IStoreServicesUIEventDelegate" iid="{5B4F4F5D-5672-51F2-82DA-CD4C1BBFB42A}" proxyStubClsid32="{F707A913-E0CE-4FD4-BCE3-425DD153285B}" />
+  <comInterfaceExternalProxyStub name="IActvityStateEventDelegate" iid="{0A180672-967F-5B4E-9D67-8146D1200522}" proxyStubClsid32="{F707A913-E0CE-4FD4-BCE3-425DD153285B}" />
+  <comInterfaceExternalProxyStub name="IBusyChangedEventDelegate" iid="{6F89C3B3-0C25-50C5-BECA-3D5086210E34}" proxyStubClsid32="{F707A913-E0CE-4FD4-BCE3-425DD153285B}" />
+  <comInterfaceExternalProxyStub name="ICloudLibraryEventDelegate" iid="{C4C9DE7B-DE44-59DB-9805-54686C6DC298}" proxyStubClsid32="{F707A913-E0CE-4FD4-BCE3-425DD153285B}" />
+  <comInterfaceExternalProxyStub name="IDeviceEventDelegate" iid="{897B3128-5D81-4BD0-8A53-7BB9EED8346A}" proxyStubClsid32="{F707A913-E0CE-4FD4-BCE3-425DD153285B}" />
+  <comInterfaceExternalProxyStub name="IFetchInvalidationEventDelegate" iid="{E9AE66D5-042E-5058-BEAA-1355425C739A}" proxyStubClsid32="{F707A913-E0CE-4FD4-BCE3-425DD153285B}" />
+  <comInterfaceExternalProxyStub name="ILibraryEventDelegate" iid="{7923015C-75C0-5732-86CC-AB09C471A674}" proxyStubClsid32="{F707A913-E0CE-4FD4-BCE3-425DD153285B}" />
+  <comInterfaceExternalProxyStub name="ILibraryRevisionChangedEventDelegate" iid="{E4712EB5-60A2-513D-B6E9-71C0ED973E52}" proxyStubClsid32="{F707A913-E0CE-4FD4-BCE3-425DD153285B}" />
+</assembly>
