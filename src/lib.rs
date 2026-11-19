@@ -4,6 +4,7 @@ pub mod audio_viz;
 pub mod binaural_dsp;
 pub mod bplist;
 pub mod downloads;
+pub mod drm_fix;
 pub mod lyrics;
 pub mod smtc;
 pub mod theme;

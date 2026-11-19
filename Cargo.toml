@@ -2,7 +2,9 @@
 name = "am-light"
 version = "0.2.0"
 description = "Apple Music desktop client with native Direct2D UI, synced lyrics, and audio visualizer"
-authors = ["AM Light"]
+authors = ["N20xDuli"]
+license = "MIT"
+repository = "https://github.com/N20xDuli/AM-Light"
 edition = "2021"
 
 [lib]

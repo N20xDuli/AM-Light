@@ -9,6 +9,7 @@ use crate::audio_viz::{self, AudioOutputDevice, LiveVisualizerSnapshot};
 use crate::binaural_dsp::{self, BinauralConfig, BinauralStatus};
 use crate::d2d_renderer::{D2DRenderer, GlassBtnVariant, SfIcon, TextAlign};
 use crate::downloads::{self, DownloadsOverview};
+use crate::drm_fix::{self, DrmDiagReport};
 use crate::lyrics::{self, NonEmphasisLyricsEffect, ParsedLyrics};
 use crate::lyrics_view::{LyricsHitAction, LyricsViewState};
 use crate::smtc::{self, SmtcState};
@@ -440,6 +441,10 @@ pub enum AsyncMsg {
     },
     BannerNotice(String),
     BannerError(String),
+    DrmDiagUpdated {
+        report: DrmDiagReport,
+        banner: Option<(String, bool)>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -521,6 +526,9 @@ pub enum UiAction {
     // Settings actions
     SetStorefront(String),
     SyncOfficialClientAccount,
+    CheckDrmHealth,
+    RunDrmRepair,
+    OpenDrmFixRepo,
     FocusTokenBox,
     PasteUserToken,
     OpenWebAppleMusic,
@@ -714,6 +722,8 @@ pub struct AppUi {
     pub playlist_diff_anim: Option<PlaylistDiffAnimState>,
     pub top_bar_guard_spring: lyrics::Spring1D,
     playlist_sync_in_flight: bool,
+    pub drm_diag: DrmDiagReport,
+    pub drm_repair_running: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
@@ -1138,6 +1148,8 @@ impl AppUi {
             playlist_diff_anim: None,
             top_bar_guard_spring: lyrics::Spring1D::new(0.0, 1.0, 210.0, 29.0),
             playlist_sync_in_flight: false,
+            drm_diag: DrmDiagReport::default(),
+            drm_repair_running: false,
         };
 
         if wake_hwnd != 0 {
@@ -1172,6 +1184,7 @@ impl AppUi {
     pub fn fetch_initial_data(&mut self) {
         self.fetch_home_charts();
         self.refresh_devices_and_prefs(false);
+        self.refresh_drm_health_async(false);
         if !self.settings.user_token.is_empty() {
             self.dispatch_background_playlist_sync();
         }
@@ -1752,6 +1765,13 @@ impl AppUi {
                     self.playback_loading_track_id = None;
                     self.playback_loading_container_id = None;
                     self.set_banner(s, true);
+                }
+                AsyncMsg::DrmDiagUpdated { report, banner } => {
+                    self.drm_repair_running = false;
+                    self.drm_diag = report;
+                    if let Some((msg, is_err)) = banner {
+                        self.set_banner(msg, is_err);
+                    }
                 }
             }
         }
@@ -3063,6 +3083,23 @@ impl AppUi {
         });
     }
 
+    pub fn refresh_drm_health_async(&self, show_banner: bool) {
+        let tx = self.tx.clone();
+        let hwnd = self.wake_hwnd;
+        self.rt.spawn(async move {
+            let report = tokio::task::spawn_blocking(drm_fix::check_apple_music_drm_health)
+                .await
+                .unwrap_or_default();
+            let banner = if show_banner {
+                Some((report.summary.clone(), !report.healthy))
+            } else {
+                None
+            };
+            let _ = tx.send(AsyncMsg::DrmDiagUpdated { report, banner });
+            Self::post_ui_wake(hwnd);
+        });
+    }
+
     pub fn navigate_to(&mut self, next: PageRoute) {
         if self.route == next {
             return;
@@ -3113,6 +3150,7 @@ impl AppUi {
             }
             PageRoute::Settings => {
                 self.refresh_devices_and_prefs(false);
+                self.refresh_drm_health_async(false);
             }
             PageRoute::Visualizer => {
                 self.refresh_devices_and_prefs(false);
@@ -4119,6 +4157,38 @@ impl AppUi {
                     };
                     self.set_banner(format!("已同步原装端信息：{detail}"), false);
                 }
+            }
+            UiAction::CheckDrmHealth => {
+                self.refresh_drm_health_async(true);
+            }
+            UiAction::RunDrmRepair => {
+                if self.drm_repair_running {
+                    return;
+                }
+                self.drm_repair_running = true;
+                self.set_banner("正在请求管理员权限并执行 DRM 修复（自动备份）...".to_string(), false);
+                let tx = self.tx.clone();
+                let hwnd = self.wake_hwnd;
+                self.rt.spawn(async move {
+                    let banner = match tokio::task::spawn_blocking(|| {
+                        let _ = am_agent::disconnect_agent();
+                        drm_fix::run_elevated_drm_repair_blocking()
+                    })
+                    .await
+                    {
+                        Ok(Ok(msg)) => Some((msg, false)),
+                        Ok(Err(e)) => Some((e, true)),
+                        Err(e) => Some((format!("修复任务异常: {e}"), true)),
+                    };
+                    let report = tokio::task::spawn_blocking(drm_fix::check_apple_music_drm_health)
+                        .await
+                        .unwrap_or_default();
+                    let _ = tx.send(AsyncMsg::DrmDiagUpdated { report, banner });
+                    Self::post_ui_wake(hwnd);
+                });
+            }
+            UiAction::OpenDrmFixRepo => {
+                open_external_browser(drm_fix::DRM_FIX_REPO_URL);
             }
             UiAction::FocusTokenBox => {
                 self.token_box_focused = true;
@@ -8005,6 +8075,121 @@ impl AppUi {
         }
 
         y += 232.0;
+
+        // --- Group 1.5: 播放故障诊断与 DRM 修复 (`N20xDuli/apple-music-windows-drm-fix`) ---
+        r.draw_text(
+            "播放故障诊断与 DRM 修复",
+            RectF::new(x0 + 4.0, y, cw, 22.0),
+            13.0,
+            600,
+            Theme::TEXT_MUTED,
+            TextAlign::Left,
+            true,
+            false,
+        );
+        y += 26.0;
+
+        let g_drm = RectF::new(x0, y, cw, 102.0);
+        r.fill_rounded_rect(g_drm, 14.0, Theme::BG_ELEVATED);
+        r.stroke_rounded_rect(g_drm, 14.0, Theme::SEPARATOR, 1.0);
+
+        let drm_text_w = (cw - 294.0).max(160.0);
+        r.draw_text(
+            "原版 Apple Music 无法播放 / 点歌秒切修复",
+            RectF::new(x0 + 18.0, y + 14.0, drm_text_w, 22.0),
+            14.0,
+            600,
+            Theme::TEXT_PRIMARY,
+            TextAlign::Left,
+            true,
+            false,
+        );
+        let (sum_txt, sum_col) = if !self.drm_diag.checked {
+            (
+                "正在检测 Anisette / ADI 设备身份与权限状态...",
+                Theme::TEXT_SECONDARY,
+            )
+        } else if !self.drm_diag.healthy {
+            (self.drm_diag.summary.as_str(), Theme::ACCENT_RED)
+        } else if !self.drm_diag.hklm_redirections.is_empty() {
+            (self.drm_diag.summary.as_str(), Theme::SIGNAL_AMBER)
+        } else {
+            (self.drm_diag.summary.as_str(), Theme::SIGNAL_GREEN)
+        };
+        r.draw_text(
+            sum_txt,
+            RectF::new(x0 + 18.0, y + 44.0, cw - 36.0, 20.0),
+            12.2,
+            500,
+            sum_col,
+            TextAlign::Left,
+            true,
+            false,
+        );
+        let det_txt = if self.drm_diag.checked {
+            self.drm_diag.detail.as_str()
+        } else {
+            "支持无管理员权限快速检测，或一键备份并修复目录写入权限与第三方重定向"
+        };
+        r.draw_text(
+            det_txt,
+            RectF::new(x0 + 18.0, y + 68.0, cw - 36.0, 20.0),
+            11.4,
+            400,
+            Theme::TEXT_SECONDARY,
+            TextAlign::Left,
+            true,
+            false,
+        );
+
+        let need_fix = self.drm_diag.checked
+            && (!self.drm_diag.healthy || !self.drm_diag.hklm_redirections.is_empty());
+        let repair_lbl = if self.drm_repair_running {
+            "修复中..."
+        } else {
+            "一键修复"
+        };
+        let mut dx = x0 + cw - 18.0;
+        for (lbl, bw, tinted, act) in [
+            (repair_lbl, 86.0f32, need_fix, UiAction::RunDrmRepair),
+            ("重新检测", 78.0, false, UiAction::CheckDrmHealth),
+            ("项目主页", 78.0, false, UiAction::OpenDrmFixRepo),
+        ] {
+            dx -= bw;
+            let br = RectF::new(dx, y + 12.0, bw, 28.0);
+            let bhov = self.mouse_pos.1 >= TOP_BAR_GUARD_H
+                && br.contains(self.mouse_pos.0, self.mouse_pos.1);
+            r.draw_liquid_glass_button(
+                br,
+                8.5,
+                if tinted {
+                    GlassBtnVariant::Tinted(Theme::ACCENT_RED)
+                } else {
+                    GlassBtnVariant::Regular
+                },
+                bhov,
+                self.mouse_down,
+                self.mouse_pos,
+                self.glass_off(),
+            );
+            r.draw_text(
+                lbl,
+                br,
+                12.0,
+                if bhov || tinted { 600 } else { 500 },
+                Theme::TEXT_PRIMARY,
+                TextAlign::Center,
+                true,
+                false,
+            );
+            self.hit_regions.push(HitRegion {
+                rect: br,
+                action: act,
+            });
+            dx -= 7.0;
+        }
+
+        y += 122.0;
 
         // --- Group 2: 音频与播放 (Restrained phrasing; Spatial/Atmos hidden by default below!) ---
         r.draw_text(

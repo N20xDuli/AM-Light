@@ -2953,4 +2953,55 @@ mod tests {
         }
         assert!(prev_lift < -0.5);
     }
+
+    #[test]
+    fn test_apple_music_drm_diagnosis_healthy_readonly_and_redirections() {
+        use am_light_lib::drm_fix::diagnose_drm_paths;
+
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("am_light_drm_test_{uniq}"));
+        let adi_dir = root.join("adi");
+        let sc_dir = root.join("SC Info");
+        let sc_file = sc_dir.join("SC Info.txt");
+        let _ = std::fs::remove_dir_all(&root);
+
+        // 1. Missing folder -> healthy initial state
+        let rep0 = diagnose_drm_paths(&adi_dir, &sc_file, Vec::new());
+        assert!(rep0.checked && rep0.healthy && !rep0.adi_dir_exists && rep0.adi_file_count == 0);
+
+        // 2. Writable ADI file -> healthy
+        std::fs::create_dir_all(&adi_dir).unwrap();
+        std::fs::create_dir_all(&sc_dir).unwrap();
+        let adi_pb = adi_dir.join("adi.pb");
+        std::fs::write(&adi_pb, b"test-adi").unwrap();
+        let rep1 = diagnose_drm_paths(&adi_dir, &sc_file, Vec::new());
+        assert!(rep1.healthy && rep1.adi_dir_exists && rep1.adi_file_count == 1);
+        assert!(rep1.unwritable_files.is_empty());
+
+        // 3. Read-only ADI file -> detected as unhealthy
+        let mut perms = std::fs::metadata(&adi_pb).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&adi_pb, perms).unwrap();
+        let rep2 = diagnose_drm_paths(&adi_dir, &sc_file, Vec::new());
+        assert!(!rep2.healthy);
+        assert_eq!(rep2.unwritable_files, vec!["adi.pb".to_string()]);
+
+        // Restore write bit for clean removal & test redirection warning
+        let mut perms2 = std::fs::metadata(&adi_pb).unwrap().permissions();
+        perms2.set_readonly(false);
+        std::fs::set_permissions(&adi_pb, perms2).unwrap();
+        let rep3 = diagnose_drm_paths(
+            &adi_dir,
+            &sc_file,
+            vec!["LibSidePath = C:\\Sideloadly\\CoreADI.dll".to_string()],
+        );
+        assert!(rep3.healthy);
+        assert_eq!(rep3.hklm_redirections.len(), 1);
+        assert!(rep3.summary.contains("第三方 DRM 重定向"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
