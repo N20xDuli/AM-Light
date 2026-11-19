@@ -2759,14 +2759,30 @@ mod tests {
             PlistValue::dict([("playButtonState", PlistValue::String("stop".to_string()))]),
         )]));
 
-        // 2. Visualizer-only WASAPI subscription
+        // 2. WASAPI subscription: gated by Visualizer page OR `live_eq_icon_spectrum` toggle while Playing
         set_viz_subscribed(false);
         let mut ui = am_light_lib::app_ui::AppUi::new(0);
         ui.smtc.status = "Playing".to_string();
         ui.route = am_light_lib::app_ui::PageRoute::Home;
+        ui.settings.live_eq_icon_spectrum = false;
         ui.update_viz_subscription();
-        assert!(!is_viz_subscribed(), "Home while Playing must NOT subscribe WASAPI");
+        assert!(
+            !is_viz_subscribed(),
+            "Home while Playing with live_eq_icon_spectrum=false must NOT subscribe WASAPI"
+        );
 
+        ui.settings.live_eq_icon_spectrum = true;
+        ui.update_viz_subscription();
+        assert!(
+            is_viz_subscribed(),
+            "Home while Playing with live_eq_icon_spectrum=true must subscribe lightweight WASAPI"
+        );
+
+        ui.smtc.status = "Paused".to_string();
+        ui.update_viz_subscription();
+        assert!(!is_viz_subscribed(), "Home while Paused must release WASAPI");
+
+        ui.smtc.status = "Playing".to_string();
         ui.route = am_light_lib::app_ui::PageRoute::Visualizer;
         ui.show_lyrics_overlay = false;
         ui.update_viz_subscription();
@@ -3003,5 +3019,502 @@ mod tests {
         assert!(rep3.summary.contains("第三方 DRM 重定向"));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_soundstage_semicircle_folding() {
+        use am_light_lib::visualizers::map_lr_to_semicircle;
+
+        for (l, r, g) in [
+            (0.5f32, 0.5f32, 1.5f32),
+            (-0.6, -0.6, 1.8),
+            (0.9, -0.9, 2.2),
+            (-0.8, 0.2, 1.4),
+            (0.0, 0.0, 1.0),
+        ] {
+            let (nx, ny) = map_lr_to_semicircle(l, r, g);
+            assert!(ny >= 0.0, "semicircle ny must never drop below 0: {ny}");
+            assert!(
+                nx * nx + ny * ny <= 1.0 + 1e-4,
+                "semicircle magnitude must stay within unit disk: ({nx}, {ny})"
+            );
+        }
+
+        // Pure mono in both positive & negative half-cycles maps straight up X = 0
+        let (mx_pos, my_pos) = map_lr_to_semicircle(0.4, 0.4, 1.2);
+        let (mx_neg, my_neg) = map_lr_to_semicircle(-0.4, -0.4, 1.2);
+        assert!(mx_pos.abs() < 1e-5 && my_pos > 0.3);
+        assert!(mx_neg.abs() < 1e-5 && (my_pos - my_neg).abs() < 1e-5);
+
+        // Mirror stereo panning symmetry
+        let (lx, ly) = map_lr_to_semicircle(0.6, 0.0, 1.2);
+        let (rx, ry) = map_lr_to_semicircle(0.0, 0.6, 1.2);
+        assert!(lx < 0.0 && rx > 0.0);
+        assert!((lx + rx).abs() < 1e-5 && (ly - ry).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_lyrics_auto_emphasis_toggle() {
+        use am_light_lib::lyrics::parse_ttml_lyrics;
+
+        // One word has explicit `emphasis="true"`, another is long sustained duration without explicit tag
+        let ttml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<tt xmlns="http://www.w3.org/ns/ttml" xmlns:ttm="http://www.w3.org/ns/ttml#metadata">
+  <body><div>
+    <p begin="1.0s" end="4.5s">
+      <span begin="1.0s" end="2.4s">天</span>
+      <span begin="2.5s" end="4.0s" ttm:role="x-emphasis">亮</span>
+    </p>
+  </div></body>
+</tt>"#;
+        let parsed = parse_ttml_lyrics(ttml, "Apple Music TTML").expect("parse ttml");
+        let units = &parsed.lines[0].word_cjk_units;
+        assert_eq!(units.len(), 2);
+        assert!(!units[0].is_explicit_emphasis, "untagged long syllable must NOT be explicit");
+        assert!(units[0].is_sustained, "long 1.4s syllable IS auto-detected as sustained");
+        assert!(units[0].is_emphasized(true), "auto_detect=true enables heuristic emphasis");
+        assert!(
+            !units[0].is_emphasized(false),
+            "auto_detect=false must reject heuristic-only emphasis"
+        );
+        assert!(units[1].is_explicit_emphasis, "explicit span must set is_explicit_emphasis");
+        assert!(units[1].is_emphasized(false), "auto_detect=false must still allow explicit emphasis");
+    }
+
+    #[test]
+    fn test_lyrics_frontier_lift_scale_glow_and_speed_gate() {
+        use am_light_lib::lyrics::{
+            eval_frontier_glow_profile, eval_frontier_lift_weight, eval_frontier_scale_delta,
+            should_use_frontier_lift,
+        };
+
+        // 1. Speed gate for non-emphasized frontier lift
+        assert!(
+            !should_use_frontier_lift(false, 0.25, 110.0),
+            "fast non-emphasized word must skip frontier split for performance"
+        );
+        assert!(
+            !should_use_frontier_lift(false, 0.60, 140.0),
+            "233 DIP/s non-emphasized word is faster than slow threshold -> skip"
+        );
+        assert!(
+            should_use_frontier_lift(false, 0.90, 90.0),
+            "slow 0.90s @ 100 DIP/s non-emphasized word must use frontier lift"
+        );
+        assert!(
+            should_use_frontier_lift(true, 0.22, 120.0),
+            "emphasized unit always uses frontier mechanics regardless of speed"
+        );
+
+        // 2. Frontier lift progresses cleanly ahead/behind progress boundary
+        let back_l = eval_frontier_lift_weight(0.15, 0.50, false);
+        let front_l = eval_frontier_lift_weight(0.85, 0.50, false);
+        assert!(back_l > 0.85 && front_l < 0.15, "back={back_l}, front={front_l}");
+
+        // 3. Frontier zoom bulge peaks near frontier and tapers away
+        let peak_d = eval_frontier_scale_delta(0.50, 0.50, 0.14, false);
+        let edge_d = eval_frontier_scale_delta(0.05, 0.50, 0.14, false);
+        assert!(peak_d > 0.12 && edge_d < peak_d * 0.4, "peak={peak_d}, edge={edge_d}");
+
+        // 4. Glow profile: legible luminous swept body (never blinding white), leading frontier peak, smooth non-abrupt end-hold rise
+        let (sweep_body, sweep_peak, _) = eval_frontier_glow_profile(0.50, 0.0, 0.0, true, true, 0.8);
+        assert!(
+            sweep_body > 0.40 && sweep_body < 0.62 && sweep_peak > sweep_body * 1.25 && sweep_peak <= 0.85,
+            "swept body {sweep_body} should be legible & lit while frontier peak {sweep_peak} leads clearly without whiteout"
+        );
+
+        let (near_end_body, _, _) = eval_frontier_glow_profile(0.98, 0.0, 0.0, true, true, 0.8);
+        let (hold_early, hold_peak0, _) = eval_frontier_glow_profile(1.0, 0.02, 0.0, true, true, 0.8);
+        let (hold_late, hold_peak1, _) = eval_frontier_glow_profile(1.0, 0.45, 0.0, true, true, 0.8);
+        assert!(
+            (hold_early - near_end_body).abs() < 0.14,
+            "end-hold entry must be smooth, not abrupt: near_end={near_end_body}, hold_early={hold_early}"
+        );
+        assert!(
+            hold_late > hold_early && (hold_late - hold_peak1).abs() < 0.02,
+            "hold_early={hold_early}, hold_late={hold_late}, peak={hold_peak0}/{hold_peak1}"
+        );
+    }
+
+    #[test]
+    fn test_motion_art_hls_m3u8_parser() {
+        use am_light_lib::motion_art::{
+            parse_best_avc_variant_from_master, parse_mp4_url_from_variant,
+        };
+
+        let master = r#"#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=90000,CODECS="avc1.64001f",URI="iframe_486.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=2400000,RESOLUTION=1080x1080,CODECS="hvc1.1.6.L120.90"
+hevc_1080.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=900000,RESOLUTION=486x486,CODECS="avc1.64001f"
+avc_486.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=3500000,RESOLUTION=2160x2160,CODECS="avc1.64002a"
+avc_2160.m3u8
+"#;
+        let master_url = "https://mvod.itunes.apple.com/itunes-assets/motion/master.m3u8";
+        let picked = parse_best_avc_variant_from_master(master, master_url)
+            .expect("must pick avc1 486x486 variant");
+        assert_eq!(
+            picked,
+            "https://mvod.itunes.apple.com/itunes-assets/motion/avc_486.m3u8"
+        );
+
+        let variant = r#"#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXT-X-MAP:URI="video_486x486.mp4"
+#EXTINF:5.9,
+video_486x486.mp4
+#EXT-X-ENDLIST
+"#;
+        let mp4 = parse_mp4_url_from_variant(variant, &picked).expect("must extract mp4 url");
+        assert_eq!(
+            mp4,
+            "https://mvod.itunes.apple.com/itunes-assets/motion/video_486x486.mp4"
+        );
+    }
+
+    #[test]
+    fn test_remote_version_semver_compare() {
+        use am_light_lib::app_ui::is_remote_version_newer;
+
+        assert!(is_remote_version_newer("0.2.1", "v0.2.2"));
+        assert!(is_remote_version_newer("0.2.1", "v0.10.0"));
+        assert!(is_remote_version_newer("0.2.1", "1.0.0"));
+        assert!(!is_remote_version_newer("0.2.1", "v0.2.1"));
+        assert!(!is_remote_version_newer("0.2.1", "v0.2.0"));
+        assert!(!is_remote_version_newer("0.2.1", "invalid-tag"));
+    }
+
+    #[test]
+    fn test_narrow_window_floating_sidebar_state() {
+        use am_light_lib::app_ui::{AppUi, PageRoute, UiAction};
+        use am_light_lib::theme::Theme;
+
+        let mut ui = AppUi::new(0);
+        ui.last_win_w = Theme::SIDEBAR_AUTO_COLLAPSE_WIDTH - 120.0;
+        assert!(!ui.narrow_sidebar_overlay_open);
+
+        // Toggle opens floating overlay without permanently mutating desktop sidebar_collapsed
+        let prev_desktop_collapsed = ui.settings.sidebar_collapsed;
+        ui.execute_action(UiAction::ToggleSidebar);
+        assert!(ui.narrow_sidebar_overlay_open);
+        assert_eq!(ui.sidebar_open_spring.target, 1.0);
+        assert_eq!(ui.settings.sidebar_collapsed, prev_desktop_collapsed);
+
+        // Navigating closes floating overlay automatically
+        ui.execute_action(UiAction::Navigate(PageRoute::Browse));
+        assert!(!ui.narrow_sidebar_overlay_open);
+
+        // Re-open then close via scrim dismiss action
+        ui.execute_action(UiAction::ToggleSidebar);
+        assert!(ui.narrow_sidebar_overlay_open);
+        ui.execute_action(UiAction::CloseNarrowSidebarOverlay);
+        assert!(!ui.narrow_sidebar_overlay_open);
+        assert_eq!(ui.sidebar_open_spring.target, 0.0);
+    }
+
+    #[test]
+    fn test_zero_tear_cjk_wave_shear_and_toggle() {
+        use am_light_lib::app_ui::{AppUi, UiAction};
+        use am_light_lib::lyrics::eval_frontier_wave_shear;
+
+        let (l0, s0) = eval_frontier_wave_shear(-4.0, 40.0, 0.0, false);
+        assert_eq!(l0, 0.0);
+        assert_eq!(s0, 0.0);
+
+        let (l_mid, s_mid) = eval_frontier_wave_shear(-4.0, 40.0, 0.45, false);
+        assert!(l_mid < -0.5 && l_mid > -3.8, "mid center lift={l_mid}");
+        assert!(s_mid > 0.01 && s_mid <= 0.14, "LTR wave lifts left ahead of right: shear={s_mid}");
+
+        let (_, s_rtl) = eval_frontier_wave_shear(-4.0, 40.0, 0.45, true);
+        assert!(s_rtl < -0.01 && s_rtl >= -0.14, "RTL wave mirrors shear sign: shear={s_rtl}");
+
+        let (l1, s1) = eval_frontier_wave_shear(-4.0, 40.0, 1.0, false);
+        assert!((l1 - (-4.0)).abs() < 1e-4 && s1 == 0.0, "end settles flat: l1={l1}, s1={s1}");
+
+        let mut ui = AppUi::new(0);
+        let init_wave = ui.settings.lyrics_frontier_wave;
+        ui.execute_action(UiAction::ToggleLyricsFrontierWave);
+        assert_eq!(ui.settings.lyrics_frontier_wave, !init_wave);
+        ui.execute_action(UiAction::ToggleLyricsFrontierWave);
+        assert_eq!(ui.settings.lyrics_frontier_wave, init_wave);
+    }
+
+    #[test]
+    fn test_v023_mp4_crop_and_blur_downsample_toggle() {
+        use am_light_lib::app_ui::{AppUi, UiAction};
+        use am_light_lib::motion_art::compute_clean_display_crop;
+
+        // H.264 486x486 padded to 496x496 macroblock coded frame -> crop strips 10px right/bottom padding!
+        assert_eq!(
+            compute_clean_display_crop(496, 496, Some((0, 0, 486, 486)), 486, 486),
+            (0, 0, 486, 486)
+        );
+        // Even when MF omits aperture after CURRENTMEDIATYPECHANGED, initial display size catches 16px rounding!
+        assert_eq!(
+            compute_clean_display_crop(496, 496, None, 486, 486),
+            (0, 0, 486, 486)
+        );
+        // Exact multiple of 16 passes through unchanged
+        assert_eq!(
+            compute_clean_display_crop(544, 544, None, 544, 544),
+            (0, 0, 544, 544)
+        );
+
+        let mut ui = AppUi::new(0);
+        let init_ds = ui.settings.lyrics_blur_downsample;
+        ui.execute_action(UiAction::ToggleLyricsBlurDownsample);
+        assert_eq!(ui.settings.lyrics_blur_downsample, !init_ds);
+        ui.execute_action(UiAction::ToggleLyricsBlurDownsample);
+        assert_eq!(ui.settings.lyrics_blur_downsample, init_ds);
+    }
+
+    #[test]
+    fn test_v024_adaptive_spectrogram_and_hires_specs() {
+        use am_light_lib::audio_viz::{
+            enrich_stream_specs_with_live_and_traits, parse_enhanced_hls_variants,
+        };
+        use am_light_lib::visualizers::compute_adaptive_display_max_hz;
+
+        let nyq_192 = 96_000.0f32;
+        let mut bins_20k = vec![-110.0f32; 256];
+        for b in 0..54 {
+            bins_20k[b] = -32.0;
+        }
+        // Standard 20kHz music on a 192kHz DAC MUST stay at default 24 kHz!
+        let c0 = compute_adaptive_display_max_hz(24_000.0, nyq_192, &bins_20k, &bins_20k, 20_000.0, 12);
+        assert!((c0 - 24_000.0).abs() < 1.0, "expected 24kHz default, got {c0}");
+
+        // Ultrasonic energy at ~32 kHz (bins 84..88 of 256 across 96 kHz) expands chart to 48 kHz!
+        let mut bins_32k = bins_20k.clone();
+        for b in 84..89 {
+            bins_32k[b] = -58.0;
+        }
+        let c1 = compute_adaptive_display_max_hz(c0, nyq_192, &bins_32k, &bins_32k, 32_000.0, 14);
+        assert!((c1 - 48_000.0).abs() < 1.0, "expected 48kHz expansion, got {c1}");
+
+        // Ultrasonic energy at ~64 kHz (bins 168..173) expands chart to 96 kHz!
+        let mut bins_64k = bins_32k.clone();
+        for b in 168..174 {
+            bins_64k[b] = -60.0;
+        }
+        let c2 = compute_adaptive_display_max_hz(c1, nyq_192, &bins_64k, &bins_64k, 64_000.0, 16);
+        assert!((c2 - 96_000.0).abs() < 1.0, "expected 96kHz expansion, got {c2}");
+
+        // Reset / track change (`analyzed_frames < 2`) snaps back to 24 kHz!
+        let c_reset = compute_adaptive_display_max_hz(c2, nyq_192, &bins_20k, &bins_20k, 0.0, 0);
+        assert!((c_reset - 24_000.0).abs() < 1.0, "expected reset to 24kHz, got {c_reset}");
+
+        // Hi-Res 192 kHz parsed even when SAMPLE-RATE only appears in GROUP-ID!
+        let gid_only_m3u8 = "\
+#EXTM3U\n\
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio-alac-stereo-192000-24\",CHANNELS=\"2\"\n\
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio-alac-stereo-48000-24\",CHANNELS=\"2\"\n\
+#EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=5235000,BANDWIDTH=5439000,CODECS=\"alac\",AUDIO=\"audio-alac-stereo-192000-24\"\n\
+hi192.m3u8\n\
+#EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=1690000,BANDWIDTH=1798000,CODECS=\"alac\",AUDIO=\"audio-alac-stereo-48000-24\"\n\
+lo48.m3u8\n";
+        let sp192 = parse_enhanced_hls_variants(gid_only_m3u8, true, 20, 10).expect("192k specs");
+        assert_eq!(sp192.sample_rate_hz, 192_000);
+        assert_eq!(sp192.bit_depth, Some(24));
+
+        // Capped `_lossless.m3u8` (48kHz only) upgraded by live AMPLibraryAgent 192kHz & hi-res trait!
+        let cap_m3u8 = "\
+#EXTM3U\n\
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio-alac-stereo-48000-24\",CHANNELS=\"2\",SAMPLE-RATE=48000,BIT-DEPTH=24\n\
+#EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=1690000,BANDWIDTH=1798000,CODECS=\"alac\",AUDIO=\"audio-alac-stereo-48000-24\"\n\
+lo48.m3u8\n";
+        let base48 = parse_enhanced_hls_variants(cap_m3u8, true, 20, 10);
+        let upgraded = enrich_stream_specs_with_live_and_traits(
+            base48.clone(),
+            Some(192_000),
+            Some(24),
+            Some("alac"),
+            true,
+            true,
+            20,
+            10,
+        )
+        .expect("upgraded 192k");
+        assert_eq!(upgraded.sample_rate_hz, 192_000);
+        assert_eq!(upgraded.tier_label, "Hi-Res 无损");
+
+        let trait_only =
+            enrich_stream_specs_with_live_and_traits(base48, None, None, None, true, true, 20, 10)
+                .expect("trait hires");
+        assert!(trait_only.hires_catalog_trait);
+        assert_eq!(trait_only.tier_label, "Hi-Res 无损");
+    }
+
+    #[test]
+    fn test_v024_soundstage_5band_colors_and_rms_agc() {
+        use am_light_lib::audio_viz::{split_stereo_5band_soundstage, LiveVisualizerSnapshot};
+        use am_light_lib::visualizers::{
+            soundstage_band_color, VisualizerState, SOUNDSTAGE_BAND_COLORS,
+        };
+        use std::f32::consts::TAU;
+
+        // Distinct colors for all 5 frequency bands (Low -> High)
+        for i in 0..5 {
+            for j in (i + 1)..5 {
+                assert_ne!(
+                    SOUNDSTAGE_BAND_COLORS[i], SOUNDSTAGE_BAND_COLORS[j],
+                    "band colors {i} and {j} must be distinct"
+                );
+            }
+            assert_eq!(soundstage_band_color(i as u8), SOUNDSTAGE_BAND_COLORS[i]);
+        }
+
+        // Synthesize multi-band stereo signal (80 Hz bass, 300 Hz low-mid, 1 kHz mid, 3.5 kHz high-mid, 9 kHz treble)
+        let sr = 48_000u32;
+        let make_stereo = |amp: f32| -> Vec<[f32; 2]> {
+            (0..256)
+                .map(|i| {
+                    let t = (i as f32) / (sr as f32);
+                    let bass = (TAU * 80.0 * t).sin() * 0.30 * amp;
+                    let lm = (TAU * 300.0 * t).sin() * 0.25 * amp;
+                    let mid = (TAU * 1000.0 * t).sin() * 0.22 * amp;
+                    let hm = (TAU * 3500.0 * t).sin() * 0.20 * amp;
+                    let tr = (TAU * 9000.0 * t).sin() * 0.18 * amp;
+                    [bass + lm + mid * 0.9 + hm * 0.5 + tr, bass + lm * 0.8 + mid + hm + tr * 0.4]
+                })
+                .collect()
+        };
+
+        let loud_lr = make_stereo(0.85);
+        let band_pts = split_stereo_5band_soundstage(&loud_lr, sr);
+        let mut seen = [0usize; 5];
+        for &[_, _, bf] in &band_pts {
+            seen[(bf.round() as usize).min(4)] += 1;
+        }
+        assert!(
+            seen.iter().all(|&c| c > 0),
+            "all 5 frequency bands must emit stereo soundstage points: {seen:?}"
+        );
+
+        // Adaptive RMS AGC: quiet (-22 dB) audio must receive substantially higher gain than loud audio!
+        let mut viz_loud = VisualizerState::default();
+        let mut snap_loud = LiveVisualizerSnapshot::default();
+        snap_loud.active_signal = true;
+        snap_loud.peak_db_l = -4.0;
+        snap_loud.peak_db_r = -4.0;
+        snap_loud.rms_db = -10.0;
+        snap_loud.soundstage_lr = loud_lr;
+        snap_loud.soundstage_band_pts = band_pts;
+        for _ in 0..40 {
+            viz_loud.step(&snap_loud, 1.0 / 60.0, false);
+        }
+
+        let quiet_lr = make_stereo(0.08);
+        let mut viz_quiet = VisualizerState::default();
+        let mut snap_quiet = LiveVisualizerSnapshot::default();
+        snap_quiet.active_signal = true;
+        snap_quiet.peak_db_l = -26.0;
+        snap_quiet.peak_db_r = -26.0;
+        snap_quiet.rms_db = -32.0;
+        snap_quiet.soundstage_lr = quiet_lr.clone();
+        snap_quiet.soundstage_band_pts = split_stereo_5band_soundstage(&quiet_lr, sr);
+        for _ in 0..60 {
+            viz_quiet.step(&snap_quiet, 1.0 / 60.0, false);
+        }
+        assert!(
+            viz_quiet.soundstage_gain_value() > viz_loud.soundstage_gain_value() * 3.0,
+            "AGC must boost quiet volume gain significantly: quiet={} vs loud={}",
+            viz_quiet.soundstage_gain_value(),
+            viz_loud.soundstage_gain_value()
+        );
+        assert!(
+            viz_loud.soundstage_band_counts().iter().all(|&c| c > 0),
+            "phosphor cloud must contain all 5 frequency bands: {:?}",
+            viz_loud.soundstage_band_counts()
+        );
+    }
+
+    #[test]
+    fn test_v024_playlist_race_cover_flow_launch_and_toggles() {
+        use am_light_lib::app_ui::{AppUi, MediaCardItem, PageRoute, UiAction};
+        use am_light_lib::lyrics::eval_frontier_glow_profile;
+        use am_light_lib::theme::RectF;
+
+        let mut ui = AppUi::new(0);
+        ui.settings.reduce_motion = false;
+
+        // 1. Rapid playlist switching monotonically increments `detail_req_seq`!
+        let s0 = ui.detail_req_seq;
+        ui.navigate_to(PageRoute::ContainerDetail {
+            kind: "library-playlists".to_string(),
+            id: "p.AAA".to_string(),
+            title_hint: "Playlist A".to_string(),
+        });
+        let s1 = ui.detail_req_seq;
+        ui.navigate_to(PageRoute::ContainerDetail {
+            kind: "library-playlists".to_string(),
+            id: "p.BBB".to_string(),
+            title_hint: "Playlist B".to_string(),
+        });
+        let s2 = ui.detail_req_seq;
+        assert!(s1 > s0 && s2 > s1, "seq must increase on rapid playlist switches: {s0}->{s1}->{s2}");
+
+        // 2. Cover Flow Easter Egg: navigating to LibAlbums enters grid, re-clicking LibAlbums toggles Cover Flow!
+        ui.lib_cards.insert(
+            "albums".to_string(),
+            (0..5)
+                .map(|i| MediaCardItem {
+                    id: format!("alb.{i}"),
+                    kind: "library-albums".to_string(),
+                    title: format!("Album {i}"),
+                    subtitle: "Artist".to_string(),
+                    description: String::new(),
+                    artwork_url: None,
+                    badge: None,
+                    track_input: None,
+                })
+                .collect(),
+        );
+        ui.navigate_to(PageRoute::LibAlbums);
+        assert!(!ui.albums_cover_flow);
+        ui.navigate_to(PageRoute::LibAlbums);
+        assert!(ui.albums_cover_flow, "second click on LibAlbums must enter Cover Flow");
+        assert!(ui.on_cover_flow_key(0x27)); // Right arrow
+        assert_eq!(ui.cover_flow_target, 1);
+        ui.navigate_to(PageRoute::LibAlbums);
+        assert!(!ui.albums_cover_flow, "third click on LibAlbums must exit Cover Flow");
+
+        // 3. Hero Album Cover Launch Zoom Animation
+        let src_rect = RectF::new(120.0, 260.0, 180.0, 180.0);
+        ui.execute_action(UiAction::OpenContainerFromCard {
+            kind: "albums".to_string(),
+            id: "12345".to_string(),
+            title_hint: "Test Album".to_string(),
+            artwork_url: None,
+            card_rect: src_rect,
+            card_radius: 12.0,
+        });
+        let anim = ui.cover_launch_anim.as_ref().expect("launch anim active");
+        assert_eq!(anim.target_id, "12345");
+        assert_eq!(anim.from_rect.x, 120.0);
+        assert!(ui.needs_continuous_animation());
+
+        // 4. Window maximize transition + new settings toggles + readable glow ceiling
+        ui.on_window_maximize_toggled(true);
+        assert_eq!(ui.win_max_trans, 0.0);
+        assert!(ui.win_max_going_max);
+
+        let init_eq = ui.settings.live_eq_icon_spectrum;
+        ui.execute_action(UiAction::ToggleLiveEqIconSpectrum);
+        assert_eq!(ui.settings.live_eq_icon_spectrum, !init_eq);
+        ui.execute_action(UiAction::ToggleLiveEqIconSpectrum);
+        assert_eq!(ui.settings.live_eq_icon_spectrum, init_eq);
+
+        let init_mem = ui.settings.aggressive_memory_release;
+        ui.execute_action(UiAction::ToggleAggressiveMemoryRelease);
+        assert_eq!(ui.settings.aggressive_memory_release, !init_mem);
+        ui.execute_action(UiAction::ToggleAggressiveMemoryRelease);
+        assert_eq!(ui.settings.aggressive_memory_release, init_mem);
+
+        // Emphasized glow profile must stay legible (never saturated to 1.0 white blowout)
+        let (body_mid, peak_mid, _) = eval_frontier_glow_profile(0.5, 0.0, 0.0, false, true, 1.0);
+        assert!(body_mid <= 0.65 && peak_mid <= 0.80, "glow must stay readable: body={body_mid}, peak={peak_mid}");
     }
 }

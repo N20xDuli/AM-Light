@@ -4,7 +4,7 @@ use crate::am_agent::{
     self, format_artwork_template, format_audio_traits_badge, parse_track_from_am_json,
     AgentStatus, AgentTrackInput, AudioPrefs, CachedTrackMeta,
 };
-use crate::am_api::{self, AuthVerifyResult};
+use crate::am_api::{self, AuthVerifyResult, EditorialShelf, EditorialShelfKind};
 use crate::audio_viz::{self, AudioOutputDevice, LiveVisualizerSnapshot};
 use crate::binaural_dsp::{self, BinauralConfig, BinauralStatus};
 use crate::d2d_renderer::{D2DRenderer, GlassBtnVariant, SfIcon, TextAlign};
@@ -12,9 +12,34 @@ use crate::downloads::{self, DownloadsOverview};
 use crate::drm_fix::{self, DrmDiagReport};
 use crate::lyrics::{self, NonEmphasisLyricsEffect, ParsedLyrics};
 use crate::lyrics_view::{LyricsHitAction, LyricsViewState};
+use crate::motion_art::MotionArtManager;
 use crate::smtc::{self, SmtcState};
 use crate::theme::{Color, RectF, Theme};
 use crate::visualizers::{VizHitAction, VizStyle, VisualizerState};
+
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+pub fn parse_semver_tuple(raw: &str) -> Option<(u32, u32, u32)> {
+    let cleaned = raw
+        .trim()
+        .trim_start_matches('v')
+        .trim_start_matches('V')
+        .split('-')
+        .next()?
+        .trim();
+    let mut parts = cleaned.split('.');
+    let major = parts.next()?.parse::<u32>().ok()?;
+    let minor = parts.next().unwrap_or("0").parse::<u32>().ok()?;
+    let patch = parts.next().unwrap_or("0").parse::<u32>().ok()?;
+    Some((major, minor, patch))
+}
+
+pub fn is_remote_version_newer(current: &str, remote_tag: &str) -> bool {
+    match (parse_semver_tuple(current), parse_semver_tuple(remote_tag)) {
+        (Some(cur), Some(rem)) => rem > cur,
+        _ => false,
+    }
+}
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -197,6 +222,18 @@ pub struct AppSettings {
     pub lyrics_latin_by_word: bool,
     #[serde(default)]
     pub lyrics_non_emphasis_effect: NonEmphasisLyricsEffect,
+    #[serde(default = "default_true")]
+    pub lyrics_auto_emphasis: bool,
+    #[serde(default = "default_true")]
+    pub lyrics_frontier_wave: bool,
+    #[serde(default)]
+    pub lyrics_blur_downsample: bool,
+    #[serde(default = "default_true")]
+    pub motion_artwork_enabled: bool,
+    #[serde(default = "default_true")]
+    pub live_eq_icon_spectrum: bool,
+    #[serde(default)]
+    pub aggressive_memory_release: bool,
     pub reduce_motion: bool,
     pub reduce_transparency: bool,
     pub lyrics_free_blur: bool,
@@ -222,6 +259,12 @@ impl Default for AppSettings {
             liquid_glass_enabled: false,
             lyrics_latin_by_word: true,
             lyrics_non_emphasis_effect: NonEmphasisLyricsEffect::None,
+            lyrics_auto_emphasis: true,
+            lyrics_frontier_wave: true,
+            lyrics_blur_downsample: false,
+            motion_artwork_enabled: true,
+            live_eq_icon_spectrum: true,
+            aggressive_memory_release: false,
             reduce_motion: false,
             reduce_transparency: false,
             lyrics_free_blur: false,
@@ -402,7 +445,11 @@ pub enum AsyncMsg {
     },
     LibrarySongsLoaded(Vec<AgentTrackInput>),
     SidebarPlaylistsLoaded(Vec<MediaCardItem>),
-    ContainerLoaded(Result<ContainerDetailData, String>),
+    ContainerLoaded {
+        seq: u64,
+        expected_id: String,
+        res: Result<ContainerDetailData, String>,
+    },
     PlaylistBackgroundUpdated(ContainerDetailData),
     PeriodicPlaylistSyncDue,
     DownloadsLoaded(Result<DownloadsOverview, String>),
@@ -445,6 +492,19 @@ pub enum AsyncMsg {
         report: DrmDiagReport,
         banner: Option<(String, bool)>,
     },
+    HomeShelvesLoaded(Vec<EditorialShelf>),
+    BrowseShelvesLoaded(Vec<EditorialShelf>),
+    RadioShelvesLoaded(Vec<EditorialShelf>),
+    TrackMotionVideoResolved {
+        track_key: String,
+        video_url: Option<String>,
+    },
+    UpdateCheckResult {
+        latest_tag: Option<String>,
+        release_url: Option<String>,
+        message: String,
+        is_newer: bool,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -476,6 +536,16 @@ pub enum UiAction {
     WindowToggleMaximize,
     WindowClose,
     Navigate(PageRoute),
+    OpenContainerFromCard {
+        kind: String,
+        id: String,
+        title_hint: String,
+        artwork_url: Option<String>,
+        card_rect: RectF,
+        card_radius: f32,
+    },
+    CoverFlowSelect(i32),
+    ToggleAlbumsCoverFlow,
     NavigateBack,
     ToggleSidebar,
     ToggleSidebarEdit,
@@ -556,9 +626,18 @@ pub enum UiAction {
     ToggleLiquidGlass,
     ToggleLyricsLatinByWord,
     SetLyricsNonEmphasisEffect(NonEmphasisLyricsEffect),
+    ToggleLyricsAutoEmphasis,
+    ToggleLyricsFrontierWave,
+    ToggleLyricsBlurDownsample,
+    ToggleMotionArtwork,
+    ToggleLiveEqIconSpectrum,
+    ToggleAggressiveMemoryRelease,
     ToggleLyricsBlurMode,
     ToggleReduceMotion,
     ToggleReduceTransparency,
+    CloseNarrowSidebarOverlay,
+    CheckForUpdates,
+    OpenUrl(String),
     // Hidden-by-default spatial audio flavor disclosure
     ToggleAdvancedSpatialDisclosure,
     ToggleBinauralEnabled,
@@ -633,6 +712,9 @@ pub struct AppUi {
     pub home_playlists: Vec<MediaCardItem>,
     pub home_songs: Vec<AgentTrackInput>,
     pub radio_cards: Vec<MediaCardItem>,
+    pub home_shelves: Vec<EditorialShelf>,
+    pub browse_shelves: Vec<EditorialShelf>,
+    pub radio_shelves: Vec<EditorialShelf>,
     pub search_albums: Vec<MediaCardItem>,
     pub search_playlists: Vec<MediaCardItem>,
     pub search_songs: Vec<AgentTrackInput>,
@@ -713,9 +795,19 @@ pub struct AppUi {
     smtc_seek_pre_univ: i64,
     pub lyrics_fetched_with_dur: f64,
     lyrics_req_seq: u64,
-    eq_bars_smooth: [f32; 6],
+    eq_bars_smooth: [f32; 5],
     hover_alphas: HashMap<u64, f32>,
     visited_hover_keys: HashSet<u64>,
+    has_settling_hover: bool,
+    pub narrow_sidebar_overlay_open: bool,
+    pub last_win_w: f32,
+    motion_art: MotionArtManager,
+    visible_home_motion_urls: Vec<String>,
+    track_motion_urls: HashMap<String, Option<String>>,
+    pending_motion_tracks: HashSet<String>,
+    pub update_checking: bool,
+    pub update_status_msg: Option<String>,
+    pub update_latest_url: Option<String>,
     art_fading_until: Option<Instant>,
     frame_dt: f32,
     pub playlist_cache: PlaylistDiskCache,
@@ -724,6 +816,25 @@ pub struct AppUi {
     playlist_sync_in_flight: bool,
     pub drm_diag: DrmDiagReport,
     pub drm_repair_running: bool,
+    pub detail_req_seq: u64,
+    pub albums_cover_flow: bool,
+    pub cover_flow_index: f32,
+    pub cover_flow_target: i32,
+    pub cover_launch_anim: Option<CoverLaunchAnimState>,
+    pub win_max_trans: f32,
+    pub win_max_going_max: bool,
+    last_mem_trim_at: Instant,
+    pending_route_mem_trim: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct CoverLaunchAnimState {
+    pub target_id: String,
+    pub artwork_url: Option<String>,
+    pub from_rect: RectF,
+    pub from_radius: f32,
+    pub started_at: Instant,
+    pub duration_sec: f32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
@@ -1069,6 +1180,9 @@ impl AppUi {
             home_playlists: Vec::new(),
             home_songs: Vec::new(),
             radio_cards: Vec::new(),
+            home_shelves: Vec::new(),
+            browse_shelves: Vec::new(),
+            radio_shelves: Vec::new(),
             search_albums: Vec::new(),
             search_playlists: Vec::new(),
             search_songs: Vec::new(),
@@ -1139,9 +1253,19 @@ impl AppUi {
             smtc_seek_pre_univ: 0,
             lyrics_fetched_with_dur: 0.0,
             lyrics_req_seq: 0,
-            eq_bars_smooth: [0.0; 6],
+            eq_bars_smooth: [0.0; 5],
             hover_alphas: HashMap::with_capacity(64),
             visited_hover_keys: HashSet::with_capacity(64),
+            has_settling_hover: false,
+            narrow_sidebar_overlay_open: false,
+            last_win_w: 1280.0,
+            motion_art: MotionArtManager::new(),
+            visible_home_motion_urls: Vec::with_capacity(4),
+            track_motion_urls: HashMap::with_capacity(16),
+            pending_motion_tracks: HashSet::with_capacity(16),
+            update_checking: false,
+            update_status_msg: None,
+            update_latest_url: None,
             art_fading_until: None,
             frame_dt: 1.0 / 60.0,
             playlist_cache,
@@ -1150,9 +1274,19 @@ impl AppUi {
             playlist_sync_in_flight: false,
             drm_diag: DrmDiagReport::default(),
             drm_repair_running: false,
+            detail_req_seq: 0,
+            albums_cover_flow: false,
+            cover_flow_index: 0.0,
+            cover_flow_target: 0,
+            cover_launch_anim: None,
+            win_max_trans: 1.0,
+            win_max_going_max: false,
+            last_mem_trim_at: now,
+            pending_route_mem_trim: false,
         };
 
         if wake_hwnd != 0 {
+            ui.motion_art.set_wake_hwnd(wake_hwnd);
             ui.fetch_initial_data();
             if let Some(arg_os) = std::env::args_os().nth(1) {
                 let p = PathBuf::from(arg_os);
@@ -1225,10 +1359,67 @@ impl AppUi {
     }
 
     pub fn update_viz_subscription(&self) {
-        // Strictly capture/render audio ONLY on the Visualizer page (even when unfocused in background);
-        // anywhere else (Home, Playlist Detail, Lyrics Overlay, Settings, etc.), WASAPI loopback stays stopped!
-        let want_viz = self.route == PageRoute::Visualizer && !self.show_lyrics_overlay;
-        audio_viz::set_viz_subscribed(want_viz);
+        // Subscribe WASAPI loopback when on the Visualizer page OR when playing with
+        // real-time 5-bar spectrum icon enabled (ultra-lightweight 512-pt FFT, stops immediately on pause!).
+        let on_viz = self.route == PageRoute::Visualizer && !self.show_lyrics_overlay;
+        let want_icon_fft = self.settings.live_eq_icon_spectrum
+            && !self.settings.reduce_motion
+            && self.smtc.status == "Playing"
+            && !self.show_lyrics_overlay;
+        audio_viz::set_viz_subscribed(on_viz || want_icon_fft);
+    }
+
+    pub fn on_window_maximize_toggled(&mut self, going_maximized: bool) {
+        self.win_max_going_max = going_maximized;
+        self.win_max_trans = if self.settings.reduce_motion { 1.0 } else { 0.0 };
+    }
+
+    pub fn on_cover_flow_key(&mut self, vk: u16) -> bool {
+        if self.route != PageRoute::LibAlbums || !self.albums_cover_flow {
+            return false;
+        }
+        let count = self.lib_cards.get("albums").map(|v| v.len()).unwrap_or(0);
+        if count == 0 {
+            return false;
+        }
+        let max_i = (count - 1) as i32;
+        match vk {
+            0x25 => {
+                // VK_LEFT
+                self.cover_flow_target = (self.cover_flow_target - 1).clamp(0, max_i);
+                if self.settings.reduce_motion {
+                    self.cover_flow_index = self.cover_flow_target as f32;
+                }
+                true
+            }
+            0x27 => {
+                // VK_RIGHT
+                self.cover_flow_target = (self.cover_flow_target + 1).clamp(0, max_i);
+                if self.settings.reduce_motion {
+                    self.cover_flow_index = self.cover_flow_target as f32;
+                }
+                true
+            }
+            0x0D => {
+                // VK_RETURN: open currently centered album
+                let idx = (self.cover_flow_target.clamp(0, max_i)) as usize;
+                if let Some(item) = self.lib_cards.get("albums").and_then(|v| v.get(idx)).cloned() {
+                    let cx = (self.last_win_w * 0.5).max(320.0);
+                    let hero_r = RectF::new(cx - 120.0, 210.0, 240.0, 240.0);
+                    self.execute_action(UiAction::OpenContainerFromCard {
+                        kind: item.kind,
+                        id: item.id,
+                        title_hint: item.title,
+                        artwork_url: item.artwork_url,
+                        card_rect: hero_r,
+                        card_radius: 12.0,
+                    });
+                    return true;
+                }
+                false
+            }
+            _ => false,
+        }
     }
 
     fn eval_hover_alpha(&mut self, key_id: u64, is_hovered: bool) -> f32 {
@@ -1245,8 +1436,14 @@ impl AppUi {
         };
         if next <= 0.008 && !is_hovered {
             self.hover_alphas.remove(&key_id);
+            if cur > 0.008 {
+                self.has_settling_hover = true;
+            }
             0.0
         } else {
+            if (next - cur).abs() > 0.002 || (is_hovered && next < 0.996) {
+                self.has_settling_hover = true;
+            }
             self.hover_alphas.insert(key_id, next);
             next
         }
@@ -1299,7 +1496,7 @@ impl AppUi {
         {
             return true;
         }
-        if !self.hover_alphas.is_empty() {
+        if self.has_settling_hover {
             return true;
         }
         if self
@@ -1340,7 +1537,11 @@ impl AppUi {
         if self.has_active_ui_motion() {
             return resolve_cap_sync_and_hz(FpsCap::VSync, mon, 120);
         }
-        (0, 60, Some(16_400_000))
+        (0, 30, Some(33_000_000))
+    }
+
+    pub fn pause_motion_art_for_minimize(&mut self) {
+        self.motion_art.set_global_enabled(false);
     }
 
     pub fn needs_continuous_animation(&self) -> bool {
@@ -1376,7 +1577,7 @@ impl AppUi {
         {
             return true;
         }
-        if !self.hover_alphas.is_empty() {
+        if self.has_settling_hover {
             return true;
         }
         if self
@@ -1389,6 +1590,15 @@ impl AppUi {
             return true;
         }
         if self.smtc.status == "Playing" || self.eq_bars_smooth.iter().any(|&v| v > 0.015) {
+            return true;
+        }
+        if self.win_max_trans < 0.998 || self.cover_launch_anim.is_some() {
+            return true;
+        }
+        if self.route == PageRoute::LibAlbums
+            && self.albums_cover_flow
+            && (self.cover_flow_index - (self.cover_flow_target as f32)).abs() > 0.004
+        {
             return true;
         }
         if self.show_lyrics_overlay {
@@ -1531,6 +1741,42 @@ impl AppUi {
                 AsyncMsg::RadioLoaded(cards) => {
                     self.radio_cards = cards;
                 }
+                AsyncMsg::HomeShelvesLoaded(shelves) => {
+                    self.home_shelves = shelves;
+                }
+                AsyncMsg::BrowseShelvesLoaded(shelves) => {
+                    self.browse_shelves = shelves;
+                }
+                AsyncMsg::RadioShelvesLoaded(shelves) => {
+                    self.radio_shelves = shelves;
+                }
+                AsyncMsg::TrackMotionVideoResolved {
+                    track_key,
+                    video_url,
+                } => {
+                    self.pending_motion_tracks.remove(&track_key);
+                    if !self.smtc.title.trim().is_empty() && track_key == self.current_lyrics_key {
+                        let meta_fallback = format!(
+                            "meta_motion:{}|{}",
+                            self.smtc.title.trim().to_lowercase(),
+                            self.smtc.artist.trim().to_lowercase()
+                        );
+                        self.track_motion_urls
+                            .insert(meta_fallback, video_url.clone());
+                    }
+                    self.track_motion_urls.insert(track_key, video_url);
+                }
+                AsyncMsg::UpdateCheckResult {
+                    latest_tag,
+                    release_url,
+                    message,
+                    is_newer,
+                } => {
+                    self.update_checking = false;
+                    let _ = latest_tag;
+                    self.update_status_msg = Some(message);
+                    self.update_latest_url = if is_newer { release_url } else { None };
+                }
                 AsyncMsg::SearchResults {
                     query,
                     albums,
@@ -1555,13 +1801,34 @@ impl AppUi {
                     self.save_playlist_cache_async();
                     self.sidebar_playlists = pls;
                 }
-                AsyncMsg::ContainerLoaded(res) => {
-                    self.detail_loading = false;
+                AsyncMsg::ContainerLoaded {
+                    seq,
+                    expected_id,
+                    res,
+                } => {
+                    let is_current = seq == self.detail_req_seq
+                        && matches!(
+                            &self.route,
+                            PageRoute::ContainerDetail { id, .. } if id == &expected_id
+                        );
                     match res {
-                        Ok(data) => self.apply_loaded_container_detail(data),
+                        Ok(data) => {
+                            if data.kind.contains("playlist") {
+                                self.playlist_cache
+                                    .upsert_detail(&data, current_unix_sec());
+                                self.save_playlist_cache_async();
+                            }
+                            if is_current {
+                                self.detail_loading = false;
+                                self.apply_loaded_container_detail(data);
+                            }
+                        }
                         Err(e) => {
-                            if self.detail_data.is_none() {
-                                self.set_banner(e, true);
+                            if is_current {
+                                self.detail_loading = false;
+                                if self.detail_data.is_none() {
+                                    self.set_banner(e, true);
+                                }
                             }
                         }
                     }
@@ -1614,7 +1881,14 @@ impl AppUi {
                     self.agent_status = st;
                 }
                 AsyncMsg::AudioPrefsLoaded(p) => {
+                    let tier_changed = self.audio_prefs.lossless_enabled != p.lossless_enabled
+                        || self.audio_prefs.streaming_audio_quality != p.streaming_audio_quality
+                        || self.audio_prefs.dolby_atmos_setting != p.dolby_atmos_setting;
                     self.audio_prefs = p;
+                    if tier_changed {
+                        self.smtc_catalog_cache.clear();
+                        self.enriched_adam_ids.retain(|k| !k.starts_with("smtc:"));
+                    }
                 }
                 AsyncMsg::DevicesLoaded(devs) => {
                     self.devices = devs;
@@ -2104,7 +2378,7 @@ impl AppUi {
             };
             self.current_lyrics_key = new_key.clone();
             self.dispatch_lyrics_fetch(
-                new_key,
+                new_key.clone(),
                 st.adam_id.clone(),
                 st.title.clone(),
                 st.artist.clone(),
@@ -2112,6 +2386,34 @@ impl AppUi {
                 st.duration_sec,
                 false,
             );
+            if self.settings.motion_artwork_enabled
+                && self.wake_hwnd != 0
+                && !self.track_motion_urls.contains_key(&new_key)
+                && self.pending_motion_tracks.insert(new_key.clone())
+            {
+                let sf = self.settings.storefront.clone();
+                let aid = st.adam_id.clone();
+                let tt = st.title.clone();
+                let ar = st.artist.clone();
+                let al = st.album.clone();
+                let tx = self.tx.clone();
+                let hwnd = self.wake_hwnd;
+                self.rt.spawn(async move {
+                    let vurl = am_api::fetch_track_motion_video_url(
+                        &sf,
+                        aid.as_deref(),
+                        &tt,
+                        &ar,
+                        &al,
+                    )
+                    .await;
+                    let _ = tx.send(AsyncMsg::TrackMotionVideoResolved {
+                        track_key: new_key,
+                        video_url: vurl,
+                    });
+                    Self::post_ui_wake(hwnd);
+                });
+            }
             if let Some(existing) = saved_same_song_lyrics {
                 if self.current_lyrics.is_none() {
                     self.current_lyrics = Some(existing);
@@ -2429,17 +2731,25 @@ impl AppUi {
             return;
         }
         let target_url = if hero {
-            url.replace("360x360", "600x600")
-                .replace("240x240", "600x600")
-                .replace("120x120", "600x600")
+            url.replace("360x360", "720x720")
+                .replace("240x240", "720x720")
+                .replace("120x120", "720x720")
+                .replace("480x480", "720x720")
         } else {
-            url.replace("600x600", "240x240")
-                .replace("360x360", "240x240")
+            url.replace("120x120", "480x480")
+                .replace("240x240", "480x480")
+                .replace("360x360", "480x480")
         };
         let key_url = url.to_string();
         let tx = self.tx.clone();
         let hwnd = self.wake_hwnd;
-        let max_dim = if hero { 560u32 } else { 160u32 };
+        let max_dim = if hero {
+            if self.settings.aggressive_memory_release { 512u32 } else { 768u32 }
+        } else if self.settings.aggressive_memory_release {
+            256u32
+        } else {
+            384u32
+        };
         self.rt.spawn(async move {
             match am_api::fetch_artwork_bytes(&target_url, hero).await {
                 Ok(bytes) => {
@@ -2478,6 +2788,25 @@ impl AppUi {
         let utok = non_empty_opt(&self.settings.user_token);
         let tx = self.tx.clone();
         let hwnd = self.wake_hwnd;
+        let sf_ed = sf.clone();
+        let utok_ed = utok.clone();
+        let tx_home = tx.clone();
+        self.rt.spawn(async move {
+            if let Ok(shelves) =
+                am_api::fetch_home_editorial_shelves(&sf_ed, utok_ed.as_deref()).await
+            {
+                let _ = tx_home.send(AsyncMsg::HomeShelvesLoaded(shelves));
+                Self::post_ui_wake(hwnd);
+            }
+        });
+        let sf_browse = sf.clone();
+        let tx_browse = tx.clone();
+        self.rt.spawn(async move {
+            if let Ok(bshelves) = am_api::fetch_apple_music_web_shelves(&sf_browse, "new").await {
+                let _ = tx_browse.send(AsyncMsg::BrowseShelvesLoaded(bshelves));
+                Self::post_ui_wake(hwnd);
+            }
+        });
         self.rt.spawn(async move {
             let path = format!(
                 "v1/catalog/{sf}/charts?types=albums,playlists,songs&extend=audioTraits&limit=18&l=zh-Hans-CN"
@@ -2527,6 +2856,14 @@ impl AppUi {
         let utok = non_empty_opt(&self.settings.user_token);
         let tx = self.tx.clone();
         let hwnd = self.wake_hwnd;
+        let sf_web = sf.clone();
+        let tx_web = tx.clone();
+        self.rt.spawn(async move {
+            if let Ok(rshelves) = am_api::fetch_apple_music_web_shelves(&sf_web, "radio").await {
+                let _ = tx_web.send(AsyncMsg::RadioShelvesLoaded(rshelves));
+                Self::post_ui_wake(hwnd);
+            }
+        });
         self.rt.spawn(async move {
             let path = format!(
                 "v1/catalog/{sf}/search?term=Apple+Music+%E7%94%B5%E5%8F%B0&types=playlists&limit=18&l=zh-Hans-CN"
@@ -2726,11 +3063,15 @@ impl AppUi {
                 .upsert_detail(&data, current_unix_sec());
             self.save_playlist_cache_async();
         }
-        let same_open_playlist = data.kind.contains("playlist")
-            && matches!(
-                self.route,
-                PageRoute::ContainerDetail { ref id, .. } if id == &data.id
-            );
+        // Strict route guard: never overwrite currently open playlist/album with an out-of-order response!
+        let matches_active_route = matches!(
+            &self.route,
+            PageRoute::ContainerDetail { id, .. } if id == &data.id
+        );
+        if !matches_active_route {
+            return;
+        }
+        let same_open_playlist = data.kind.contains("playlist");
         if same_open_playlist && !self.settings.reduce_motion {
             if let Some(ref prev) = self.detail_data {
                 if prev.id == data.id && prev.tracks != data.tracks {
@@ -2813,6 +3154,9 @@ impl AppUi {
     }
 
     pub fn fetch_container_detail(&mut self, kind: String, id: String, title_hint: String) {
+        self.detail_req_seq = self.detail_req_seq.wrapping_add(1);
+        let req_seq = self.detail_req_seq;
+        let expected_id = id.clone();
         self.playlist_diff_anim = None;
         if kind.contains("playlist") {
             if let Some(cached) = self.playlist_cache.details.get(&id) {
@@ -2833,7 +3177,11 @@ impl AppUi {
 
         self.rt.spawn(async move {
             let res = Self::fetch_container_detail_api(sf, utok, kind, id, title_hint).await;
-            let _ = tx.send(AsyncMsg::ContainerLoaded(res));
+            let _ = tx.send(AsyncMsg::ContainerLoaded {
+                seq: req_seq,
+                expected_id,
+                res,
+            });
             Self::post_ui_wake(hwnd);
         });
     }
@@ -3101,8 +3449,42 @@ impl AppUi {
     }
 
     pub fn navigate_to(&mut self, next: PageRoute) {
+        self.narrow_sidebar_overlay_open = false;
         if self.route == next {
+            // Easter egg: clicking sidebar `专辑` again while already on Albums toggles Cover Flow!
+            if next == PageRoute::LibAlbums {
+                self.albums_cover_flow = !self.albums_cover_flow;
+                if self.albums_cover_flow {
+                    let count = self.lib_cards.get("albums").map(|v| v.len()).unwrap_or(0);
+                    let max_i = count.saturating_sub(1) as i32;
+                    self.cover_flow_target = self.cover_flow_target.clamp(0, max_i);
+                    self.cover_flow_index = self.cover_flow_target as f32;
+                    self.set_banner(
+                        "已进入 Cover Flow 专辑彩蛋视图（滚轮 / 方向键切换，再次点击「专辑」返回）"
+                            .to_string(),
+                        false,
+                    );
+                }
+            }
             return;
+        }
+        if !matches!(&next, PageRoute::ContainerDetail { .. }) {
+            self.detail_req_seq = self.detail_req_seq.wrapping_add(1);
+            self.cover_launch_anim = None;
+        } else if let PageRoute::ContainerDetail { ref id, .. } = next {
+            if self
+                .cover_launch_anim
+                .as_ref()
+                .is_some_and(|a| &a.target_id != id)
+            {
+                self.cover_launch_anim = None;
+            }
+        }
+        if next != PageRoute::LibAlbums {
+            self.albums_cover_flow = false;
+        }
+        if self.settings.aggressive_memory_release {
+            self.pending_route_mem_trim = true;
         }
         self.art_epoch
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3123,12 +3505,15 @@ impl AppUi {
 
         match &next {
             PageRoute::Home | PageRoute::Browse => {
-                if self.home_albums.is_empty() {
+                if self.home_albums.is_empty()
+                    || self.home_shelves.is_empty()
+                    || (next == PageRoute::Browse && self.browse_shelves.is_empty())
+                {
                     self.fetch_home_charts();
                 }
             }
             PageRoute::Radio => {
-                if self.radio_cards.is_empty() {
+                if self.radio_cards.is_empty() || self.radio_shelves.is_empty() {
                     self.fetch_radio_mixes();
                 }
             }
@@ -3198,6 +3583,18 @@ impl AppUi {
                 (self.sidebar_scroll_target_y - px).clamp(0.0, self.sidebar_max_scroll_y);
             if self.settings.reduce_motion {
                 self.sidebar_scroll_y = self.sidebar_scroll_target_y;
+            }
+            return;
+        }
+        if self.route == PageRoute::LibAlbums && self.albums_cover_flow {
+            let count = self.lib_cards.get("albums").map(|v| v.len()).unwrap_or(0);
+            if count > 0 {
+                let step = if delta_notches > 0.0 { -1 } else { 1 };
+                let max_i = (count - 1) as i32;
+                self.cover_flow_target = (self.cover_flow_target + step).clamp(0, max_i);
+                if self.settings.reduce_motion {
+                    self.cover_flow_index = self.cover_flow_target as f32;
+                }
             }
             return;
         }
@@ -3830,8 +4227,62 @@ impl AppUi {
                 }
             }
             UiAction::Navigate(r) => self.navigate_to(r),
+            UiAction::OpenContainerFromCard {
+                kind,
+                id,
+                title_hint,
+                artwork_url,
+                card_rect,
+                card_radius,
+            } => {
+                if kind == "stations" || kind == "station" || kind == "songs" {
+                    self.execute_action(UiAction::PlayContainer {
+                        kind,
+                        id,
+                        shuffle: false,
+                    });
+                    return;
+                }
+                if !self.settings.reduce_motion && card_rect.w > 10.0 && card_rect.h > 10.0 {
+                    self.cover_launch_anim = Some(CoverLaunchAnimState {
+                        target_id: id.clone(),
+                        artwork_url,
+                        from_rect: card_rect,
+                        from_radius: card_radius,
+                        started_at: Instant::now(),
+                        duration_sec: 0.38,
+                    });
+                } else {
+                    self.cover_launch_anim = None;
+                }
+                self.navigate_to(PageRoute::ContainerDetail {
+                    kind,
+                    id,
+                    title_hint,
+                });
+            }
+            UiAction::CoverFlowSelect(idx) => {
+                let count = self.lib_cards.get("albums").map(|v| v.len()).unwrap_or(0);
+                if count > 0 {
+                    self.cover_flow_target = idx.clamp(0, (count - 1) as i32);
+                    if self.settings.reduce_motion {
+                        self.cover_flow_index = self.cover_flow_target as f32;
+                    }
+                }
+            }
+            UiAction::ToggleAlbumsCoverFlow => {
+                self.albums_cover_flow = !self.albums_cover_flow;
+            }
             UiAction::NavigateBack => {
                 if let Some(prev) = self.nav_history.pop() {
+                    self.detail_req_seq = self.detail_req_seq.wrapping_add(1);
+                    self.cover_launch_anim = None;
+                    if prev != PageRoute::LibAlbums {
+                        self.albums_cover_flow = false;
+                    }
+                    if self.settings.aggressive_memory_release {
+                        self.pending_route_mem_trim = true;
+                    }
                     self.route = prev;
                     self.route_trans = if self.settings.reduce_motion { 1.0 } else { 0.0 };
                     self.route_trans_dir = -1.0;
@@ -3842,14 +4293,26 @@ impl AppUi {
                 }
             }
             UiAction::ToggleSidebar => {
-                self.settings.sidebar_collapsed = !self.settings.sidebar_collapsed;
-                self.sidebar_open_spring.target = if self.settings.sidebar_collapsed {
-                    0.0
+                if self.last_win_w > 0.0 && self.last_win_w < Theme::SIDEBAR_AUTO_COLLAPSE_WIDTH {
+                    self.narrow_sidebar_overlay_open = !self.narrow_sidebar_overlay_open;
+                    self.sidebar_open_spring.target =
+                        if self.narrow_sidebar_overlay_open { 1.0 } else { 0.0 };
                 } else {
-                    1.0
-                };
-                if self.wake_hwnd != 0 {
-                    self.settings.save();
+                    self.settings.sidebar_collapsed = !self.settings.sidebar_collapsed;
+                    self.sidebar_open_spring.target = if self.settings.sidebar_collapsed {
+                        0.0
+                    } else {
+                        1.0
+                    };
+                    if self.wake_hwnd != 0 {
+                        self.settings.save();
+                    }
+                }
+            }
+            UiAction::CloseNarrowSidebarOverlay => {
+                self.narrow_sidebar_overlay_open = false;
+                if self.last_win_w < Theme::SIDEBAR_AUTO_COLLAPSE_WIDTH {
+                    self.sidebar_open_spring.target = 0.0;
                 }
             }
             UiAction::ToggleSidebarEdit => {
@@ -3899,7 +4362,11 @@ impl AppUi {
                 }
                 let sf = self.settings.storefront.clone();
                 if !self.settings.use_builtin_service {
-                    let uri_kind = if kind.contains("playlist") {
+                    let uri_kind = if kind.contains("station") {
+                        "station"
+                    } else if kind.contains("song") {
+                        "song"
+                    } else if kind.contains("playlist") {
                         "playlist"
                     } else {
                         "album"
@@ -4388,6 +4855,146 @@ impl AppUi {
                     self.settings.save();
                 }
             }
+            UiAction::ToggleLyricsAutoEmphasis => {
+                self.settings.lyrics_auto_emphasis = !self.settings.lyrics_auto_emphasis;
+                if self.wake_hwnd != 0 {
+                    self.settings.save();
+                }
+            }
+            UiAction::ToggleLyricsFrontierWave => {
+                self.settings.lyrics_frontier_wave = !self.settings.lyrics_frontier_wave;
+                if self.wake_hwnd != 0 {
+                    self.settings.save();
+                }
+            }
+            UiAction::ToggleLyricsBlurDownsample => {
+                self.settings.lyrics_blur_downsample = !self.settings.lyrics_blur_downsample;
+                if self.wake_hwnd != 0 {
+                    self.settings.save();
+                }
+            }
+            UiAction::ToggleMotionArtwork => {
+                self.settings.motion_artwork_enabled = !self.settings.motion_artwork_enabled;
+                self.motion_art
+                    .set_global_enabled(self.settings.motion_artwork_enabled && !self.settings.reduce_motion);
+                if self.settings.motion_artwork_enabled && self.wake_hwnd != 0 {
+                    let cur_key = self.current_lyrics_key.clone();
+                    if !cur_key.is_empty()
+                        && !self.track_motion_urls.contains_key(&cur_key)
+                        && self.pending_motion_tracks.insert(cur_key.clone())
+                    {
+                        let sf = self.settings.storefront.clone();
+                        let aid = self.smtc.adam_id.clone();
+                        let tt = self.smtc.title.clone();
+                        let ar = self.smtc.artist.clone();
+                        let al = self.smtc.album.clone();
+                        let tx = self.tx.clone();
+                        let hwnd = self.wake_hwnd;
+                        self.rt.spawn(async move {
+                            let vurl = am_api::fetch_track_motion_video_url(
+                                &sf,
+                                aid.as_deref(),
+                                &tt,
+                                &ar,
+                                &al,
+                            )
+                            .await;
+                            let _ = tx.send(AsyncMsg::TrackMotionVideoResolved {
+                                track_key: cur_key,
+                                video_url: vurl,
+                            });
+                            Self::post_ui_wake(hwnd);
+                        });
+                    }
+                }
+                if self.wake_hwnd != 0 {
+                    self.settings.save();
+                }
+            }
+            UiAction::CheckForUpdates => {
+                if self.update_checking || self.wake_hwnd == 0 {
+                    return;
+                }
+                self.update_checking = true;
+                self.update_status_msg = Some("正在检查 GitHub 最新版本...".to_string());
+                let tx = self.tx.clone();
+                let hwnd = self.wake_hwnd;
+                self.rt.spawn(async move {
+                    let client = reqwest::Client::builder()
+                        .timeout(std::time::Duration::from_secs(10))
+                        .user_agent(format!("AM-Light/{APP_VERSION}"))
+                        .build();
+                    let result = match client {
+                        Ok(c) => match c
+                            .get("https://api.github.com/repos/N20xDuli/AM-Light/releases/latest")
+                            .header("Accept", "application/vnd.github+json")
+                            .send()
+                            .await
+                        {
+                            Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+                                Ok(json) => {
+                                    let tag = json
+                                        .get("tag_name")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let html_url = json
+                                        .get("html_url")
+                                        .and_then(Value::as_str)
+                                        .map(str::to_string);
+                                    if tag.is_empty() {
+                                        (None, None, "未读取到发布标签".to_string(), false)
+                                    } else if is_remote_version_newer(APP_VERSION, &tag) {
+                                        (
+                                            Some(tag.clone()),
+                                            html_url,
+                                            format!("发现新版本 {tag}（当前 v{APP_VERSION}）"),
+                                            true,
+                                        )
+                                    } else {
+                                        (
+                                            Some(tag.clone()),
+                                            html_url,
+                                            format!("已是最新版本（v{APP_VERSION}，远程 {tag}）"),
+                                            false,
+                                        )
+                                    }
+                                }
+                                Err(e) => (None, None, format!("解析更新信息失败: {e}"), false),
+                            },
+                            Ok(resp) => (None, None, format!("检查更新失败: HTTP {}", resp.status()), false),
+                            Err(e) => (None, None, format!("网络请求失败: {e}"), false),
+                        },
+                        Err(e) => (None, None, format!("创建 HTTP 客户端失败: {e}"), false),
+                    };
+                    let _ = tx.send(AsyncMsg::UpdateCheckResult {
+                        latest_tag: result.0,
+                        release_url: result.1,
+                        message: result.2,
+                        is_newer: result.3,
+                    });
+                    Self::post_ui_wake(hwnd);
+                });
+            }
+            UiAction::OpenUrl(url) => {
+                if url.starts_with("https://") || url.starts_with("http://") {
+                    open_external_browser(&url);
+                }
+            }
+            UiAction::ToggleLiveEqIconSpectrum => {
+                self.settings.live_eq_icon_spectrum = !self.settings.live_eq_icon_spectrum;
+                self.update_viz_subscription();
+                if self.wake_hwnd != 0 {
+                    self.settings.save();
+                }
+            }
+            UiAction::ToggleAggressiveMemoryRelease => {
+                self.settings.aggressive_memory_release = !self.settings.aggressive_memory_release;
+                self.pending_route_mem_trim = true;
+                if self.wake_hwnd != 0 {
+                    self.settings.save();
+                }
+            }
             UiAction::ToggleLyricsBlurMode => {
                 self.settings.lyrics_free_blur = !self.settings.lyrics_free_blur;
                 self.lyrics_view.music_free_blur = self.settings.lyrics_free_blur;
@@ -4551,6 +5158,8 @@ impl AppUi {
 
     fn save_audio_prefs_async(&mut self, prefs: AudioPrefs) {
         self.audio_prefs = prefs.clone();
+        self.smtc_catalog_cache.clear();
+        self.enriched_adam_ids.retain(|k| !k.starts_with("smtc:"));
         let tx = self.tx.clone();
         let hwnd = self.wake_hwnd;
         self.rt.spawn(async move {
@@ -4636,6 +5245,35 @@ impl AppUi {
         let dt = dt_sec.clamp(0.001, 0.08);
         self.frame_dt = dt;
         self.visited_hover_keys.clear();
+        self.has_settling_hover = false;
+        r.set_aggressive_memory_release(self.settings.aggressive_memory_release);
+        if self.settings.aggressive_memory_release
+            && (self.pending_route_mem_trim
+                || self.last_mem_trim_at.elapsed() >= std::time::Duration::from_secs(12))
+        {
+            self.pending_route_mem_trim = false;
+            self.last_mem_trim_at = Instant::now();
+            r.perform_aggressive_memory_trim(self.show_lyrics_overlay);
+        }
+        if self.win_max_trans < 1.0 {
+            if self.settings.reduce_motion {
+                self.win_max_trans = 1.0;
+            } else {
+                self.win_max_trans = (self.win_max_trans + dt / 0.21).min(1.0);
+            }
+        }
+        if self.route == PageRoute::LibAlbums && self.albums_cover_flow {
+            let tgt = self.cover_flow_target as f32;
+            if self.settings.reduce_motion {
+                self.cover_flow_index = tgt;
+            } else {
+                let k = (1.0 - (-14.0 * dt).exp()).clamp(0.05, 1.0);
+                self.cover_flow_index += (tgt - self.cover_flow_index) * k;
+                if (self.cover_flow_index - tgt).abs() < 0.003 {
+                    self.cover_flow_index = tgt;
+                }
+            }
+        }
 
         // Same-frame (<4ms) gapless & duration/onset sync whenever AMPLibraryAgent increments `state_seq()`!
         let cur_agent_seq = am_agent::state_seq();
@@ -4682,8 +5320,18 @@ impl AppUi {
         let win_w = r.logical_width();
         let win_h = r.logical_height();
         let win_rect = RectF::new(0.0, 0.0, win_w, win_h);
-        let want_sb = if !self.settings.sidebar_collapsed && win_w >= Theme::SIDEBAR_AUTO_COLLAPSE_WIDTH
-        {
+        self.last_win_w = win_w;
+        let is_narrow = win_w < Theme::SIDEBAR_AUTO_COLLAPSE_WIDTH;
+        if !is_narrow {
+            self.narrow_sidebar_overlay_open = false;
+        }
+        let want_sb = if is_narrow {
+            if self.narrow_sidebar_overlay_open {
+                1.0f32
+            } else {
+                0.0f32
+            }
+        } else if !self.settings.sidebar_collapsed {
             1.0f32
         } else {
             0.0f32
@@ -4691,7 +5339,11 @@ impl AppUi {
         let want_lib = if self.sec_library_open { 1.0f32 } else { 0.0f32 };
         let want_pls = if self.sec_playlists_open { 1.0f32 } else { 0.0f32 };
         let want_edit = if self.sidebar_edit_mode { 1.0f32 } else { 0.0f32 };
-        let cur_sb_w = Theme::SIDEBAR_WIDTH * self.sidebar_open_spring.value.clamp(0.0, 1.0);
+        let cur_sb_w = if is_narrow {
+            0.0
+        } else {
+            Theme::SIDEBAR_WIDTH * self.sidebar_open_spring.value.clamp(0.0, 1.0)
+        };
         let want_tb_guard = if !self.show_lyrics_overlay
             && self.route != PageRoute::Visualizer
             && self.mouse_pos.1 >= 0.0
@@ -4833,14 +5485,28 @@ impl AppUi {
             );
         }
 
-        // Sample live WASAPI audio visualizer ONLY when actively viewing the Visualizer page
-        // (even in unfocused background window); zero WASAPI capture or FFT elsewhere!
+        // Sample full WASAPI audio visualizer on Visualizer page, or ultra-lightweight 512-pt FFT
+        // when playing with「实时频谱播放图标」enabled so both the playing-cover 5 bars and sidebar
+        // Visualizer icon react to real-time audio even when the Visualizer page is closed!
         let is_playing_now = self.smtc.status == "Playing";
         let on_visualizer_page = self.route == PageRoute::Visualizer && !self.show_lyrics_overlay;
+        let use_live_icon_fft = !on_visualizer_page
+            && is_playing_now
+            && self.settings.live_eq_icon_spectrum
+            && !self.settings.reduce_motion
+            && !self.show_lyrics_overlay;
         if on_visualizer_page {
             self.latest_viz_snap = audio_viz::sample_live_visualizer(dt);
             self.viz_state
                 .step(&self.latest_viz_snap, dt, self.settings.reduce_motion);
+        } else if use_live_icon_fft {
+            let (active, bass, mid, high, beat, spec32) = audio_viz::sample_rhythm_levels_fast(dt);
+            self.latest_viz_snap.active_signal = active;
+            self.latest_viz_snap.bass_energy = bass;
+            self.latest_viz_snap.mid_energy = mid;
+            self.latest_viz_snap.high_energy = high;
+            self.latest_viz_snap.beat_pulse = beat;
+            self.latest_viz_snap.spectrum_32 = spec32;
         } else {
             self.latest_viz_snap.active_signal = false;
             self.latest_viz_snap.beat_pulse = 0.0;
@@ -4855,31 +5521,29 @@ impl AppUi {
         if is_playing_now && !self.settings.reduce_motion {
             let s = &self.latest_viz_snap;
             let beat = s.beat_pulse * 0.24;
-            let raw_6 = if on_visualizer_page && s.active_signal {
+            let raw_5 = if (on_visualizer_page || use_live_icon_fft) && s.active_signal {
                 [
                     (s.spectrum_32[1] * 1.15 + beat).clamp(0.14, 1.0),
-                    (s.spectrum_32[5] * 1.25 + beat * 0.8).clamp(0.18, 1.0),
-                    (s.spectrum_32[10] * 1.30 + s.mid_energy * 0.35).clamp(0.16, 1.0),
-                    (s.spectrum_32[16] * 1.30 + s.mid_energy * 0.30).clamp(0.16, 1.0),
-                    (s.spectrum_32[22] * 1.35 + s.high_energy * 0.35).clamp(0.14, 1.0),
-                    (s.spectrum_32[27] * 1.35 + s.high_energy * 0.30).clamp(0.12, 1.0),
+                    (s.spectrum_32[6] * 1.25 + beat * 0.8).clamp(0.18, 1.0),
+                    (s.spectrum_32[12] * 1.32 + s.mid_energy * 0.35).clamp(0.20, 1.0),
+                    (s.spectrum_32[19] * 1.32 + s.mid_energy * 0.30).clamp(0.18, 1.0),
+                    (s.spectrum_32[26] * 1.35 + s.high_energy * 0.32).clamp(0.14, 1.0),
                 ]
             } else {
                 let p = (self.smtc.position_sec as f32) * 5.8;
                 [
-                    0.26 + 0.34 * (p * 1.00 + 0.1).sin().abs(),
-                    0.34 + 0.42 * (p * 1.28 + 1.1).sin().abs(),
-                    0.30 + 0.44 * (p * 1.54 + 2.3).sin().abs(),
-                    0.28 + 0.40 * (p * 1.78 + 3.4).sin().abs(),
-                    0.22 + 0.36 * (p * 2.04 + 4.5).sin().abs(),
-                    0.20 + 0.30 * (p * 2.26 + 5.2).sin().abs(),
+                    0.24 + 0.32 * (p * 1.00 + 0.1).sin().abs(),
+                    0.32 + 0.40 * (p * 1.32 + 1.1).sin().abs(),
+                    0.36 + 0.48 * (p * 1.58 + 2.3).sin().abs(),
+                    0.32 + 0.40 * (p * 1.84 + 3.4).sin().abs(),
+                    0.22 + 0.34 * (p * 2.12 + 4.5).sin().abs(),
                 ]
             };
             let atk = (1.0 - (-24.0 * dt).exp()).clamp(0.05, 1.0);
             let rel = (1.0 - (-11.0 * dt).exp()).clamp(0.03, 1.0);
-            for i in 0..6 {
-                let k = if raw_6[i] > self.eq_bars_smooth[i] { atk } else { rel };
-                self.eq_bars_smooth[i] += (raw_6[i] - self.eq_bars_smooth[i]) * k;
+            for i in 0..5 {
+                let k = if raw_5[i] > self.eq_bars_smooth[i] { atk } else { rel };
+                self.eq_bars_smooth[i] += (raw_5[i] - self.eq_bars_smooth[i]) * k;
             }
         } else {
             let decay = (-12.0 * dt).exp();
@@ -4896,6 +5560,141 @@ impl AppUi {
             self.request_artwork(r, &art_url, true);
             self.request_artwork(r, &art_url, false);
         }
+
+        let motion_on = self.settings.motion_artwork_enabled && !self.settings.reduce_motion;
+        self.motion_art.set_global_enabled(motion_on);
+        let meta_motion_key = if !self.smtc.title.trim().is_empty() {
+            format!(
+                "meta_motion:{}|{}",
+                self.smtc.title.trim().to_lowercase(),
+                self.smtc.artist.trim().to_lowercase()
+            )
+        } else {
+            String::new()
+        };
+        if motion_on
+            && lyr_open_t > 0.01
+            && self.wake_hwnd != 0
+            && !self.smtc.title.trim().is_empty()
+        {
+            let fetch_key = if !self.current_lyrics_key.is_empty() {
+                self.current_lyrics_key.clone()
+            } else {
+                meta_motion_key.clone()
+            };
+            let already_known = self.track_motion_urls.contains_key(&fetch_key)
+                || (!meta_motion_key.is_empty()
+                    && self
+                        .track_motion_urls
+                        .get(&meta_motion_key)
+                        .and_then(|o| o.as_ref())
+                        .is_some());
+            if !already_known && self.pending_motion_tracks.insert(fetch_key.clone()) {
+                let sf = self.settings.storefront.clone();
+                let aid = self.smtc.adam_id.clone();
+                let tt = self.smtc.title.clone();
+                let ar = self.smtc.artist.clone();
+                let al = self.smtc.album.clone();
+                let tx = self.tx.clone();
+                let hwnd = self.wake_hwnd;
+                self.rt.spawn(async move {
+                    let vurl = am_api::fetch_track_motion_video_url(
+                        &sf,
+                        aid.as_deref(),
+                        &tt,
+                        &ar,
+                        &al,
+                    )
+                    .await;
+                    let _ = tx.send(AsyncMsg::TrackMotionVideoResolved {
+                        track_key: fetch_key,
+                        video_url: vurl,
+                    });
+                    Self::post_ui_wake(hwnd);
+                });
+            }
+        }
+        let lyrics_motion_url = if motion_on && lyr_open_t > 0.01 {
+            self.track_motion_urls
+                .get(&self.current_lyrics_key)
+                .and_then(|o| o.as_deref())
+                .or_else(|| {
+                    if meta_motion_key.is_empty() {
+                        None
+                    } else {
+                        self.track_motion_urls
+                            .get(&meta_motion_key)
+                            .and_then(|o| o.as_deref())
+                    }
+                })
+        } else {
+            None
+        };
+        r.set_lyrics_blur_downsample(self.settings.lyrics_blur_downsample);
+        self.motion_art
+            .set_slot("lyrics_cover", lyrics_motion_url, lyrics_motion_url.is_some());
+        let lyrics_motion_frame = lyrics_motion_url
+            .and_then(|u| self.motion_art.latest_frame("lyrics_cover", Some(u)));
+
+        // Dynamic covers on browse/discover & radio are disabled per official Apple Music UX;
+        // ONLY Home (`主页`) & Lyrics (`歌词页`) play dynamic covers (up to 3 viewport-visible Home slots)!
+        let mut home_motion_urls: [Option<String>; 3] = [None, None, None];
+        if motion_on
+            && self.is_window_focused
+            && !self.show_lyrics_overlay
+            && self.route == PageRoute::Home
+        {
+            let mut picked = 0usize;
+            for u in &self.visible_home_motion_urls {
+                if !u.is_empty() && !home_motion_urls[..picked].iter().any(|x| x.as_deref() == Some(u.as_str())) {
+                    home_motion_urls[picked] = Some(u.clone());
+                    picked += 1;
+                    if picked >= 3 {
+                        break;
+                    }
+                }
+            }
+            if picked == 0 {
+                for s in &self.home_shelves {
+                    for it in &s.items {
+                        let cand = if s.kind == EditorialShelfKind::HomeTopPicks {
+                            it.motion_tall_video_url
+                                .as_deref()
+                                .or(it.motion_video_url.as_deref())
+                        } else {
+                            it.motion_video_url.as_deref()
+                        };
+                        if let Some(u) = cand {
+                            if !home_motion_urls[..picked].iter().any(|x| x.as_deref() == Some(u)) {
+                                home_motion_urls[picked] = Some(u.to_string());
+                                picked += 1;
+                                if picked >= 3 {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if picked >= 3 {
+                        break;
+                    }
+                }
+            }
+        }
+        self.motion_art.set_slot(
+            "home_motion_0",
+            home_motion_urls[0].as_deref(),
+            home_motion_urls[0].is_some(),
+        );
+        self.motion_art.set_slot(
+            "home_motion_1",
+            home_motion_urls[1].as_deref(),
+            home_motion_urls[1].is_some(),
+        );
+        self.motion_art.set_slot(
+            "home_motion_2",
+            home_motion_urls[2].as_deref(),
+            home_motion_urls[2].is_some(),
+        );
 
         if lyr_open_t > 0.004 {
             let pal = self
@@ -4920,6 +5719,7 @@ impl AppUi {
 
         // Fast path when Lyrics view is fully expanded (`lyr_open_t >= 0.996`)
         if lyr_open_t >= 0.996 {
+            r.release_lyrics_transition_surfaces();
             self.hover_alphas.clear();
             r.begin_draw(Theme::BG_PRIMARY);
             let art_key = self.smtc.artwork_url.clone();
@@ -4946,6 +5746,10 @@ impl AppUi {
                 glass_off,
                 self.settings.lyrics_latin_by_word,
                 self.settings.lyrics_non_emphasis_effect,
+                self.settings.lyrics_auto_emphasis,
+                self.settings.lyrics_frontier_wave,
+                1.0,
+                lyrics_motion_frame.as_ref(),
             );
             let sync_int = if live_resize_no_vsync {
                 0
@@ -4960,7 +5764,8 @@ impl AppUi {
             return;
         }
 
-        if !self.show_lyrics_overlay && lyr_open_t <= 0.002 {
+        if !self.show_lyrics_overlay && lyr_open_t <= 0.004 {
+            r.release_lyrics_transition_surfaces();
             self.lyrics_view.release_gpu_caches(r);
         }
         self.hit_regions.clear();
@@ -4979,7 +5784,11 @@ impl AppUi {
                 diff_finished = true;
             } else {
                 let sb_open_t = self.sidebar_open_spring.value.clamp(0.0, 1.0);
-                let sb_layout_w = Theme::SIDEBAR_WIDTH * sb_open_t;
+                let sb_layout_w = if is_narrow {
+                    0.0
+                } else {
+                    Theme::SIDEBAR_WIDTH * sb_open_t
+                };
                 let area_w = (win_w - sb_layout_w).max(200.0);
                 let inner_w = (area_w - 64.0).max(200.0);
                 let ease_trans = 1.0 - (1.0 - self.route_trans.clamp(0.0, 1.0)).powi(4);
@@ -5032,7 +5841,7 @@ impl AppUi {
                                 0.0,
                                 false,
                                 0.0,
-                                [0.0; 4],
+                                [0.0; 5],
                                 false,
                                 false,
                                 (0.0, 0.0),
@@ -5051,15 +5860,40 @@ impl AppUi {
             r.release_row_fx_surfaces();
         }
 
-        // Smoothly animated sidebar width (`0.0 .. Theme::SIDEBAR_WIDTH`) + horizontal slide!
+        // Smoothly animated sidebar width (`0.0 .. Theme::SIDEBAR_WIDTH`) + floating drawer on narrow windows!
         let sb_open_t = self.sidebar_open_spring.value.clamp(0.0, 1.0);
-        let sb_layout_w = Theme::SIDEBAR_WIDTH * sb_open_t;
+        let sb_layout_w = if is_narrow {
+            0.0
+        } else {
+            Theme::SIDEBAR_WIDTH * sb_open_t
+        };
         if sb_open_t <= 0.003 {
             self.sidebar_nav_rect = RectF::default();
         }
         let content_area = RectF::new(sb_layout_w, 0.0, (win_w - sb_layout_w).max(200.0), win_h);
 
         // 1. LAYER 1: Content Layer with smooth nonlinear page-transition entrance!
+        // Plus subtle window maximize/restore centered scale transition (when reduce_motion is OFF)!
+        let max_trans_active = self.win_max_trans < 0.998 && !self.settings.reduce_motion;
+        if max_trans_active {
+            let t = self.win_max_trans.clamp(0.0, 1.0);
+            let ease = 1.0 - (1.0 - t).powi(3);
+            let sc = if self.win_max_going_max {
+                0.972 + 0.028 * ease
+            } else {
+                1.026 - 0.026 * ease
+            };
+            let cx = win_w * 0.5;
+            let cy = win_h * 0.5;
+            r.set_transform(&windows_numerics::Matrix3x2 {
+                M11: sc,
+                M12: 0.0,
+                M21: 0.0,
+                M22: sc,
+                M31: cx * (1.0 - sc),
+                M32: cy * (1.0 - sc),
+            });
+        }
         self.draw_main_content_layer(r, content_area);
         clip_hit_regions_below_topbar(&mut self.hit_regions, TOP_BAR_GUARD_H);
 
@@ -5085,12 +5919,12 @@ impl AppUi {
             r.fill_rounded_rect(grip, 2.0, Color::rgba(255, 255, 255, 0.30 * tb_guard_a));
         }
 
-        // 2. LAYER 2: Functional Layer (Animated Sliding Sidebar, Unified Top Bar, Floating MiniPlayer, Popovers)
-        if sb_open_t > 0.003 {
+        // 2. LAYER 2: Docked Sidebar (wide windows), Unified Top Bar, Floating MiniPlayer
+        if !is_narrow && sb_open_t > 0.003 {
             let sb_x = -(1.0 - sb_open_t) * Theme::SIDEBAR_WIDTH;
             let sb_rect = RectF::new(sb_x, 0.0, Theme::SIDEBAR_WIDTH, win_h);
             let sb_alpha = (sb_open_t * 1.28).clamp(0.0, 1.0);
-            let pushed_sb = if sb_alpha < 0.995 {
+            let pushed_sb = if sb_alpha < 0.995 && r.width_px < 1920 {
                 r.push_opacity_layer(RectF::new(0.0, 0.0, sb_layout_w + 4.0, win_h), sb_alpha)
             } else {
                 false
@@ -5101,8 +5935,21 @@ impl AppUi {
             }
         }
 
-        self.draw_top_floating_nav(r, content_area, sb_open_t);
+        let nav_sb_t = if is_narrow { 0.0 } else { sb_open_t };
+        self.draw_top_floating_nav(r, content_area, nav_sb_t);
         self.draw_floating_mini_player(r, content_area);
+
+        // Narrow-window floating sidebar drawer + click-to-dismiss scrim
+        if is_narrow && sb_open_t > 0.003 {
+            r.fill_rect(win_rect, Color::rgba(0, 0, 0, 0.45 * sb_open_t));
+            self.hit_regions.push(HitRegion {
+                rect: win_rect,
+                action: UiAction::CloseNarrowSidebarOverlay,
+            });
+            let sb_x = -(1.0 - sb_open_t) * Theme::SIDEBAR_WIDTH;
+            let sb_rect = RectF::new(sb_x, 0.0, Theme::SIDEBAR_WIDTH, win_h);
+            self.draw_ipad_sidebar(r, sb_rect);
+        }
 
         if self.show_queue_popover {
             self.draw_queue_popover(r, content_area);
@@ -5113,52 +5960,122 @@ impl AppUi {
         if let Some((ref msg, is_err, _)) = self.banner_text.clone() {
             self.draw_banner_toast(r, content_area, msg, is_err);
         }
+        if max_trans_active {
+            r.reset_transform();
+        }
 
         // Decay any hover entries whose items scrolled offscreen so `hover_alphas` reaches empty!
         if !self.hover_alphas.is_empty() {
             let decay = (-5.8 * dt).exp();
             let visited = &self.visited_hover_keys;
+            let mut offscreen_settling = false;
             self.hover_alphas.retain(|k, v| {
                 if !visited.contains(k) {
                     *v *= decay;
+                    offscreen_settling = true;
                 }
                 *v > 0.008
             });
+            if offscreen_settling {
+                self.has_settling_hover = true;
+            }
         }
 
-        // Smooth nonlinear Lyrics sheet expand / collapse overlay (`0.004 < lyr_open_t < 0.996`)!
+        // Smooth dual-blur + unified opacity fade Lyrics sheet expand / collapse (`0.004 < lyr_open_t < 0.996`)!
+        // Background UI smoothly blurs into frosted bokeh while the entire Lyrics sheet fades & de-blurs as one surface!
         if lyr_open_t > 0.004 {
-            let ease_alpha = lyr_open_t.powf(0.82).clamp(0.0, 1.0);
-            let slide_y = (1.0 - lyr_open_t) * win_h * 0.12;
-            let lyr_rect = RectF::new(0.0, slide_y, win_w, win_h);
-            let pushed = r.push_opacity_layer(win_rect, ease_alpha);
+            let ease_t = lyr_open_t.clamp(0.0, 1.0);
+            let ease_alpha = ease_t * ease_t * (3.0 - 2.0 * ease_t);
+            let bg_blur_sigma = if self.settings.reduce_motion {
+                0.0
+            } else {
+                ease_alpha * 18.0
+            };
+            let fg_blur_sigma = if self.settings.reduce_motion {
+                0.0
+            } else {
+                (1.0 - ease_alpha).powf(1.35) * 14.0
+            };
+            let slide_y = if self.settings.reduce_motion {
+                0.0
+            } else {
+                (1.0 - ease_t) * win_h * 0.055
+            };
+            let trans_scale = if self.settings.reduce_motion {
+                1.0
+            } else {
+                0.965 + 0.035 * ease_alpha
+            };
             let art_key = self.smtc.artwork_url.clone();
             let lyr_key = self.current_lyrics_key.clone();
             let glass_off = self.glass_off();
-            self.lyrics_view.draw(
-                r,
-                lyr_rect,
-                &self.smtc,
-                art_key.as_deref(),
-                self.current_lyrics.as_ref(),
-                &lyr_key,
-                self.lyrics_loading,
-                self.playback_loading,
-                self.spinner_phase,
-                self.latest_viz_snap.bass_energy,
-                self.shuffle_on,
-                self.repeat_on,
-                self.mouse_pos,
-                self.mouse_down,
-                self.is_window_maximized,
-                self.settings.reduce_motion,
-                self.settings.reduce_transparency,
-                glass_off,
-                self.settings.lyrics_latin_by_word,
-                self.settings.lyrics_non_emphasis_effect,
-            );
-            if pushed {
-                r.pop_layer();
+
+            if bg_blur_sigma > 0.25 {
+                r.blur_current_backbuffer_in_place(bg_blur_sigma);
+            }
+            if r.begin_lyrics_transition_sheet() {
+                self.lyrics_view.draw(
+                    r,
+                    win_rect,
+                    &self.smtc,
+                    art_key.as_deref(),
+                    self.current_lyrics.as_ref(),
+                    &lyr_key,
+                    self.lyrics_loading,
+                    self.playback_loading,
+                    self.spinner_phase,
+                    self.latest_viz_snap.bass_energy,
+                    self.shuffle_on,
+                    self.repeat_on,
+                    self.mouse_pos,
+                    self.mouse_down,
+                    self.is_window_maximized,
+                    self.settings.reduce_motion,
+                    self.settings.reduce_transparency,
+                    glass_off,
+                    self.settings.lyrics_latin_by_word,
+                    self.settings.lyrics_non_emphasis_effect,
+                    self.settings.lyrics_auto_emphasis,
+                    self.settings.lyrics_frontier_wave,
+                    1.0,
+                    lyrics_motion_frame.as_ref(),
+                );
+                r.end_and_composite_lyrics_transition_sheet(
+                    ease_alpha,
+                    fg_blur_sigma,
+                    slide_y,
+                    trans_scale,
+                    self.settings.window_corner_radius,
+                    self.is_window_maximized,
+                );
+            } else {
+                let lyr_rect = RectF::new(0.0, slide_y, win_w, win_h);
+                self.lyrics_view.draw(
+                    r,
+                    lyr_rect,
+                    &self.smtc,
+                    art_key.as_deref(),
+                    self.current_lyrics.as_ref(),
+                    &lyr_key,
+                    self.lyrics_loading,
+                    self.playback_loading,
+                    self.spinner_phase,
+                    self.latest_viz_snap.bass_energy,
+                    self.shuffle_on,
+                    self.repeat_on,
+                    self.mouse_pos,
+                    self.mouse_down,
+                    self.is_window_maximized,
+                    self.settings.reduce_motion,
+                    self.settings.reduce_transparency,
+                    glass_off,
+                    self.settings.lyrics_latin_by_word,
+                    self.settings.lyrics_non_emphasis_effect,
+                    self.settings.lyrics_auto_emphasis,
+                    self.settings.lyrics_frontier_wave,
+                    ease_alpha,
+                    lyrics_motion_frame.as_ref(),
+                );
             }
         }
 
@@ -5186,6 +6103,10 @@ impl AppUi {
         };
         r.fill_rect(sb, sb_fill);
         r.draw_line(sb.right(), sb.y, sb.right(), sb.bottom(), Theme::SEPARATOR, 1.0);
+        self.hit_regions.push(HitRegion {
+            rect: sb,
+            action: UiAction::SwallowClick,
+        });
 
         let x0 = sb.x;
         let pad_x = 14.0;
@@ -5772,12 +6693,14 @@ impl AppUi {
 
         let vis_alpha = (if hidden { 0.38 * edit_t } else { 1.0 }) * sec_alpha;
         let ic_rect = RectF::new(row.x + 10.0, row.y + 8.5, 19.0, 19.0);
-        if icon == SfIcon::Visualizer && self.eq_bars_smooth.iter().any(|&v| v > 0.02) {
-            let eq6 = self.eq_bars_smooth;
+        let show_live_viz_icon = (self.route == PageRoute::Visualizer || self.settings.live_eq_icon_spectrum)
+            && self.eq_bars_smooth.iter().any(|&v| v > 0.02);
+        if icon == SfIcon::Visualizer && show_live_viz_icon {
+            let eq5 = self.eq_bars_smooth;
             r.draw_live_equalizer_bars(
                 ic_rect.inset(1.0, 1.5),
                 Theme::ACCENT_RED.with_alpha(vis_alpha),
-                &eq6,
+                &eq5,
                 true,
             );
         } else {
@@ -6342,15 +7265,23 @@ impl AppUi {
     // ========================================================================
     fn draw_main_content_layer(&mut self, r: &mut D2DRenderer, area: RectF) {
         // Nonlinear quintic ease-out page transition (`1 - (1 - t)^4`) across ALL routes!
+        // When a Hero Cover Launch zoom animation is flying into `ContainerDetail`, keep `art_rect`
+        // stationary and let `draw_container_detail_page` fade the detail page in behind the flying cover!
+        let has_hero_launch = self.cover_launch_anim.is_some()
+            && matches!(self.route, PageRoute::ContainerDetail { .. });
         let trans_t = self.route_trans.clamp(0.0, 1.0);
         let ease = 1.0 - (1.0 - trans_t).powi(4);
-        let trans_dy = if self.settings.reduce_motion {
+        let trans_dy = if self.settings.reduce_motion || has_hero_launch {
             0.0
         } else {
             (1.0 - ease) * 18.0 * self.route_trans_dir
         };
-        let trans_alpha = (0.20 + 0.80 * ease).clamp(0.0, 1.0);
-        let pushed_trans = if trans_alpha < 0.996 && !self.settings.reduce_motion {
+        let trans_alpha = if has_hero_launch {
+            1.0
+        } else {
+            (0.20 + 0.80 * ease).clamp(0.0, 1.0)
+        };
+        let pushed_trans = if trans_alpha < 0.996 && !self.settings.reduce_motion && r.width_px < 1920 {
             r.push_opacity_layer(area, trans_alpha)
         } else {
             false
@@ -6407,13 +7338,78 @@ impl AppUi {
         let x0 = area.x + pad_x;
 
         let end_y = match self.route.clone() {
-            PageRoute::Home => self.draw_home_or_browse(r, x0, start_y, inner_w, "主页"),
-            PageRoute::Browse => self.draw_home_or_browse(r, x0, start_y, inner_w, "新发现"),
+            PageRoute::Home => {
+                if !self.home_shelves.is_empty() {
+                    let shelves = std::mem::take(&mut self.home_shelves);
+                    let out_y = self.draw_editorial_shelves_page(
+                        r,
+                        x0,
+                        start_y,
+                        inner_w,
+                        "主页",
+                        &shelves,
+                        true,
+                    );
+                    self.home_shelves = shelves;
+                    out_y
+                } else {
+                    self.visible_home_motion_urls.clear();
+                    self.draw_home_or_browse(r, x0, start_y, inner_w, "主页")
+                }
+            }
+            PageRoute::Browse => {
+                self.visible_home_motion_urls.clear();
+                if !self.browse_shelves.is_empty() {
+                    let shelves = std::mem::take(&mut self.browse_shelves);
+                    let out_y = self.draw_editorial_shelves_page(
+                        r,
+                        x0,
+                        start_y,
+                        inner_w,
+                        "新发现",
+                        &shelves,
+                        false,
+                    );
+                    self.browse_shelves = shelves;
+                    out_y
+                } else if !self.home_shelves.is_empty() {
+                    let shelves = std::mem::take(&mut self.home_shelves);
+                    let out_y = self.draw_editorial_shelves_page(
+                        r,
+                        x0,
+                        start_y,
+                        inner_w,
+                        "新发现",
+                        &shelves,
+                        false,
+                    );
+                    self.home_shelves = shelves;
+                    out_y
+                } else {
+                    self.draw_home_or_browse(r, x0, start_y, inner_w, "新发现")
+                }
+            }
             PageRoute::Radio => {
-                let cards = std::mem::take(&mut self.radio_cards);
-                let out_y = self.draw_cards_page(r, x0, start_y, inner_w, "广播与精选电台", &cards, false);
-                self.radio_cards = cards;
-                out_y
+                self.visible_home_motion_urls.clear();
+                if !self.radio_shelves.is_empty() {
+                    let shelves = std::mem::take(&mut self.radio_shelves);
+                    let out_y = self.draw_editorial_shelves_page(
+                        r,
+                        x0,
+                        start_y,
+                        inner_w,
+                        "广播",
+                        &shelves,
+                        false,
+                    );
+                    self.radio_shelves = shelves;
+                    out_y
+                } else {
+                    let cards = std::mem::take(&mut self.radio_cards);
+                    let out_y = self.draw_cards_page(r, x0, start_y, inner_w, "广播与精选电台", &cards, false);
+                    self.radio_cards = cards;
+                    out_y
+                }
             }
             PageRoute::ContainerDetail { .. } => {
                 self.draw_container_detail_page(r, x0, start_y, inner_w)
@@ -6431,7 +7427,11 @@ impl AppUi {
             }
             PageRoute::LibAlbums => {
                 let c = self.lib_cards.remove("albums").unwrap_or_default();
-                let out_y = self.draw_cards_page(r, x0, start_y, inner_w, "专辑", &c, true);
+                let out_y = if self.albums_cover_flow && !c.is_empty() {
+                    self.draw_albums_cover_flow_page(r, x0, start_y, inner_w, area.h, &c)
+                } else {
+                    self.draw_cards_page(r, x0, start_y, inner_w, "专辑", &c, true)
+                };
                 if !c.is_empty() {
                     self.lib_cards.insert("albums".to_string(), c);
                 }
@@ -6478,6 +7478,278 @@ impl AppUi {
     }
 
     // ========================================================================
+    // Cover Flow Easter Egg View (`在专辑页再次点击侧栏专辑进入`)
+    // ========================================================================
+    fn draw_albums_cover_flow_page(
+        &mut self,
+        r: &mut D2DRenderer,
+        x0: f32,
+        mut y: f32,
+        w: f32,
+        view_h: f32,
+        albums: &[MediaCardItem],
+    ) -> f32 {
+        let count = albums.len();
+        if count == 0 {
+            return y + 80.0;
+        }
+        let max_i = (count - 1) as i32;
+        self.cover_flow_target = self.cover_flow_target.clamp(0, max_i);
+        self.cover_flow_index = self.cover_flow_index.clamp(0.0, max_i as f32);
+
+        // Header + Easter Egg Badge + Back-to-Grid button
+        r.draw_text(
+            "专辑",
+            RectF::new(x0, y, 120.0, 38.0),
+            28.0,
+            700,
+            Theme::TEXT_PRIMARY,
+            TextAlign::Left,
+            true,
+            false,
+        );
+        let badge_r = RectF::new(x0 + 74.0, y + 8.0, 102.0, 22.0);
+        r.fill_rounded_rect(badge_r, 11.0, Theme::ACCENT_RED.with_alpha(0.20));
+        r.stroke_rounded_rect(badge_r, 11.0, Theme::ACCENT_RED.with_alpha(0.50), 1.0);
+        r.draw_text(
+            "Cover Flow",
+            badge_r,
+            11.2,
+            600,
+            Theme::ACCENT_RED,
+            TextAlign::Center,
+            true,
+            false,
+        );
+
+        let back_btn = RectF::new(x0 + w - 98.0, y + 6.0, 98.0, 28.0);
+        let back_hov = self.mouse_pos.1 >= TOP_BAR_GUARD_H
+            && back_btn.contains(self.mouse_pos.0, self.mouse_pos.1);
+        r.draw_liquid_glass_button(
+            back_btn,
+            14.0,
+            GlassBtnVariant::Regular,
+            back_hov,
+            self.mouse_down,
+            self.mouse_pos,
+            self.glass_off(),
+        );
+        r.draw_text(
+            "返回网格",
+            back_btn,
+            12.0,
+            if back_hov { 600 } else { 500 },
+            Theme::TEXT_PRIMARY,
+            TextAlign::Center,
+            true,
+            false,
+        );
+        self.hit_regions.push(HitRegion {
+            rect: back_btn,
+            action: UiAction::ToggleAlbumsCoverFlow,
+        });
+        y += 50.0;
+
+        let stage_h = (view_h - 210.0).clamp(320.0, 560.0);
+        let stage_r = RectF::new(x0, y, w, stage_h);
+        r.fill_rounded_rect(stage_r, 18.0, Color::rgb(14, 14, 18));
+        r.stroke_rounded_rect(stage_r, 18.0, Theme::SEPARATOR, 1.0);
+
+        let center_x = stage_r.center_x();
+        let hero_sz = (stage_h * 0.56).min(w * 0.34).clamp(176.0, 290.0);
+        let center_y = stage_r.y + stage_h * 0.43;
+
+        // Ambient stage spotlight beneath centered album
+        r.fill_radial_glow(
+            center_x,
+            center_y + hero_sz * 0.25,
+            hero_sz * 1.45,
+            hero_sz * 0.72,
+            Color::rgba(255, 255, 255, 0.08),
+            Color::rgba(14, 14, 18, 0.0),
+        );
+
+        let cur_f = self.cover_flow_index;
+        let center_idx = (cur_f.round() as i32).clamp(0, max_i);
+
+        // Pre-warm artwork for nearby sleeves
+        let pre_lo = (center_idx - 7).max(0) as usize;
+        let pre_hi = ((center_idx + 7).min(max_i)) as usize;
+        for idx in pre_lo..=pre_hi {
+            if let Some(ref u) = albums[idx].artwork_url {
+                let is_near_center = (idx as i32 - center_idx).abs() <= 1;
+                self.request_artwork(r, u, is_near_center);
+            }
+        }
+
+        // Painter's order: draw outer sleeves -> inner sleeves -> centered hero album
+        let mut draw_order: Vec<i32> = Vec::with_capacity(13);
+        for d in (1..=6).rev() {
+            let l_idx = center_idx - d;
+            if l_idx >= 0 {
+                draw_order.push(l_idx);
+            }
+            let r_idx = center_idx + d;
+            if r_idx <= max_i {
+                draw_order.push(r_idx);
+            }
+        }
+        draw_order.push(center_idx);
+
+        r.push_clip(stage_r.inset(2.0, 2.0));
+        let mut center_hit_rect = RectF::new(
+            center_x - hero_sz * 0.5,
+            center_y - hero_sz * 0.5,
+            hero_sz,
+            hero_sz,
+        );
+        for idx in draw_order {
+            let rel = (idx as f32) - cur_f;
+            let abs_rel = rel.abs();
+            let sign = if rel < 0.0 { -1.0 } else { 1.0 };
+            let is_center = abs_rel < 0.35;
+
+            let sleeve_sz = if abs_rel < 1.0 {
+                hero_sz * (1.0 - 0.16 * abs_rel)
+            } else {
+                hero_sz * (0.84 - (abs_rel - 1.0).min(5.0) * 0.025)
+            };
+            let base_step = hero_sz * 0.58;
+            let extra_step = hero_sz * 0.25;
+            let dx = if abs_rel <= 1.0 {
+                rel * base_step
+            } else {
+                sign * (base_step + (abs_rel - 1.0) * extra_step)
+            };
+            let sx = if abs_rel < 1.0 {
+                1.0 - 0.36 * abs_rel
+            } else {
+                0.64
+            };
+            let tilt_skew = if abs_rel < 1.0 {
+                -sign * 0.24 * abs_rel
+            } else {
+                -sign * 0.24
+            };
+            let dim_a = (abs_rel * 0.18).clamp(0.0, 0.62);
+            let refl_a = (1.0 - abs_rel * 0.16).clamp(0.15, 0.90);
+
+            let cx = center_x + dx;
+            let cy = center_y + (abs_rel.min(1.0) * 8.0);
+            let rect = RectF::new(cx - sleeve_sz * 0.5, cy - sleeve_sz * 0.5, sleeve_sz, sleeve_sz);
+            let item = &albums[idx as usize];
+            r.draw_cover_flow_sleeve(
+                item.artwork_url.as_deref(),
+                rect,
+                tilt_skew,
+                sx,
+                dim_a,
+                refl_a,
+                is_center,
+            );
+
+            let vis_w = sleeve_sz * sx;
+            let hit_r = RectF::new(cx - vis_w * 0.5, rect.y, vis_w, sleeve_sz);
+            if idx == center_idx {
+                center_hit_rect = rect;
+            } else if stage_r.contains(cx, cy) {
+                self.hit_regions.push(HitRegion {
+                    rect: hit_r,
+                    action: UiAction::CoverFlowSelect(idx),
+                });
+            }
+        }
+        r.pop_clip();
+
+        // Register centered album click -> launches Hero Album Cover Zoom Animation straight into tracklist!
+        let cur_album = &albums[center_idx as usize];
+        self.hit_regions.push(HitRegion {
+            rect: center_hit_rect,
+            action: UiAction::OpenContainerFromCard {
+                kind: cur_album.kind.clone(),
+                id: cur_album.id.clone(),
+                title_hint: cur_album.title.clone(),
+                artwork_url: cur_album.artwork_url.clone(),
+                card_rect: center_hit_rect,
+                card_radius: 12.0,
+            },
+        });
+
+        // Centered Album Metadata + Prev/Next Liquid Glass Controls at bottom of stage
+        let meta_y = stage_r.bottom() - 86.0;
+        r.draw_text(
+            &cur_album.title,
+            RectF::new(stage_r.x + 80.0, meta_y, (stage_r.w - 160.0).max(120.0), 26.0),
+            19.0,
+            700,
+            Theme::TEXT_PRIMARY,
+            TextAlign::Center,
+            true,
+            false,
+        );
+        r.draw_text(
+            &cur_album.subtitle,
+            RectF::new(stage_r.x + 80.0, meta_y + 27.0, (stage_r.w - 160.0).max(120.0), 20.0),
+            13.5,
+            500,
+            Theme::TEXT_SECONDARY,
+            TextAlign::Center,
+            true,
+            false,
+        );
+        r.draw_mono_text(
+            &format!("{} / {} · 点击居中封面打开 · 滚轮或左右键切换", center_idx + 1, count),
+            RectF::new(stage_r.x + 40.0, meta_y + 52.0, (stage_r.w - 80.0).max(120.0), 18.0),
+            11.2,
+            400,
+            Theme::TEXT_MUTED,
+            TextAlign::Center,
+            true,
+        );
+
+        let prev_btn = RectF::new(stage_r.x + 22.0, center_y - 20.0, 38.0, 38.0);
+        let next_btn = RectF::new(stage_r.right() - 60.0, center_y - 20.0, 38.0, 38.0);
+        if center_idx > 0 {
+            let hov = self.mouse_pos.1 >= TOP_BAR_GUARD_H
+                && prev_btn.contains(self.mouse_pos.0, self.mouse_pos.1);
+            r.draw_liquid_glass_button(
+                prev_btn,
+                19.0,
+                GlassBtnVariant::Regular,
+                hov,
+                self.mouse_down,
+                self.mouse_pos,
+                self.glass_off(),
+            );
+            r.draw_icon(SfIcon::ChevronLeft, prev_btn.inset(10.0, 10.0), Theme::TEXT_PRIMARY);
+            self.hit_regions.push(HitRegion {
+                rect: prev_btn,
+                action: UiAction::CoverFlowSelect(center_idx - 1),
+            });
+        }
+        if center_idx < max_i {
+            let hov = self.mouse_pos.1 >= TOP_BAR_GUARD_H
+                && next_btn.contains(self.mouse_pos.0, self.mouse_pos.1);
+            r.draw_liquid_glass_button(
+                next_btn,
+                19.0,
+                GlassBtnVariant::Regular,
+                hov,
+                self.mouse_down,
+                self.mouse_pos,
+                self.glass_off(),
+            );
+            r.draw_icon(SfIcon::ChevronRight, next_btn.inset(10.0, 10.0), Theme::TEXT_PRIMARY);
+            self.hit_regions.push(HitRegion {
+                rect: next_btn,
+                action: UiAction::CoverFlowSelect(center_idx + 1),
+            });
+        }
+
+        stage_r.bottom() + 24.0
+    }
+
+    // ========================================================================
     // Album / Playlist Hero + Tracklist Page (1:1 Match with Screenshot `WWDC26`!)
     // ========================================================================
     fn draw_container_detail_page(
@@ -6487,10 +7759,71 @@ impl AppUi {
         mut y: f32,
         w: f32,
     ) -> f32 {
+        let art_sz = 228.0f32.min(w * 0.34).max(164.0);
+        let art_rect = RectF::new(x0, y, art_sz, art_sz);
+
+        // Evaluate active Hero Album Cover Launch Zoom Animation (`clicked card -> detail hero`)
+        let route_id = match &self.route {
+            PageRoute::ContainerDetail { id, .. } => id.clone(),
+            _ => String::new(),
+        };
+        let mut launch_anim_frame: Option<(RectF, f32, Option<String>, f32)> = None;
+        if let Some(anim) = self.cover_launch_anim.clone() {
+            if anim.target_id == route_id && !self.settings.reduce_motion {
+                let raw_t = (anim.started_at.elapsed().as_secs_f32() / anim.duration_sec).clamp(0.0, 1.0);
+                if raw_t >= 0.998 {
+                    self.cover_launch_anim = None;
+                } else {
+                    let ease = 1.0 - (1.0 - raw_t).powi(4);
+                    let cur_r = RectF::new(
+                        anim.from_rect.x + (art_rect.x - anim.from_rect.x) * ease,
+                        anim.from_rect.y + (art_rect.y - anim.from_rect.y) * ease,
+                        anim.from_rect.w + (art_rect.w - anim.from_rect.w) * ease,
+                        anim.from_rect.h + (art_rect.h - anim.from_rect.h) * ease,
+                    );
+                    let cur_rad = anim.from_radius + (14.0 - anim.from_radius) * ease;
+                    let behind_a = ((raw_t - 0.10) / 0.90).clamp(0.0, 1.0);
+                    let behind_smooth = behind_a * behind_a * (3.0 - 2.0 * behind_a);
+                    launch_anim_frame = Some((cur_r, cur_rad, anim.artwork_url, behind_smooth));
+                }
+            } else {
+                self.cover_launch_anim = None;
+            }
+        }
+
+        let draw_flying_cover = |this: &mut Self,
+                                 r: &mut D2DRenderer,
+                                 cur_r: RectF,
+                                 cur_rad: f32,
+                                 art_opt: Option<&str>| {
+            r.fill_rounded_rect(
+                RectF::new(cur_r.x + 5.0, cur_r.y + 10.0, cur_r.w - 10.0, cur_r.h),
+                cur_rad,
+                Color::rgba(0, 0, 0, 0.48),
+            );
+            let mut drew_fly = false;
+            if let Some(u) = art_opt {
+                if !u.is_empty() {
+                    this.request_artwork(r, u, true);
+                    drew_fly = r.draw_rounded_artwork(u, true, cur_r, cur_rad, 1.0)
+                        || r.draw_rounded_artwork(u, false, cur_r, cur_rad, 1.0);
+                }
+            }
+            if !drew_fly {
+                r.fill_rounded_rect(cur_r, cur_rad, Theme::BG_ELEVATED);
+                r.draw_icon(
+                    SfIcon::Albums,
+                    cur_r.inset(cur_r.w * 0.32, cur_r.h * 0.32),
+                    Theme::TEXT_MUTED,
+                );
+            }
+            r.stroke_rounded_rect(cur_r, cur_rad, Color::rgba(255, 255, 255, 0.18), 1.1);
+        };
+
         if self.detail_loading {
             r.draw_text(
                 "正在载入曲目列表...",
-                RectF::new(x0, y + 60.0, w, 32.0),
+                RectF::new(art_rect.right() + 28.0, y + 60.0, (w - art_sz - 28.0).max(120.0), 32.0),
                 16.0,
                 500,
                 Theme::TEXT_SECONDARY,
@@ -6498,7 +7831,10 @@ impl AppUi {
                 true,
                 false,
             );
-            return y + 120.0;
+            if let Some((cur_r, cur_rad, ref fly_art, _)) = launch_anim_frame {
+                draw_flying_cover(self, r, cur_r, cur_rad, fly_art.as_deref());
+            }
+            return y + art_sz + 80.0;
         }
 
         let Some(detail) = self.detail_data.take() else {
@@ -6512,49 +7848,68 @@ impl AppUi {
                 true,
                 false,
             );
-            return y + 120.0;
+            if let Some((cur_r, cur_rad, ref fly_art, _)) = launch_anim_frame {
+                draw_flying_cover(self, r, cur_r, cur_rad, fly_art.as_deref());
+            }
+            return y + art_sz + 80.0;
         };
 
-        // Hero Section: Left 228x228 Rounded Artwork + Right Metadata & Liquid Glass Action Buttons
-        let art_sz = 228.0f32.min(w * 0.34).max(164.0);
-        let art_rect = RectF::new(x0, y, art_sz, art_sz);
+        let is_launching = launch_anim_frame.is_some();
+        let behind_alpha = launch_anim_frame.as_ref().map(|f| f.3).unwrap_or(1.0);
+        let pushed_behind = if is_launching && behind_alpha < 0.995 {
+            r.push_opacity_layer(
+                RectF::new(x0 - 16.0, y - 16.0, w + 32.0, (r.logical_height() - y + 64.0).max(400.0)),
+                behind_alpha.max(0.02),
+            )
+        } else {
+            false
+        };
 
-        // Soft ambient shadow beneath hero artwork
-        r.fill_rounded_rect(
-            RectF::new(art_rect.x + 4.0, art_rect.y + 8.0, art_sz - 8.0, art_sz),
-            14.0,
-            Color::rgba(0, 0, 0, 0.45),
-        );
-
-        let mut drew_hero = false;
-        if let Some(ref u) = detail.artwork_url {
-            self.request_artwork(r, u, true);
-            drew_hero = r.draw_rounded_artwork(u, true, art_rect, 14.0, 1.0);
-        }
-        if !drew_hero {
-            r.fill_rounded_rect(art_rect, 14.0, Theme::BG_ELEVATED);
-            r.draw_icon(
-                SfIcon::Albums,
-                art_rect.inset(art_sz * 0.32, art_sz * 0.32),
-                Theme::TEXT_MUTED,
+        // Hero Artwork Slot (hidden in-slot while the flying cover is in transit in front!)
+        if !is_launching {
+            r.fill_rounded_rect(
+                RectF::new(art_rect.x + 4.0, art_rect.y + 8.0, art_sz - 8.0, art_sz),
+                14.0,
+                Color::rgba(0, 0, 0, 0.45),
             );
+
+            let mut drew_hero = false;
+            if let Some(ref u) = detail.artwork_url {
+                self.request_artwork(r, u, true);
+                drew_hero = r.draw_rounded_artwork(u, true, art_rect, 14.0, 1.0);
+            }
+            if !drew_hero {
+                r.fill_rounded_rect(art_rect, 14.0, Theme::BG_ELEVATED);
+                r.draw_icon(
+                    SfIcon::Albums,
+                    art_rect.inset(art_sz * 0.32, art_sz * 0.32),
+                    Theme::TEXT_MUTED,
+                );
+            }
+            let hero_is_loading_slot = self.playback_loading
+                && (self.playback_loading_container_id.as_deref() == Some(detail.id.as_str())
+                    || self.playback_loading_track_id.as_deref().is_some_and(|tid| {
+                        detail.tracks.iter().any(|t| t.effective_adam_id() == tid)
+                    }));
+            if hero_is_loading_slot {
+                r.fill_rounded_rect(art_rect, 14.0, Color::rgba(8, 8, 14, 0.48));
+                r.draw_loading_spinner(
+                    art_rect.center_x(),
+                    art_rect.center_y(),
+                    22.0,
+                    self.spinner_phase,
+                    Color::rgba(255, 255, 255, 0.96),
+                );
+            }
+            r.stroke_rounded_rect(art_rect, 14.0, Color::rgba(255, 255, 255, 0.12), 1.0);
+        } else if let Some(ref u) = detail.artwork_url {
+            self.request_artwork(r, u, true);
         }
         let hero_is_loading = self.playback_loading
             && (self.playback_loading_container_id.as_deref() == Some(detail.id.as_str())
                 || self.playback_loading_track_id.as_deref().is_some_and(|tid| {
                     detail.tracks.iter().any(|t| t.effective_adam_id() == tid)
                 }));
-        if hero_is_loading {
-            r.fill_rounded_rect(art_rect, 14.0, Color::rgba(8, 8, 14, 0.48));
-            r.draw_loading_spinner(
-                art_rect.center_x(),
-                art_rect.center_y(),
-                22.0,
-                self.spinner_phase,
-                Color::rgba(255, 255, 255, 0.96),
-            );
-        }
-        r.stroke_rounded_rect(art_rect, 14.0, Color::rgba(255, 255, 255, 0.12), 1.0);
 
         let rx = art_rect.right() + 28.0;
         let rw = (x0 + w - rx).max(140.0);
@@ -6697,6 +8052,16 @@ impl AppUi {
         y += 2.0;
 
         let out_y = self.draw_tracklist_rows(r, x0, y, w, &detail.tracks, TrackListSource::DetailTracks);
+        if pushed_behind {
+            r.pop_layer();
+        }
+        if let Some((cur_r, cur_rad, ref fly_art, _)) = launch_anim_frame {
+            let best_art = detail
+                .artwork_url
+                .as_deref()
+                .or(fly_art.as_deref());
+            draw_flying_cover(self, r, cur_r, cur_rad, best_art);
+        }
         self.detail_data = Some(detail);
         out_y
     }
@@ -6714,7 +8079,7 @@ impl AppUi {
         spinner_phase: f32,
         is_playing_now: bool,
         hov_t: f32,
-        bars4: [f32; 4],
+        bars5: [f32; 5],
         dots_hov: bool,
         mouse_down: bool,
         mouse_pos: (f32, f32),
@@ -6763,7 +8128,7 @@ impl AppUi {
             );
         } else if is_cur && is_playing_now {
             r.fill_rounded_rect(thumb, 6.0, Color::rgba(0, 0, 0, 0.48));
-            r.draw_live_equalizer_bars(thumb.inset(9.5, 10.0), Theme::ACCENT_RED, &bars4, false);
+            r.draw_live_equalizer_bars(thumb.inset(9.5, 10.0), Theme::ACCENT_RED, &bars5, true);
         } else if is_cur {
             r.fill_rounded_rect(thumb, 6.0, Color::rgba(0, 0, 0, 0.44));
             r.draw_icon(SfIcon::Play, thumb.inset(11.0, 11.0), Theme::ACCENT_RED);
@@ -6863,12 +8228,7 @@ impl AppUi {
         } else {
             win_h + 560.0
         };
-        let bars4 = [
-            self.eq_bars_smooth[0],
-            self.eq_bars_smooth[2],
-            self.eq_bars_smooth[3],
-            self.eq_bars_smooth[5],
-        ];
+        let bars5 = self.eq_bars_smooth;
         let is_playing_now = self.smtc.status == "Playing";
         let allow_page_hov = self.mouse_pos.1 >= TOP_BAR_GUARD_H;
         let glass_off = self.glass_off();
@@ -6959,7 +8319,7 @@ impl AppUi {
                             self.spinner_phase,
                             is_playing_now,
                             hov_t,
-                            bars4,
+                            bars5,
                             dots_hov,
                             self.mouse_down,
                             self.mouse_pos,
@@ -7040,7 +8400,7 @@ impl AppUi {
                 self.spinner_phase,
                 is_playing_now,
                 hov_t,
-                bars4,
+                bars5,
                 dots_hov,
                 self.mouse_down,
                 self.mouse_pos,
@@ -7066,6 +8426,764 @@ impl AppUi {
     // ========================================================================
     // Home / Browse / Cards / Search / Library / Downloads / Settings Pages
     // ========================================================================
+    fn draw_editorial_shelves_page(
+        &mut self,
+        r: &mut D2DRenderer,
+        x0: f32,
+        mut y: f32,
+        w: f32,
+        heading: &str,
+        shelves: &[EditorialShelf],
+        allow_motion: bool,
+    ) -> f32 {
+        if allow_motion {
+            self.visible_home_motion_urls.clear();
+        }
+        r.draw_text(
+            heading,
+            RectF::new(x0, y, w, 40.0),
+            30.0,
+            700,
+            Theme::TEXT_PRIMARY,
+            TextAlign::Left,
+            true,
+            false,
+        );
+        y += 52.0;
+
+        let win_h = r.logical_height();
+        let allow_hov = self.mouse_pos.1 >= TOP_BAR_GUARD_H;
+        let motion_enabled = allow_motion
+            && self.settings.motion_artwork_enabled
+            && !self.settings.reduce_motion;
+
+        for (s_idx, shelf) in shelves.iter().enumerate() {
+            if shelf.items.is_empty() {
+                continue;
+            }
+            if !shelf.title.is_empty() {
+                let heading_txt = if matches!(
+                    shelf.kind,
+                    EditorialShelfKind::SquareShelf | EditorialShelfKind::TrackGrid
+                ) {
+                    format!("{} ›", shelf.title)
+                } else {
+                    shelf.title.clone()
+                };
+                r.draw_text(
+                    &heading_txt,
+                    RectF::new(x0, y, w, 28.0),
+                    20.0,
+                    700,
+                    Theme::TEXT_PRIMARY,
+                    TextAlign::Left,
+                    true,
+                    false,
+                );
+                y += 34.0;
+            }
+
+            match shelf.kind {
+                EditorialShelfKind::HomeTopPicks => {
+                    // Official Apple Music Home Top Picks (`为你精选`): tall 3:4 portrait showcase strip!
+                    let gap = 18.0;
+                    let cols = if w >= 1220.0 {
+                        4usize
+                    } else if w >= 720.0 {
+                        3usize
+                    } else {
+                        2usize
+                    };
+                    let card_w = (w - gap * ((cols - 1) as f32)) / (cols as f32);
+                    let card_h = (card_w * 1.28).clamp(245.0, 415.0);
+                    let show_n = shelf.items.len().min(cols);
+                    for (idx, it) in shelf.items.iter().take(show_n).enumerate() {
+                        let cx = x0 + (idx as f32) * (card_w + gap);
+                        let cy = y;
+                        if cy + card_h >= -420.0 && cy <= win_h + 720.0 && !it.artwork_url.is_empty() {
+                            self.request_artwork(r, &it.artwork_url, true);
+                        }
+                        if cy + card_h < 0.0 || cy > win_h {
+                            continue;
+                        }
+                        let card_r = RectF::new(cx, cy, card_w, card_h);
+                        let is_hov = allow_hov && card_r.contains(self.mouse_pos.0, self.mouse_pos.1);
+                        let hov_t = self.eval_hover_alpha(
+                            fnv1a_hover_key("ed_pick", &it.id) ^ ((s_idx as u64) << 16) ^ ((idx as u64) << 32),
+                            is_hov,
+                        );
+                        let pick_vid_url = it
+                            .motion_tall_video_url
+                            .as_deref()
+                            .or(it.motion_video_url.as_deref());
+                        if motion_enabled {
+                            if let Some(u) = pick_vid_url {
+                                if self.visible_home_motion_urls.len() < 3
+                                    && !self.visible_home_motion_urls.iter().any(|x| x == u)
+                                {
+                                    self.visible_home_motion_urls.push(u.to_string());
+                                }
+                            }
+                        }
+                        let pick_mf = if motion_enabled {
+                            pick_vid_url.and_then(|u| {
+                                self.motion_art
+                                    .latest_frame("home_motion_0", Some(u))
+                                    .or_else(|| self.motion_art.latest_frame("home_motion_1", Some(u)))
+                                    .or_else(|| self.motion_art.latest_frame("home_motion_2", Some(u)))
+                            })
+                        } else {
+                            None
+                        };
+                        let drew = pick_mf
+                            .as_ref()
+                            .map(|mf| r.draw_motion_artwork(mf, card_r, 16.0, 1.0))
+                            .unwrap_or(false)
+                            || (!it.artwork_url.is_empty()
+                                && r.draw_rounded_artwork(&it.artwork_url, true, card_r, 16.0, 1.0));
+                        if !drew {
+                            r.fill_rounded_rect(card_r, 16.0, Theme::BG_ELEVATED);
+                        }
+                        // Smooth optical bottom scrim gradient (zero harsh box edge!)
+                        let scrim_y = cy + card_h * 0.48;
+                        r.fill_linear_gradient_rect(
+                            RectF::new(cx, scrim_y, card_w, card_h * 0.52),
+                            16.0,
+                            cx,
+                            scrim_y,
+                            cx,
+                            cy + card_h,
+                            Color::rgba(8, 8, 12, 0.0),
+                            Color::rgba(6, 6, 10, 0.86),
+                        );
+                        let text_w = (card_w - 32.0).max(60.0);
+                        let mut ty = cy + card_h - 24.0;
+                        if !it.subtitle.is_empty() {
+                            r.draw_text(
+                                &it.subtitle,
+                                RectF::new(cx + 16.0, ty, text_w, 18.0),
+                                12.6,
+                                400,
+                                Color::rgba(255, 255, 255, 0.80),
+                                TextAlign::Left,
+                                true,
+                                false,
+                            );
+                            ty -= 23.0;
+                        }
+                        r.draw_text(
+                            &it.title,
+                            RectF::new(cx + 16.0, ty, text_w, 22.0),
+                            16.2,
+                            700,
+                            Theme::TEXT_PRIMARY,
+                            TextAlign::Left,
+                            true,
+                            false,
+                        );
+                        if !it.badge.is_empty() {
+                            r.draw_text(
+                                &it.badge,
+                                RectF::new(cx + 16.0, ty - 18.0, text_w, 16.0),
+                                11.0,
+                                600,
+                                Color::rgba(255, 255, 255, 0.72),
+                                TextAlign::Left,
+                                true,
+                                false,
+                            );
+                        }
+                        r.stroke_rounded_rect(
+                            card_r,
+                            16.0,
+                            Color::rgba(255, 255, 255, 0.10 + 0.22 * hov_t),
+                            1.0,
+                        );
+                        if !it.id.is_empty() {
+                            let play_circle = RectF::new(card_r.right() - 48.0, card_r.y + 14.0, 34.0, 34.0);
+                            if hov_t > 0.04 {
+                                let pc_hov = play_circle.contains(self.mouse_pos.0, self.mouse_pos.1);
+                                r.draw_liquid_glass_button(
+                                    play_circle,
+                                    17.0,
+                                    GlassBtnVariant::Regular,
+                                    pc_hov,
+                                    self.mouse_down,
+                                    self.mouse_pos,
+                                    self.glass_off(),
+                                );
+                                r.draw_icon(SfIcon::Play, play_circle.inset(9.0, 9.0), Theme::TEXT_PRIMARY);
+                            }
+                            let act = if it.play_kind == "songs" || it.play_kind == "stations" {
+                                UiAction::PlayContainer {
+                                    kind: it.play_kind.clone(),
+                                    id: it.id.clone(),
+                                    shuffle: false,
+                                }
+                            } else {
+                                UiAction::OpenContainerFromCard {
+                                    kind: it.play_kind.clone(),
+                                    id: it.id.clone(),
+                                    title_hint: it.title.clone(),
+                                    artwork_url: (!it.artwork_url.is_empty()).then(|| it.artwork_url.clone()),
+                                    card_rect: card_r,
+                                    card_radius: 16.0,
+                                }
+                            };
+                            self.hit_regions.push(HitRegion { rect: card_r, action: act });
+                            if it.play_kind != "songs" && it.play_kind != "stations" {
+                                self.hit_regions.push(HitRegion {
+                                    rect: play_circle,
+                                    action: UiAction::PlayContainer {
+                                        kind: it.play_kind.clone(),
+                                        id: it.id.clone(),
+                                        shuffle: false,
+                                    },
+                                });
+                            }
+                        }
+                    }
+                    y += card_h + 26.0;
+                }
+                EditorialShelfKind::NewFeatureHero => {
+                    // Official Apple Music Browse/New (`新发现`) top featured strip:
+                    // Eyebrow + Bold Title + Artist ABOVE wide 16:10 rounded artwork, strictly static!
+                    let gap = 20.0;
+                    let cols = if w >= 1480.0 {
+                        3usize
+                    } else if w >= 660.0 {
+                        2usize
+                    } else {
+                        1usize
+                    };
+                    let card_w = (w - gap * ((cols - 1) as f32)) / (cols as f32);
+                    let header_h = 62.0;
+                    let art_h = (card_w * 0.56).clamp(165.0, 290.0);
+                    let card_h = header_h + art_h;
+                    let show_n = shelf.items.len().min(cols * 2);
+                    for (idx, it) in shelf.items.iter().take(show_n).enumerate() {
+                        let col = idx % cols;
+                        let row = idx / cols;
+                        let cx = x0 + (col as f32) * (card_w + gap);
+                        let cy = y + (row as f32) * (card_h + 18.0);
+                        if cy + card_h >= -420.0 && cy <= win_h + 720.0 && !it.artwork_url.is_empty() {
+                            self.request_artwork(r, &it.artwork_url, true);
+                        }
+                        if cy + card_h < 0.0 || cy > win_h {
+                            continue;
+                        }
+                        let full_r = RectF::new(cx, cy, card_w, card_h);
+                        let art_r = RectF::new(cx, cy + header_h, card_w, art_h);
+                        let is_hov = allow_hov && full_r.contains(self.mouse_pos.0, self.mouse_pos.1);
+                        let hov_t = self.eval_hover_alpha(
+                            fnv1a_hover_key("ed_newhero", &it.id) ^ ((s_idx as u64) << 16) ^ ((idx as u64) << 32),
+                            is_hov,
+                        );
+                        // Header metadata ABOVE artwork (matching official Screenshot 4)
+                        let eyebrow = if !it.badge.is_empty() {
+                            it.badge.as_str()
+                        } else if it.kind == "playlist" {
+                            "更新歌单"
+                        } else {
+                            "新发行"
+                        };
+                        r.draw_text(
+                            eyebrow,
+                            RectF::new(cx, cy, card_w, 15.0),
+                            10.8,
+                            700,
+                            Theme::TEXT_SECONDARY,
+                            TextAlign::Left,
+                            true,
+                            false,
+                        );
+                        r.draw_text(
+                            &it.title,
+                            RectF::new(cx, cy + 16.0, card_w, 22.0),
+                            17.0,
+                            700,
+                            Theme::TEXT_PRIMARY,
+                            TextAlign::Left,
+                            true,
+                            false,
+                        );
+                        if !it.subtitle.is_empty() {
+                            r.draw_text(
+                                &it.subtitle,
+                                RectF::new(cx, cy + 39.0, card_w, 18.0),
+                                14.0,
+                                400,
+                                Theme::TEXT_SECONDARY,
+                                TextAlign::Left,
+                                true,
+                                false,
+                            );
+                        }
+                        let drew = !it.artwork_url.is_empty()
+                            && r.draw_rounded_artwork(&it.artwork_url, true, art_r, 12.0, 1.0);
+                        if !drew {
+                            r.fill_rounded_rect(art_r, 12.0, Theme::BG_ELEVATED);
+                        }
+                        r.stroke_rounded_rect(
+                            art_r,
+                            12.0,
+                            Color::rgba(255, 255, 255, 0.09 + 0.18 * hov_t),
+                            1.0,
+                        );
+                        if !it.id.is_empty() {
+                            let play_circle = RectF::new(art_r.right() - 46.0, art_r.bottom() - 46.0, 34.0, 34.0);
+                            if hov_t > 0.04 {
+                                let pc_hov = play_circle.contains(self.mouse_pos.0, self.mouse_pos.1);
+                                r.draw_liquid_glass_button(
+                                    play_circle,
+                                    17.0,
+                                    GlassBtnVariant::Regular,
+                                    pc_hov,
+                                    self.mouse_down,
+                                    self.mouse_pos,
+                                    self.glass_off(),
+                                );
+                                r.draw_icon(SfIcon::Play, play_circle.inset(9.0, 9.0), Theme::TEXT_PRIMARY);
+                            }
+                            let act = if it.play_kind == "songs" || it.play_kind == "stations" {
+                                UiAction::PlayContainer {
+                                    kind: it.play_kind.clone(),
+                                    id: it.id.clone(),
+                                    shuffle: false,
+                                }
+                            } else {
+                                UiAction::OpenContainerFromCard {
+                                    kind: it.play_kind.clone(),
+                                    id: it.id.clone(),
+                                    title_hint: it.title.clone(),
+                                    artwork_url: (!it.artwork_url.is_empty()).then(|| it.artwork_url.clone()),
+                                    card_rect: art_r,
+                                    card_radius: 12.0,
+                                }
+                            };
+                            self.hit_regions.push(HitRegion { rect: full_r, action: act });
+                            if it.play_kind != "songs" && it.play_kind != "stations" {
+                                self.hit_regions.push(HitRegion {
+                                    rect: play_circle,
+                                    action: UiAction::PlayContainer {
+                                        kind: it.play_kind.clone(),
+                                        id: it.id.clone(),
+                                        shuffle: false,
+                                    },
+                                });
+                            }
+                        }
+                    }
+                    let rows = (show_n + cols - 1) / cols;
+                    y += (rows as f32) * (card_h + 18.0) + 14.0;
+                }
+                EditorialShelfKind::HeroFlowcase => {
+                    let gap = 18.0;
+                    let cols = if w >= 1180.0 {
+                        3usize
+                    } else if w >= 680.0 {
+                        2usize
+                    } else {
+                        1usize
+                    };
+                    let card_w = (w - gap * ((cols - 1) as f32)) / (cols as f32);
+                    let card_h = (card_w * 0.62).clamp(180.0, 290.0);
+                    let show_n = shelf.items.len().min(6);
+                    for (idx, it) in shelf.items.iter().take(show_n).enumerate() {
+                        let col = idx % cols;
+                        let row = idx / cols;
+                        let cx = x0 + (col as f32) * (card_w + gap);
+                        let cy = y + (row as f32) * (card_h + 16.0);
+                        if cy + card_h >= -420.0 && cy <= win_h + 720.0 && !it.artwork_url.is_empty() {
+                            self.request_artwork(r, &it.artwork_url, true);
+                        }
+                        if cy + card_h < 0.0 || cy > win_h {
+                            continue;
+                        }
+                        let card_r = RectF::new(cx, cy, card_w, card_h);
+                        let is_hov = allow_hov && card_r.contains(self.mouse_pos.0, self.mouse_pos.1);
+                        let hov_t = self.eval_hover_alpha(
+                            fnv1a_hover_key("ed_hero", &it.id) ^ ((s_idx as u64) << 16) ^ ((idx as u64) << 32),
+                            is_hov,
+                        );
+                        if motion_enabled {
+                            if let Some(u) = it.motion_video_url.as_deref() {
+                                if self.visible_home_motion_urls.len() < 3
+                                    && !self.visible_home_motion_urls.iter().any(|x| x == u)
+                                {
+                                    self.visible_home_motion_urls.push(u.to_string());
+                                }
+                            }
+                        }
+                        let hero_mf = if motion_enabled {
+                            it.motion_video_url.as_deref().and_then(|u| {
+                                self.motion_art
+                                    .latest_frame("home_motion_0", Some(u))
+                                    .or_else(|| self.motion_art.latest_frame("home_motion_1", Some(u)))
+                                    .or_else(|| self.motion_art.latest_frame("home_motion_2", Some(u)))
+                            })
+                        } else {
+                            None
+                        };
+                        let drew = hero_mf
+                            .as_ref()
+                            .map(|mf| r.draw_motion_artwork(mf, card_r, 14.0, 1.0))
+                            .unwrap_or(false)
+                            || (!it.artwork_url.is_empty()
+                                && r.draw_rounded_artwork(&it.artwork_url, true, card_r, 14.0, 1.0));
+                        if !drew {
+                            r.fill_rounded_rect(card_r, 14.0, Theme::BG_ELEVATED);
+                        }
+                        let scrim_y = cy + card_h * 0.44;
+                        r.fill_linear_gradient_rect(
+                            RectF::new(cx, scrim_y, card_w, card_h * 0.56),
+                            14.0,
+                            cx,
+                            scrim_y,
+                            cx,
+                            cy + card_h,
+                            Color::rgba(8, 8, 12, 0.0),
+                            Color::rgba(6, 6, 10, 0.84),
+                        );
+                        if !it.badge.is_empty() {
+                            r.draw_text(
+                                &it.badge,
+                                RectF::new(cx + 16.0, cy + card_h - 68.0, card_w - 32.0, 16.0),
+                                10.8,
+                                700,
+                                Color::rgba(255, 255, 255, 0.82),
+                                TextAlign::Left,
+                                true,
+                                false,
+                            );
+                        }
+                        r.draw_text(
+                            &it.title,
+                            RectF::new(cx + 16.0, cy + card_h - 49.0, card_w - 72.0, 24.0),
+                            17.0,
+                            700,
+                            Theme::TEXT_PRIMARY,
+                            TextAlign::Left,
+                            true,
+                            false,
+                        );
+                        if !it.subtitle.is_empty() {
+                            r.draw_text(
+                                &it.subtitle,
+                                RectF::new(cx + 16.0, cy + card_h - 24.0, card_w - 72.0, 18.0),
+                                12.6,
+                                400,
+                                Color::rgba(255, 255, 255, 0.80),
+                                TextAlign::Left,
+                                true,
+                                false,
+                            );
+                        }
+                        r.stroke_rounded_rect(
+                            card_r,
+                            14.0,
+                            Color::rgba(255, 255, 255, 0.12 + 0.20 * hov_t),
+                            1.0,
+                        );
+                        if !it.id.is_empty() {
+                            let play_circle = RectF::new(card_r.right() - 48.0, card_r.bottom() - 48.0, 34.0, 34.0);
+                            if hov_t > 0.05 {
+                                let pc_hov = play_circle.contains(self.mouse_pos.0, self.mouse_pos.1);
+                                r.draw_liquid_glass_button(
+                                    play_circle,
+                                    17.0,
+                                    GlassBtnVariant::Regular,
+                                    pc_hov,
+                                    self.mouse_down,
+                                    self.mouse_pos,
+                                    self.glass_off(),
+                                );
+                                r.draw_icon(SfIcon::Play, play_circle.inset(9.0, 9.0), Theme::TEXT_PRIMARY);
+                            }
+                            let act = if it.play_kind == "songs" || it.play_kind == "stations" {
+                                UiAction::PlayContainer {
+                                    kind: it.play_kind.clone(),
+                                    id: it.id.clone(),
+                                    shuffle: false,
+                                }
+                            } else {
+                                UiAction::OpenContainerFromCard {
+                                    kind: it.play_kind.clone(),
+                                    id: it.id.clone(),
+                                    title_hint: it.title.clone(),
+                                    artwork_url: (!it.artwork_url.is_empty()).then(|| it.artwork_url.clone()),
+                                    card_rect: card_r,
+                                    card_radius: 16.0,
+                                }
+                            };
+                            self.hit_regions.push(HitRegion { rect: card_r, action: act });
+                            if it.play_kind != "songs" && it.play_kind != "stations" {
+                                self.hit_regions.push(HitRegion {
+                                    rect: play_circle,
+                                    action: UiAction::PlayContainer {
+                                        kind: it.play_kind.clone(),
+                                        id: it.id.clone(),
+                                        shuffle: false,
+                                    },
+                                });
+                            }
+                        }
+                    }
+                    let rows = (show_n + cols - 1) / cols;
+                    y += (rows as f32) * (card_h + 16.0) + 12.0;
+                }
+                EditorialShelfKind::TrackGrid => {
+                    let gap = 14.0;
+                    let cols = ((w + gap) / 320.0).floor().clamp(1.0, 3.0) as usize;
+                    let col_w = (w - gap * ((cols - 1) as f32)) / (cols as f32);
+                    let row_h = 58.0;
+                    let show_n = shelf.items.len().min(cols * 4);
+                    for (idx, it) in shelf.items.iter().take(show_n).enumerate() {
+                        let col = idx % cols;
+                        let row = idx / cols;
+                        let cx = x0 + (col as f32) * (col_w + gap);
+                        let cy = y + (row as f32) * (row_h + 4.0);
+                        if cy + row_h >= -300.0 && cy <= win_h + 480.0 && !it.artwork_url.is_empty() {
+                            self.request_artwork(r, &it.artwork_url, false);
+                        }
+                        if cy + row_h < 0.0 || cy > win_h {
+                            continue;
+                        }
+                        let row_r = RectF::new(cx, cy, col_w, row_h);
+                        let is_hov = allow_hov && row_r.contains(self.mouse_pos.0, self.mouse_pos.1);
+                        let hov_t = self.eval_hover_alpha(
+                            fnv1a_hover_key("ed_tr", &it.id) ^ ((s_idx as u64) << 16) ^ ((idx as u64) << 32),
+                            is_hov,
+                        );
+                        if hov_t > 0.008 {
+                            r.fill_rounded_rect(
+                                row_r,
+                                9.0,
+                                Theme::ROW_HOVER.with_alpha(Theme::ROW_HOVER.a * hov_t),
+                            );
+                        }
+                        let art_r = RectF::new(cx + 6.0, cy + 5.0, 48.0, 48.0);
+                        let drew = !it.artwork_url.is_empty()
+                            && r.draw_rounded_artwork(&it.artwork_url, false, art_r, 6.0, 1.0);
+                        if !drew {
+                            r.fill_rounded_rect(art_r, 6.0, Theme::BG_ELEVATED);
+                            r.draw_icon(SfIcon::MusicNote, art_r.inset(14.0, 14.0), Theme::TEXT_MUTED);
+                        }
+                        if hov_t > 0.04 {
+                            r.fill_rounded_rect(art_r, 6.0, Color::rgba(0, 0, 0, 0.44 * hov_t));
+                            r.draw_icon(
+                                SfIcon::Play,
+                                art_r.inset(13.0, 13.0),
+                                Theme::TEXT_PRIMARY.with_alpha(hov_t),
+                            );
+                        }
+                        r.draw_text(
+                            &it.title,
+                            RectF::new(art_r.right() + 12.0, cy + 9.0, (col_w - 74.0).max(40.0), 20.0),
+                            13.8,
+                            500,
+                            Theme::TEXT_PRIMARY,
+                            TextAlign::Left,
+                            true,
+                            false,
+                        );
+                        r.draw_text(
+                            &it.subtitle,
+                            RectF::new(art_r.right() + 12.0, cy + 31.0, (col_w - 74.0).max(40.0), 17.0),
+                            12.0,
+                            400,
+                            Theme::TEXT_SECONDARY,
+                            TextAlign::Left,
+                            true,
+                            false,
+                        );
+                        r.draw_line(
+                            art_r.right() + 12.0,
+                            row_r.bottom(),
+                            row_r.right() - 8.0,
+                            row_r.bottom(),
+                            Theme::SEPARATOR,
+                            1.0,
+                        );
+                        if !it.id.is_empty() {
+                            self.hit_regions.push(HitRegion {
+                                rect: row_r,
+                                action: UiAction::PlayContainer {
+                                    kind: if it.play_kind.is_empty() {
+                                        "songs".to_string()
+                                    } else {
+                                        it.play_kind.clone()
+                                    },
+                                    id: it.id.clone(),
+                                    shuffle: false,
+                                },
+                            });
+                        }
+                    }
+                    let rows = (show_n + cols - 1) / cols;
+                    y += (rows as f32) * (row_h + 4.0) + 22.0;
+                }
+                EditorialShelfKind::SquareShelf | EditorialShelfKind::RadioStationRow => {
+                    let gap = 18.0;
+                    let cols = ((w + gap) / 188.0).floor().clamp(2.0, 6.0) as usize;
+                    let card_w = (w - gap * ((cols - 1) as f32)) / (cols as f32);
+                    let card_h = card_w + 48.0;
+                    // On rich multi-shelf pages (Home/New), display crisp 1-row editorial strips matching official Apple Music!
+                    let max_rows = if shelves.len() >= 4 { 1 } else { 2 };
+                    let show_n = shelf.items.len().min(cols * max_rows);
+                    for (idx, it) in shelf.items.iter().take(show_n).enumerate() {
+                        let col = idx % cols;
+                        let row = idx / cols;
+                        let cx = x0 + (col as f32) * (card_w + gap);
+                        let cy = y + (row as f32) * (card_h + 14.0);
+                        if cy + card_h >= -360.0 && cy <= win_h + 560.0 && !it.artwork_url.is_empty() {
+                            self.request_artwork(r, &it.artwork_url, false);
+                        }
+                        if cy + card_h < 0.0 || cy > win_h {
+                            continue;
+                        }
+                        let art_r = RectF::new(cx, cy, card_w, card_w);
+                        let full_r = RectF::new(cx, cy, card_w, card_h);
+                        let is_hov = allow_hov && full_r.contains(self.mouse_pos.0, self.mouse_pos.1);
+                        let hov_t = self.eval_hover_alpha(
+                            fnv1a_hover_key("ed_sq", &it.id) ^ ((s_idx as u64) << 16) ^ ((idx as u64) << 32),
+                            is_hov,
+                        );
+                        if hov_t > 0.008 {
+                            r.fill_rounded_rect(
+                                full_r.inset(-6.0, -6.0),
+                                14.0,
+                                Color::rgba(255, 255, 255, 0.052 * hov_t),
+                            );
+                        }
+                        if motion_enabled {
+                            if let Some(u) = it.motion_video_url.as_deref() {
+                                if self.visible_home_motion_urls.len() < 3
+                                    && !self.visible_home_motion_urls.iter().any(|x| x == u)
+                                {
+                                    self.visible_home_motion_urls.push(u.to_string());
+                                }
+                            }
+                        }
+                        let sq_mf = if motion_enabled {
+                            it.motion_video_url.as_deref().and_then(|u| {
+                                self.motion_art
+                                    .latest_frame("home_motion_0", Some(u))
+                                    .or_else(|| self.motion_art.latest_frame("home_motion_1", Some(u)))
+                                    .or_else(|| self.motion_art.latest_frame("home_motion_2", Some(u)))
+                            })
+                        } else {
+                            None
+                        };
+                        let drew = sq_mf
+                            .as_ref()
+                            .map(|mf| r.draw_motion_artwork(mf, art_r, 12.0, 1.0))
+                            .unwrap_or(false)
+                            || (!it.artwork_url.is_empty()
+                                && r.draw_rounded_artwork(&it.artwork_url, false, art_r, 12.0, 1.0));
+                        if !drew {
+                            r.fill_rounded_rect(art_r, 12.0, Theme::BG_ELEVATED);
+                            r.draw_icon(
+                                if it.kind == "station" { SfIcon::Radio } else { SfIcon::Albums },
+                                art_r.inset(card_w * 0.34, card_w * 0.34),
+                                Theme::TEXT_MUTED,
+                            );
+                        }
+                        if it.badge == "LIVE" {
+                            let badge_r = RectF::new(cx + 8.0, cy + 8.0, 44.0, 19.0);
+                            r.fill_rounded_rect(badge_r, 9.5, Theme::ACCENT_RED);
+                            r.draw_text(
+                                "LIVE",
+                                badge_r,
+                                9.5,
+                                700,
+                                Theme::TEXT_PRIMARY,
+                                TextAlign::Center,
+                                true,
+                                false,
+                            );
+                        }
+                        r.stroke_rounded_rect(
+                            art_r,
+                            12.0,
+                            Color::rgba(255, 255, 255, 0.08 + 0.18 * hov_t),
+                            1.0,
+                        );
+                        let play_circle = RectF::new(art_r.right() - 40.0, art_r.bottom() - 40.0, 32.0, 32.0);
+                        if hov_t > 0.02 {
+                            let pc_hov = play_circle.contains(self.mouse_pos.0, self.mouse_pos.1);
+                            r.draw_liquid_glass_button(
+                                play_circle,
+                                16.0,
+                                GlassBtnVariant::Regular,
+                                pc_hov,
+                                self.mouse_down,
+                                self.mouse_pos,
+                                self.glass_off(),
+                            );
+                            r.draw_icon(SfIcon::Play, play_circle.inset(8.0, 8.0), Theme::TEXT_PRIMARY);
+                        }
+                        r.draw_text(
+                            &it.title,
+                            RectF::new(cx, art_r.bottom() + 8.0, card_w, 19.0),
+                            13.5,
+                            500,
+                            Theme::TEXT_PRIMARY,
+                            TextAlign::Left,
+                            true,
+                            false,
+                        );
+                        r.draw_text(
+                            &it.subtitle,
+                            RectF::new(cx, art_r.bottom() + 27.0, card_w, 17.0),
+                            12.0,
+                            400,
+                            Theme::TEXT_SECONDARY,
+                            TextAlign::Left,
+                            true,
+                            false,
+                        );
+                        if !it.id.is_empty() {
+                            if it.play_kind == "stations" || it.play_kind == "songs" {
+                                self.hit_regions.push(HitRegion {
+                                    rect: full_r,
+                                    action: UiAction::PlayContainer {
+                                        kind: it.play_kind.clone(),
+                                        id: it.id.clone(),
+                                        shuffle: false,
+                                    },
+                                });
+                            } else {
+                                self.hit_regions.push(HitRegion {
+                                    rect: full_r,
+                                    action: UiAction::OpenContainerFromCard {
+                                        kind: it.play_kind.clone(),
+                                        id: it.id.clone(),
+                                        title_hint: it.title.clone(),
+                                        artwork_url: (!it.artwork_url.is_empty()).then(|| it.artwork_url.clone()),
+                                        card_rect: art_r,
+                                        card_radius: 12.0,
+                                    },
+                                });
+                                self.hit_regions.push(HitRegion {
+                                    rect: play_circle,
+                                    action: UiAction::PlayContainer {
+                                        kind: it.play_kind.clone(),
+                                        id: it.id.clone(),
+                                        shuffle: false,
+                                    },
+                                });
+                            }
+                        }
+                    }
+                    let rows = (show_n + cols - 1) / cols;
+                    y += (rows as f32) * (card_h + 14.0) + 22.0;
+                }
+            }
+        }
+        y
+    }
+
     fn draw_home_or_browse(
         &mut self,
         r: &mut D2DRenderer,
@@ -7240,15 +9358,10 @@ impl AppUi {
                 1.0,
             );
 
-            // Liquid Glass Play button overlay in bottom-right corner of artwork (smooth fade-in/out!)
+            // Liquid Glass Play button overlay in bottom-right corner of artwork (zero per-card PushLayer!)
             let play_circle = RectF::new(art_r.right() - 40.0, art_r.bottom() - 40.0, 32.0, 32.0);
-            if hov_t > 0.02 && !card_loading {
+            if hov_t > 0.08 && !card_loading {
                 let pc_hov = play_circle.contains(self.mouse_pos.0, self.mouse_pos.1);
-                let pushed_pc = if hov_t < 0.98 {
-                    r.push_opacity_layer(play_circle.inset(-4.0, -4.0), hov_t)
-                } else {
-                    false
-                };
                 r.draw_liquid_glass_button(
                     play_circle,
                     16.0,
@@ -7258,10 +9371,11 @@ impl AppUi {
                     self.mouse_pos,
                     self.glass_off(),
                 );
-                r.draw_icon(SfIcon::Play, play_circle.inset(8.0, 8.0), Theme::TEXT_PRIMARY);
-                if pushed_pc {
-                    r.pop_layer();
-                }
+                r.draw_icon(
+                    SfIcon::Play,
+                    play_circle.inset(8.0, 8.0),
+                    Theme::TEXT_PRIMARY.with_alpha(hov_t),
+                );
             }
 
             r.draw_text(
@@ -7287,11 +9401,14 @@ impl AppUi {
 
             self.hit_regions.push(HitRegion {
                 rect: full_r,
-                action: UiAction::Navigate(PageRoute::ContainerDetail {
+                action: UiAction::OpenContainerFromCard {
                     kind: item.kind.clone(),
                     id: item.id.clone(),
                     title_hint: item.title.clone(),
-                }),
+                    artwork_url: item.artwork_url.clone(),
+                    card_rect: art_r,
+                    card_radius: 11.0,
+                },
             });
             self.hit_regions.push(HitRegion {
                 rect: play_circle,
@@ -8428,9 +10545,15 @@ impl AppUi {
 
         y += 232.0;
 
-        // --- Group 3: 可视化与显示体验 (Includes FPS Cap up to VSync + Adjustable Window Corner Radius!) ---
+        let mon_hz = self.current_monitor_hz.clamp(30, 500);
+        let viz_custom_open = self.settings.viz_fps_cap == FpsCap::Custom;
+        let lyr_custom_open = self.settings.lyrics_fps_cap == FpsCap::Custom;
+        let viz_extra = if viz_custom_open { 38.0 } else { 0.0 };
+        let lyr_extra = if lyr_custom_open { 38.0 } else { 0.0 };
+
+        // --- Group 3: 歌词显示与动效 ---
         r.draw_text(
-            "可视化与显示",
+            "歌词显示与动效",
             RectF::new(x0 + 4.0, y, cw, 22.0),
             13.0,
             600,
@@ -8441,162 +10564,12 @@ impl AppUi {
         );
         y += 26.0;
 
-        let viz_custom_open = self.settings.viz_fps_cap == FpsCap::Custom;
-        let lyr_custom_open = self.settings.lyrics_fps_cap == FpsCap::Custom;
-        let viz_extra = if viz_custom_open { 38.0 } else { 0.0 };
-        let lyr_extra = if lyr_custom_open { 38.0 } else { 0.0 };
-        let card_h = 594.0 + viz_extra + lyr_extra;
-        let g_viz = RectF::new(x0, y, cw, card_h);
-        r.fill_rounded_rect(g_viz, 14.0, Theme::BG_ELEVATED);
-        r.stroke_rounded_rect(g_viz, 14.0, Theme::SEPARATOR, 1.0);
+        let lyr_card_h = 442.0 + lyr_extra;
+        let g_lyr = RectF::new(x0, y, cw, lyr_card_h);
+        r.fill_rounded_rect(g_lyr, 14.0, Theme::BG_ELEVATED);
+        r.stroke_rounded_rect(g_lyr, 14.0, Theme::SEPARATOR, 1.0);
 
-        let mon_hz = self.current_monitor_hz.clamp(30, 500);
         let mut ry = y + 14.0;
-
-        // 1. 可视化页面刷新率 + 自定义滑杆
-        let viz_resolved = self
-            .settings
-            .viz_fps_cap
-            .resolved_label(mon_hz, self.settings.viz_custom_fps);
-        r.draw_text(
-            "可视化页面刷新率",
-            RectF::new(x0 + 18.0, ry, 240.0, 22.0),
-            14.2,
-            600,
-            Theme::TEXT_PRIMARY,
-            TextAlign::Left,
-            true,
-            false,
-        );
-        r.draw_text(
-            &format!("当前屏幕 {} Hz · 目标刷新率：{}", mon_hz, viz_resolved),
-            RectF::new(x0 + 18.0, ry + 22.0, cw - 36.0, 18.0),
-            12.0,
-            400,
-            Theme::TEXT_SECONDARY,
-            TextAlign::Left,
-            true,
-            false,
-        );
-        let mut fx = x0 + 18.0;
-        let fy = ry + 46.0;
-        for cap in FpsCap::ALL {
-            let sel = self.settings.viz_fps_cap == cap;
-            let bw = match cap {
-                FpsCap::Hz60 | FpsCap::Hz72 => 52.0,
-                FpsCap::Adaptive60_72 => 116.0,
-                FpsCap::VSync => 78.0,
-                FpsCap::Custom => 68.0,
-            };
-            let br = RectF::new(fx, fy, bw, 28.0);
-            let bhov = self.mouse_pos.1 >= TOP_BAR_GUARD_H && br.contains(self.mouse_pos.0, self.mouse_pos.1);
-            r.draw_liquid_glass_button(
-                br,
-                8.5,
-                if sel {
-                    GlassBtnVariant::Tinted(Theme::ACCENT_RED)
-                } else {
-                    GlassBtnVariant::Regular
-                },
-                bhov,
-                self.mouse_down,
-                self.mouse_pos,
-                self.glass_off(),
-            );
-            r.draw_text(
-                cap.label(),
-                br,
-                12.0,
-                if sel || bhov { 600 } else { 400 },
-                Theme::TEXT_PRIMARY,
-                TextAlign::Center,
-                true,
-                false,
-            );
-            self.hit_regions.push(HitRegion {
-                rect: br,
-                action: UiAction::SetVizFpsCap(cap),
-            });
-            fx += bw + 8.0;
-        }
-        ry += 82.0;
-
-        if viz_custom_open {
-            let cur_fps = self.settings.viz_custom_fps.clamp(30, 360);
-            let dec_r = RectF::new(x0 + 18.0, ry + 2.0, 28.0, 24.0);
-            let dec_hov = self.mouse_pos.1 >= TOP_BAR_GUARD_H && dec_r.contains(self.mouse_pos.0, self.mouse_pos.1);
-            r.draw_liquid_glass_button(
-                dec_r,
-                7.0,
-                GlassBtnVariant::Regular,
-                dec_hov,
-                self.mouse_down,
-                self.mouse_pos,
-                self.glass_off(),
-            );
-            r.draw_text("-", dec_r, 13.0, 600, Theme::TEXT_PRIMARY, TextAlign::Center, true, false);
-            self.hit_regions.push(HitRegion {
-                rect: dec_r,
-                action: UiAction::SetVizCustomFps(cur_fps.saturating_sub(1).max(30)),
-            });
-
-            let bar_x = x0 + 54.0;
-            let bar_w = (cw - 176.0).max(120.0);
-            let fps_bar = RectF::new(bar_x, ry + 11.0, bar_w, 6.0);
-            let fps_hit = RectF::new(bar_x - 6.0, ry - 2.0, bar_w + 12.0, 32.0);
-            let fps_hov = fps_hit.contains(self.mouse_pos.0, self.mouse_pos.1)
-                || matches!(self.active_drag, Some(ActiveDrag::VizCustomFps(_)));
-            let f_norm = ((cur_fps as f32 - 30.0) / 330.0).clamp(0.0, 1.0);
-            r.fill_rounded_rect(fps_bar, 3.0, Color::rgba(255, 255, 255, 0.14));
-            if f_norm > 0.005 {
-                r.fill_rounded_rect(
-                    RectF::new(fps_bar.x, fps_bar.y, (fps_bar.w * f_norm).max(4.0), fps_bar.h),
-                    3.0,
-                    Theme::ACCENT_RED,
-                );
-            }
-            let fcx = fps_bar.x + fps_bar.w * f_norm;
-            let ftr = if fps_hov { 8.0 } else { 6.5 };
-            r.fill_circle(fcx, fps_bar.center_y(), ftr, Color::rgb(252, 252, 255));
-            self.hit_regions.push(HitRegion {
-                rect: fps_hit,
-                action: UiAction::ScrubVizCustomFps(fps_bar),
-            });
-
-            let inc_r = RectF::new(bar_x + bar_w + 8.0, ry + 2.0, 28.0, 24.0);
-            let inc_hov = self.mouse_pos.1 >= TOP_BAR_GUARD_H && inc_r.contains(self.mouse_pos.0, self.mouse_pos.1);
-            r.draw_liquid_glass_button(
-                inc_r,
-                7.0,
-                GlassBtnVariant::Regular,
-                inc_hov,
-                self.mouse_down,
-                self.mouse_pos,
-                self.glass_off(),
-            );
-            r.draw_text("+", inc_r, 13.0, 600, Theme::TEXT_PRIMARY, TextAlign::Center, true, false);
-            self.hit_regions.push(HitRegion {
-                rect: inc_r,
-                action: UiAction::SetVizCustomFps((cur_fps + 1).min(360)),
-            });
-
-            r.draw_text(
-                &format!("{} Hz", cur_fps),
-                RectF::new(inc_r.right() + 10.0, ry + 2.0, 64.0, 24.0),
-                12.5,
-                600,
-                Theme::TEXT_PRIMARY,
-                TextAlign::Right,
-                true,
-                false,
-            );
-            ry += 38.0;
-        }
-
-        r.draw_line(x0 + 18.0, ry + 4.0, x0 + cw - 18.0, ry + 4.0, Theme::SEPARATOR, 1.0);
-        ry += 14.0;
-
-        // 2. 歌词页面刷新率 + 自定义滑杆
         let lyr_resolved = self
             .settings
             .lyrics_fps_cap
@@ -8738,163 +10711,53 @@ impl AppUi {
 
         r.draw_line(x0 + 18.0, ry + 4.0, x0 + cw - 18.0, ry + 4.0, Theme::SEPARATOR, 1.0);
         ry += 10.0;
-
         self.draw_toggle_row(
             r,
             RectF::new(x0 + 18.0, ry, cw - 36.0, 54.0),
-            "窗口失去焦点时限制歌词页帧率为 60/72 自适应",
-            "默认关闭（失焦时仍保持满帧率渲染）；开启后失焦自动切换为当前屏幕 60/72 自适应帧率",
+            "后台失焦时歌词页自动降频（60/72 自适应）",
+            "默认关闭（窗口失去焦点仍满帧渲染）；开启后失焦自动切换为 60/72 自适应省电",
             self.settings.lyrics_limit_unfocused_fps,
             UiAction::ToggleLyricsLimitUnfocusedFps,
         );
         ry += 58.0;
 
         r.draw_line(x0 + 18.0, ry + 4.0, x0 + cw - 18.0, ry + 4.0, Theme::SEPARATOR, 1.0);
-        ry += 14.0;
-
-        // Immersive Window Border Corner Radius (`直角 0px` / `默认 12px` / `圆润 22px` + manual `0..28 px` slider!)
-        let cur_rad = self.settings.window_corner_radius.clamp(0.0, 28.0);
-        r.draw_text(
-            "沉浸式窗口边框圆角",
-            RectF::new(x0 + 18.0, ry, 176.0, 22.0),
-            14.0,
-            600,
-            Theme::TEXT_PRIMARY,
-            TextAlign::Left,
-            true,
-            false,
-        );
-        r.draw_text(
-            &format!(
-                "当前 {:.0} px · 可选直角或拖动滑杆精细调节圆角大小",
-                cur_rad
-            ),
-            RectF::new(x0 + 18.0, ry + 22.0, 310.0, 18.0),
-            11.8,
-            400,
-            Theme::TEXT_SECONDARY,
-            TextAlign::Left,
-            true,
-            false,
-        );
-
-        let presets: &[(&str, f32, f32)] = &[
-            ("直角 0px", 0.0, 68.0),
-            ("默认 12px", 12.0, 74.0),
-            ("大圆角 22px", 22.0, 82.0),
-        ];
-        let mut rx_btn = x0 + 320.0;
-        for &(plbl, pval, pw) in presets {
-            let sel = (cur_rad - pval).abs() < 0.45;
-            let pr = RectF::new(rx_btn, ry + 6.0, pw, 28.0);
-            let phov = pr.contains(self.mouse_pos.0, self.mouse_pos.1);
-            r.draw_liquid_glass_button(
-                pr,
-                8.5,
-                if sel {
-                    GlassBtnVariant::Tinted(Theme::ACCENT_RED)
-                } else {
-                    GlassBtnVariant::Regular
-                },
-                phov,
-                self.mouse_down,
-                self.mouse_pos,
-                self.glass_off(),
-            );
-            r.draw_text(
-                plbl,
-                pr,
-                11.8,
-                if sel || phov { 600 } else { 400 },
-                Theme::TEXT_PRIMARY,
-                TextAlign::Center,
-                true,
-                false,
-            );
-            self.hit_regions.push(HitRegion {
-                rect: pr,
-                action: UiAction::SetWindowCornerRadius(pval),
-            });
-            rx_btn += pw + 7.0;
-        }
-
-        let rad_bar_x = (rx_btn + 8.0).min(x0 + cw - 148.0);
-        let rad_bar_w = (x0 + cw - 22.0 - rad_bar_x).max(90.0);
-        let rad_bar = RectF::new(rad_bar_x, ry + 17.0, rad_bar_w, 6.0);
-        let rad_hit = RectF::new(rad_bar.x - 6.0, ry + 4.0, rad_bar.w + 12.0, 32.0);
-        let rad_hov = rad_hit.contains(self.mouse_pos.0, self.mouse_pos.1)
-            || matches!(self.active_drag, Some(ActiveDrag::WindowCornerRadius(_)));
-        let rad_norm = (cur_rad / 28.0).clamp(0.0, 1.0);
-        r.fill_rounded_rect(rad_bar, 3.0, Color::rgba(255, 255, 255, 0.14));
-        if rad_norm > 0.005 {
-            r.fill_rounded_rect(
-                RectF::new(rad_bar.x, rad_bar.y, (rad_bar.w * rad_norm).max(4.0), rad_bar.h),
-                3.0,
-                Theme::ACCENT_RED,
-            );
-        }
-        let thumb_cx = rad_bar.x + rad_bar.w * rad_norm;
-        let thumb_r = if rad_hov { 8.5 } else { 7.0 };
-        r.fill_circle(
-            thumb_cx,
-            rad_bar.center_y() + 1.5,
-            thumb_r + 1.0,
-            Color::rgba(0, 0, 0, 0.36),
-        );
-        r.fill_circle(
-            thumb_cx,
-            rad_bar.center_y(),
-            thumb_r,
-            Color::rgb(252, 252, 255),
-        );
-        if rad_hov {
-            r.stroke_circle(thumb_cx, rad_bar.center_y(), thumb_r + 1.5, Theme::ACCENT_RED, 1.2);
-        }
-        self.hit_regions.push(HitRegion {
-            rect: rad_hit,
-            action: UiAction::ScrubWindowCornerRadius(rad_bar),
-        });
-        ry += 52.0;
-
-        r.draw_line(x0 + 18.0, ry + 4.0, x0 + cw - 18.0, ry + 4.0, Theme::SEPARATOR, 1.0);
-        ry += 12.0;
-
+        ry += 10.0;
         self.draw_toggle_row(
             r,
             RectF::new(x0 + 18.0, ry, (cw - 52.0) * 0.5, 54.0),
-            "液态玻璃材质",
-            "默认关闭；开启后启用实时折射与流光边",
-            self.settings.liquid_glass_enabled,
-            UiAction::ToggleLiquidGlass,
-        );
-        self.draw_toggle_row(
-            r,
-            RectF::new(x0 + cw * 0.5 + 8.0, ry, (cw - 52.0) * 0.5, 54.0),
             "西文歌词按词律动",
-            "英语以 Word 为单位（关闭则逐字母细分）",
+            "英文以完整单词为单位扫光与上浮，关闭后按单字母细分",
             self.settings.lyrics_latin_by_word,
             UiAction::ToggleLyricsLatinByWord,
         );
+        self.draw_toggle_row(
+            r,
+            RectF::new(x0 + cw * 0.5 + 8.0, ry, (cw - 52.0) * 0.5, 54.0),
+            "自动检测歌词强调",
+            "开启时对长拖音自动触发光效；关闭仅保留歌词原标记强调",
+            self.settings.lyrics_auto_emphasis,
+            UiAction::ToggleLyricsAutoEmphasis,
+        );
         ry += 60.0;
 
         r.draw_line(x0 + 18.0, ry + 4.0, x0 + cw - 18.0, ry + 4.0, Theme::SEPARATOR, 1.0);
         ry += 10.0;
-
         self.draw_toggle_row(
             r,
             RectF::new(x0 + 18.0, ry, (cw - 52.0) * 0.5, 54.0),
-            "减弱动态效果",
-            "收敛弹簧与背景粒子运动",
-            self.settings.reduce_motion,
-            UiAction::ToggleReduceMotion,
+            "歌词进度边界弹性波浪",
+            "沿高亮前沿微倾上浮防中文字割裂，关闭则整字整体上浮",
+            self.settings.lyrics_frontier_wave,
+            UiAction::ToggleLyricsFrontierWave,
         );
         self.draw_toggle_row(
             r,
             RectF::new(x0 + cw * 0.5 + 8.0, ry, (cw - 52.0) * 0.5, 54.0),
-            "降低透明度",
-            "将半透明浮层切换为纯色表面",
-            self.settings.reduce_transparency,
-            UiAction::ToggleReduceTransparency,
+            "歌词页流动封面纹理 (FreeBlur)",
+            "开启后减轻背景模糊以保留流动封面轮廓；关闭为默认柔和扩散流光",
+            self.settings.lyrics_free_blur,
+            UiAction::ToggleLyricsBlurMode,
         );
         ry += 60.0;
 
@@ -8902,18 +10765,18 @@ impl AppUi {
         ry += 10.0;
         self.draw_toggle_row(
             r,
-            RectF::new(x0 + 18.0, ry, cw - 36.0, 42.0),
-            "歌词视图纯净柔焦背景",
-            "",
-            self.settings.lyrics_free_blur,
-            UiAction::ToggleLyricsBlurMode,
+            RectF::new(x0 + 18.0, ry, cw - 36.0, 54.0),
+            "未唱歌词轻度降采样节能",
+            "关闭为原生 1× 高清景深模糊；开启后未唱行以 0.75× 渲染进一步降低 GPU 负载",
+            self.settings.lyrics_blur_downsample,
+            UiAction::ToggleLyricsBlurDownsample,
         );
-        ry += 48.0;
+        ry += 58.0;
 
         r.draw_line(x0 + 18.0, ry + 4.0, x0 + cw - 18.0, ry + 4.0, Theme::SEPARATOR, 1.0);
         ry += 10.0;
         r.draw_text(
-            "为非强调歌词加入发光/放大效果",
+            "非强调歌词附加发光 / 放大",
             RectF::new(x0 + 18.0, ry, 260.0, 22.0),
             14.0,
             600,
@@ -8975,7 +10838,353 @@ impl AppUi {
             fx_x += bw + 6.0;
         }
 
-        y += card_h + 20.0;
+        y += lyr_card_h + 22.0;
+
+        // --- Group 4: 可视化与动态封面 ---
+        r.draw_text(
+            "可视化与动态封面",
+            RectF::new(x0 + 4.0, y, cw, 22.0),
+            13.0,
+            600,
+            Theme::TEXT_MUTED,
+            TextAlign::Left,
+            true,
+            false,
+        );
+        y += 26.0;
+
+        let viz_card_h = 240.0 + viz_extra;
+        let g_viz = RectF::new(x0, y, cw, viz_card_h);
+        r.fill_rounded_rect(g_viz, 14.0, Theme::BG_ELEVATED);
+        r.stroke_rounded_rect(g_viz, 14.0, Theme::SEPARATOR, 1.0);
+
+        let mut vy = y + 14.0;
+        let viz_resolved = self
+            .settings
+            .viz_fps_cap
+            .resolved_label(mon_hz, self.settings.viz_custom_fps);
+        r.draw_text(
+            "可视化页面刷新率",
+            RectF::new(x0 + 18.0, vy, 240.0, 22.0),
+            14.2,
+            600,
+            Theme::TEXT_PRIMARY,
+            TextAlign::Left,
+            true,
+            false,
+        );
+        r.draw_text(
+            &format!("当前屏幕 {} Hz · 目标刷新率：{}", mon_hz, viz_resolved),
+            RectF::new(x0 + 18.0, vy + 22.0, cw - 36.0, 18.0),
+            12.0,
+            400,
+            Theme::TEXT_SECONDARY,
+            TextAlign::Left,
+            true,
+            false,
+        );
+        let mut fx = x0 + 18.0;
+        let fy = vy + 46.0;
+        for cap in FpsCap::ALL {
+            let sel = self.settings.viz_fps_cap == cap;
+            let bw = match cap {
+                FpsCap::Hz60 | FpsCap::Hz72 => 52.0,
+                FpsCap::Adaptive60_72 => 116.0,
+                FpsCap::VSync => 78.0,
+                FpsCap::Custom => 68.0,
+            };
+            let br = RectF::new(fx, fy, bw, 28.0);
+            let bhov = self.mouse_pos.1 >= TOP_BAR_GUARD_H && br.contains(self.mouse_pos.0, self.mouse_pos.1);
+            r.draw_liquid_glass_button(
+                br,
+                8.5,
+                if sel {
+                    GlassBtnVariant::Tinted(Theme::ACCENT_RED)
+                } else {
+                    GlassBtnVariant::Regular
+                },
+                bhov,
+                self.mouse_down,
+                self.mouse_pos,
+                self.glass_off(),
+            );
+            r.draw_text(
+                cap.label(),
+                br,
+                12.0,
+                if sel || bhov { 600 } else { 400 },
+                Theme::TEXT_PRIMARY,
+                TextAlign::Center,
+                true,
+                false,
+            );
+            self.hit_regions.push(HitRegion {
+                rect: br,
+                action: UiAction::SetVizFpsCap(cap),
+            });
+            fx += bw + 8.0;
+        }
+        vy += 82.0;
+
+        if viz_custom_open {
+            let cur_fps = self.settings.viz_custom_fps.clamp(30, 360);
+            let dec_r = RectF::new(x0 + 18.0, vy + 2.0, 28.0, 24.0);
+            let dec_hov = self.mouse_pos.1 >= TOP_BAR_GUARD_H && dec_r.contains(self.mouse_pos.0, self.mouse_pos.1);
+            r.draw_liquid_glass_button(
+                dec_r,
+                7.0,
+                GlassBtnVariant::Regular,
+                dec_hov,
+                self.mouse_down,
+                self.mouse_pos,
+                self.glass_off(),
+            );
+            r.draw_text("-", dec_r, 13.0, 600, Theme::TEXT_PRIMARY, TextAlign::Center, true, false);
+            self.hit_regions.push(HitRegion {
+                rect: dec_r,
+                action: UiAction::SetVizCustomFps(cur_fps.saturating_sub(1).max(30)),
+            });
+
+            let bar_x = x0 + 54.0;
+            let bar_w = (cw - 176.0).max(120.0);
+            let fps_bar = RectF::new(bar_x, vy + 11.0, bar_w, 6.0);
+            let fps_hit = RectF::new(bar_x - 6.0, vy - 2.0, bar_w + 12.0, 32.0);
+            let fps_hov = fps_hit.contains(self.mouse_pos.0, self.mouse_pos.1)
+                || matches!(self.active_drag, Some(ActiveDrag::VizCustomFps(_)));
+            let f_norm = ((cur_fps as f32 - 30.0) / 330.0).clamp(0.0, 1.0);
+            r.fill_rounded_rect(fps_bar, 3.0, Color::rgba(255, 255, 255, 0.14));
+            if f_norm > 0.005 {
+                r.fill_rounded_rect(
+                    RectF::new(fps_bar.x, fps_bar.y, (fps_bar.w * f_norm).max(4.0), fps_bar.h),
+                    3.0,
+                    Theme::ACCENT_RED,
+                );
+            }
+            let fcx = fps_bar.x + fps_bar.w * f_norm;
+            let ftr = if fps_hov { 8.0 } else { 6.5 };
+            r.fill_circle(fcx, fps_bar.center_y(), ftr, Color::rgb(252, 252, 255));
+            self.hit_regions.push(HitRegion {
+                rect: fps_hit,
+                action: UiAction::ScrubVizCustomFps(fps_bar),
+            });
+
+            let inc_r = RectF::new(bar_x + bar_w + 8.0, vy + 2.0, 28.0, 24.0);
+            let inc_hov = self.mouse_pos.1 >= TOP_BAR_GUARD_H && inc_r.contains(self.mouse_pos.0, self.mouse_pos.1);
+            r.draw_liquid_glass_button(
+                inc_r,
+                7.0,
+                GlassBtnVariant::Regular,
+                inc_hov,
+                self.mouse_down,
+                self.mouse_pos,
+                self.glass_off(),
+            );
+            r.draw_text("+", inc_r, 13.0, 600, Theme::TEXT_PRIMARY, TextAlign::Center, true, false);
+            self.hit_regions.push(HitRegion {
+                rect: inc_r,
+                action: UiAction::SetVizCustomFps((cur_fps + 1).min(360)),
+            });
+
+            r.draw_text(
+                &format!("{} Hz", cur_fps),
+                RectF::new(inc_r.right() + 10.0, vy + 2.0, 64.0, 24.0),
+                12.5,
+                600,
+                Theme::TEXT_PRIMARY,
+                TextAlign::Right,
+                true,
+                false,
+            );
+            vy += 38.0;
+        }
+
+        r.draw_line(x0 + 18.0, vy + 4.0, x0 + cw - 18.0, vy + 4.0, Theme::SEPARATOR, 1.0);
+        vy += 10.0;
+        self.draw_toggle_row(
+            r,
+            RectF::new(x0 + 18.0, vy, cw - 36.0, 54.0),
+            "实时频谱播放图标",
+            "未打开可视化页时，播放封面五条竖线与侧栏可视化图标仍随实际音频实时跳动；关闭可停用后台采样",
+            self.settings.live_eq_icon_spectrum,
+            UiAction::ToggleLiveEqIconSpectrum,
+        );
+        vy += 58.0;
+
+        r.draw_line(x0 + 18.0, vy + 4.0, x0 + cw - 18.0, vy + 4.0, Theme::SEPARATOR, 1.0);
+        vy += 10.0;
+        self.draw_toggle_row(
+            r,
+            RectF::new(x0 + 18.0, vy, cw - 36.0, 54.0),
+            "动态封面（实验性）",
+            "仅在主页与歌词页启用纯 Win32 硬件解码动态封面，新发现与广播保持静态高清封面",
+            self.settings.motion_artwork_enabled,
+            UiAction::ToggleMotionArtwork,
+        );
+
+        y += viz_card_h + 22.0;
+
+        // --- Group 5: 外观、性能与内存 ---
+        r.draw_text(
+            "外观、性能与内存",
+            RectF::new(x0 + 4.0, y, cw, 22.0),
+            13.0,
+            600,
+            Theme::TEXT_MUTED,
+            TextAlign::Left,
+            true,
+            false,
+        );
+        y += 26.0;
+
+        let perf_card_h = 224.0;
+        let g_perf = RectF::new(x0, y, cw, perf_card_h);
+        r.fill_rounded_rect(g_perf, 14.0, Theme::BG_ELEVATED);
+        r.stroke_rounded_rect(g_perf, 14.0, Theme::SEPARATOR, 1.0);
+
+        let mut py = y + 14.0;
+        let cur_rad = self.settings.window_corner_radius.clamp(0.0, 28.0);
+        r.draw_text(
+            "沉浸式窗口边框圆角",
+            RectF::new(x0 + 18.0, py, 176.0, 22.0),
+            14.0,
+            600,
+            Theme::TEXT_PRIMARY,
+            TextAlign::Left,
+            true,
+            false,
+        );
+        r.draw_text(
+            &format!(
+                "当前 {:.0} px · 可选直角或拖动滑杆精细调节圆角大小",
+                cur_rad
+            ),
+            RectF::new(x0 + 18.0, py + 22.0, 310.0, 18.0),
+            11.8,
+            400,
+            Theme::TEXT_SECONDARY,
+            TextAlign::Left,
+            true,
+            false,
+        );
+
+        let presets: &[(&str, f32, f32)] = &[
+            ("直角 0px", 0.0, 68.0),
+            ("默认 12px", 12.0, 74.0),
+            ("大圆角 22px", 22.0, 82.0),
+        ];
+        let mut rx_btn = x0 + 320.0;
+        for &(plbl, pval, pw) in presets {
+            let sel = (cur_rad - pval).abs() < 0.45;
+            let pr = RectF::new(rx_btn, py + 6.0, pw, 28.0);
+            let phov = pr.contains(self.mouse_pos.0, self.mouse_pos.1);
+            r.draw_liquid_glass_button(
+                pr,
+                8.5,
+                if sel {
+                    GlassBtnVariant::Tinted(Theme::ACCENT_RED)
+                } else {
+                    GlassBtnVariant::Regular
+                },
+                phov,
+                self.mouse_down,
+                self.mouse_pos,
+                self.glass_off(),
+            );
+            r.draw_text(
+                plbl,
+                pr,
+                11.8,
+                if sel || phov { 600 } else { 400 },
+                Theme::TEXT_PRIMARY,
+                TextAlign::Center,
+                true,
+                false,
+            );
+            self.hit_regions.push(HitRegion {
+                rect: pr,
+                action: UiAction::SetWindowCornerRadius(pval),
+            });
+            rx_btn += pw + 7.0;
+        }
+
+        let rad_bar_x = (rx_btn + 8.0).min(x0 + cw - 148.0);
+        let rad_bar_w = (x0 + cw - 22.0 - rad_bar_x).max(90.0);
+        let rad_bar = RectF::new(rad_bar_x, py + 17.0, rad_bar_w, 6.0);
+        let rad_hit = RectF::new(rad_bar.x - 6.0, py + 4.0, rad_bar.w + 12.0, 32.0);
+        let rad_hov = rad_hit.contains(self.mouse_pos.0, self.mouse_pos.1)
+            || matches!(self.active_drag, Some(ActiveDrag::WindowCornerRadius(_)));
+        let rad_norm = (cur_rad / 28.0).clamp(0.0, 1.0);
+        r.fill_rounded_rect(rad_bar, 3.0, Color::rgba(255, 255, 255, 0.14));
+        if rad_norm > 0.005 {
+            r.fill_rounded_rect(
+                RectF::new(rad_bar.x, rad_bar.y, (rad_bar.w * rad_norm).max(4.0), rad_bar.h),
+                3.0,
+                Theme::ACCENT_RED,
+            );
+        }
+        let thumb_cx = rad_bar.x + rad_bar.w * rad_norm;
+        let thumb_r = if rad_hov { 8.5 } else { 7.0 };
+        r.fill_circle(
+            thumb_cx,
+            rad_bar.center_y() + 1.5,
+            thumb_r + 1.0,
+            Color::rgba(0, 0, 0, 0.36),
+        );
+        r.fill_circle(
+            thumb_cx,
+            rad_bar.center_y(),
+            thumb_r,
+            Color::rgb(252, 252, 255),
+        );
+        if rad_hov {
+            r.stroke_circle(thumb_cx, rad_bar.center_y(), thumb_r + 1.5, Theme::ACCENT_RED, 1.2);
+        }
+        self.hit_regions.push(HitRegion {
+            rect: rad_hit,
+            action: UiAction::ScrubWindowCornerRadius(rad_bar),
+        });
+        py += 52.0;
+
+        r.draw_line(x0 + 18.0, py + 4.0, x0 + cw - 18.0, py + 4.0, Theme::SEPARATOR, 1.0);
+        py += 10.0;
+        self.draw_toggle_row(
+            r,
+            RectF::new(x0 + 18.0, py, (cw - 52.0) * 0.5, 56.0),
+            "液态玻璃材质",
+            "默认关闭；开启后侧栏与控件启用实时折射与流光边",
+            self.settings.liquid_glass_enabled,
+            UiAction::ToggleLiquidGlass,
+        );
+        self.draw_toggle_row(
+            r,
+            RectF::new(x0 + cw * 0.5 + 8.0, py, (cw - 52.0) * 0.5, 56.0),
+            "降低透明度",
+            "将侧栏与浮层切换为纯色表面（不影响歌词页流光背景）",
+            self.settings.reduce_transparency,
+            UiAction::ToggleReduceTransparency,
+        );
+        py += 62.0;
+
+        r.draw_line(x0 + 18.0, py + 4.0, x0 + cw - 18.0, py + 4.0, Theme::SEPARATOR, 1.0);
+        py += 10.0;
+        self.draw_toggle_row(
+            r,
+            RectF::new(x0 + 18.0, py, (cw - 52.0) * 0.5, 60.0),
+            "减弱动态效果",
+            "收敛弹簧、封面展开与粒子运动，降低动画负载",
+            self.settings.reduce_motion,
+            UiAction::ToggleReduceMotion,
+        );
+        self.draw_toggle_row(
+            r,
+            RectF::new(x0 + cw * 0.5 + 8.0, py, (cw - 52.0) * 0.5, 60.0),
+            "增强内存释放",
+            "高频回收封面/缓存并压缩工作集（推荐与减弱动态效果一并开启）",
+            self.settings.aggressive_memory_release,
+            UiAction::ToggleAggressiveMemoryRelease,
+        );
+
+        y += perf_card_h + 22.0;
 
         // --- Group 4: Hidden-by-Default Spatial Audio & Flavor Disclosure (`空间音频风味等的开关和设置默认隐藏`!) ---
         let disc_row = RectF::new(x0, y, 224.0, 30.0);
@@ -9244,6 +11453,163 @@ impl AppUi {
             y += 238.0;
         }
 
+        // --- Group 5: About & Check Updates (`关于与更新`) ---
+        y += 8.0;
+        r.draw_text(
+            "关于与更新",
+            RectF::new(x0 + 4.0, y, cw, 22.0),
+            13.0,
+            600,
+            Theme::TEXT_SECONDARY,
+            TextAlign::Left,
+            true,
+            false,
+        );
+        y += 26.0;
+
+        let about_card = RectF::new(x0, y, cw, 118.0);
+        r.fill_rounded_rect(about_card, 14.0, Theme::BG_ELEVATED);
+        r.stroke_rounded_rect(about_card, 14.0, Theme::SEPARATOR, 1.0);
+
+        r.draw_text(
+            &format!("AM Light v{APP_VERSION}  ·  MIT License"),
+            RectF::new(x0 + 18.0, y + 14.0, (cw - 240.0).max(160.0), 22.0),
+            14.2,
+            600,
+            Theme::TEXT_PRIMARY,
+            TextAlign::Left,
+            true,
+            false,
+        );
+        r.draw_text(
+            "歌词动效与同步参考了 LyricsBlossom 及其作者分享的资料",
+            RectF::new(x0 + 18.0, y + 38.0, (cw - 240.0).max(160.0), 18.0),
+            11.8,
+            400,
+            Theme::TEXT_SECONDARY,
+            TextAlign::Left,
+            true,
+            false,
+        );
+
+        let chk_lbl = if self.update_checking {
+            "正在检查..."
+        } else {
+            "检查更新"
+        };
+        let chk_btn = RectF::new(x0 + cw - 18.0 - 94.0, y + 15.0, 94.0, 30.0);
+        let chk_hov = !self.update_checking
+            && self.mouse_pos.1 >= TOP_BAR_GUARD_H
+            && chk_btn.contains(self.mouse_pos.0, self.mouse_pos.1);
+        r.draw_liquid_glass_button(
+            chk_btn,
+            9.0,
+            GlassBtnVariant::Tinted(Theme::ACCENT_RED),
+            chk_hov,
+            self.mouse_down,
+            self.mouse_pos,
+            self.glass_off(),
+        );
+        r.draw_text(
+            chk_lbl,
+            chk_btn,
+            12.2,
+            600,
+            Theme::TEXT_PRIMARY,
+            TextAlign::Center,
+            true,
+            false,
+        );
+        if !self.update_checking {
+            self.hit_regions.push(HitRegion {
+                rect: chk_btn,
+                action: UiAction::CheckForUpdates,
+            });
+        }
+
+        let repo_btn = RectF::new(chk_btn.x - 98.0, y + 15.0, 90.0, 30.0);
+        let repo_hov = self.mouse_pos.1 >= TOP_BAR_GUARD_H
+            && repo_btn.contains(self.mouse_pos.0, self.mouse_pos.1);
+        r.draw_liquid_glass_button(
+            repo_btn,
+            9.0,
+            GlassBtnVariant::Regular,
+            repo_hov,
+            self.mouse_down,
+            self.mouse_pos,
+            self.glass_off(),
+        );
+        r.draw_text(
+            "GitHub 仓库",
+            repo_btn,
+            12.0,
+            500,
+            Theme::TEXT_PRIMARY,
+            TextAlign::Center,
+            true,
+            false,
+        );
+        self.hit_regions.push(HitRegion {
+            rect: repo_btn,
+            action: UiAction::OpenUrl("https://github.com/N20xDuli/AM-Light".to_string()),
+        });
+
+        r.draw_line(
+            x0 + 18.0,
+            y + 66.0,
+            x0 + cw - 18.0,
+            y + 66.0,
+            Theme::SEPARATOR,
+            1.0,
+        );
+        let status_txt = self
+            .update_status_msg
+            .as_deref()
+            .unwrap_or("点击「检查更新」向 GitHub Releases 查询最新版本");
+        r.draw_text(
+            status_txt,
+            RectF::new(x0 + 18.0, y + 78.0, (cw - 170.0).max(160.0), 22.0),
+            12.2,
+            400,
+            if self.update_latest_url.is_some() {
+                Color::rgb(110, 232, 160)
+            } else {
+                Theme::TEXT_SECONDARY
+            },
+            TextAlign::Left,
+            true,
+            false,
+        );
+        if let Some(ref dl_url) = self.update_latest_url.clone() {
+            let dl_btn = RectF::new(x0 + cw - 18.0 - 122.0, y + 75.0, 122.0, 28.0);
+            let dl_hov = self.mouse_pos.1 >= TOP_BAR_GUARD_H
+                && dl_btn.contains(self.mouse_pos.0, self.mouse_pos.1);
+            r.draw_liquid_glass_button(
+                dl_btn,
+                8.5,
+                GlassBtnVariant::ProminentLight,
+                dl_hov,
+                self.mouse_down,
+                self.mouse_pos,
+                self.glass_off(),
+            );
+            r.draw_text(
+                "前往下载新版本",
+                dl_btn,
+                11.8,
+                600,
+                Color::rgb(16, 16, 20),
+                TextAlign::Center,
+                true,
+                false,
+            );
+            self.hit_regions.push(HitRegion {
+                rect: dl_btn,
+                action: UiAction::OpenUrl(dl_url.clone()),
+            });
+        }
+
+        y += 126.0;
         y
     }
 
@@ -9661,17 +12027,20 @@ async fn lookup_smtc_track_in_catalog(
     let badge = format_audio_traits_badge(&parsed.audio_traits);
     let art = parsed.artwork_url.clone();
 
+    let has_hires_trait = parsed.audio_traits.iter().any(|t| t == "hi-res-lossless");
+    let spatial_ready = audio_viz::is_default_endpoint_spatial_ready();
     let mut specs = None;
     if let Some(hls_url) = best
         .pointer("/attributes/extendedAssetUrls/enhancedHls")
         .and_then(Value::as_str)
     {
         if let Ok(m3u8) = am_api::fetch_enhanced_hls_manifest(hls_url).await {
-            specs = audio_viz::parse_enhanced_hls_variants(
+            specs = audio_viz::parse_enhanced_hls_variants_with_endpoint(
                 &m3u8,
                 prefs.lossless_enabled,
                 prefs.streaming_audio_quality,
                 prefs.dolby_atmos_setting,
+                spatial_ready,
             );
         }
     } else if !aid.is_empty() {
@@ -9684,16 +12053,27 @@ async fn lookup_smtc_track_in_catalog(
                 .and_then(Value::as_str)
             {
                 if let Ok(m3u8) = am_api::fetch_enhanced_hls_manifest(hls_url).await {
-                    specs = audio_viz::parse_enhanced_hls_variants(
+                    specs = audio_viz::parse_enhanced_hls_variants_with_endpoint(
                         &m3u8,
                         prefs.lossless_enabled,
                         prefs.streaming_audio_quality,
                         prefs.dolby_atmos_setting,
+                        spatial_ready,
                     );
                 }
             }
         }
     }
+    specs = audio_viz::enrich_stream_specs_with_live_and_traits(
+        specs,
+        None,
+        None,
+        None,
+        has_hires_trait,
+        prefs.lossless_enabled,
+        prefs.streaming_audio_quality,
+        prefs.dolby_atmos_setting,
+    );
 
     Some((aid, art, badge, specs))
 }
@@ -9738,6 +12118,9 @@ async fn enrich_track_hls_and_meta(aid: &str, sf_primary: &str) {
             continue;
         };
         if let Some(parsed) = parse_track_from_am_json(item, None, None) {
+            if !parsed.audio_traits.is_empty() {
+                am_agent::set_track_audio_traits(aid, parsed.audio_traits.clone());
+            }
             am_agent::enrich_cached_track(
                 aid,
                 CachedTrackMeta {

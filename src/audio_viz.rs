@@ -63,6 +63,8 @@ pub struct StreamAudioSpecs {
     pub compression_ratio_pct: Option<f32>,
     #[serde(default)]
     pub atmos_fallback_reason: Option<String>,
+    #[serde(default)]
+    pub hires_catalog_trait: bool,
     pub available_variants: Vec<HlsStreamVariant>,
 }
 
@@ -134,10 +136,15 @@ pub struct LiveVisualizerSnapshot {
     pub wave_r: Vec<f32>,
     /// 256-point stereo (L, R) pairs for Lissajous / Goniometer Soundstage (声场图)
     pub soundstage_lr: Vec<[f32; 2]>,
+    /// 5-band frequency-split stereo points `[l, r, band_idx]` (0=Bass .. 4=Treble) for 5-color Soundstage
+    pub soundstage_band_pts: Vec<[f32; 3]>,
 
-    /// 256 linear-frequency FFT bins (-110..0 dBFS) for Spek waterfall & brickwall curve
+    /// 256 linear-frequency FFT bins (-110..0 dBFS) for Spek waterfall & brickwall curve (0..nyquist)
     pub inst_spectrum_db: Vec<f32>,
     pub peak_envelope_db: Vec<f32>,
+    /// Dedicated high-resolution 256 linear-frequency bins over `0..min(nyquist, 24 kHz)` for crisp adaptive 24k view
+    pub inst_spectrum_low24_db: Vec<f32>,
+    pub peak_envelope_low24_db: Vec<f32>,
 
     /// Forensic audio quality inspection results
     pub tier_code: String,
@@ -191,8 +198,11 @@ impl Default for LiveVisualizerSnapshot {
             wave_l: vec![0.0; 192],
             wave_r: vec![0.0; 192],
             soundstage_lr: vec![[0.0, 0.0]; 256],
+            soundstage_band_pts: Vec::new(),
             inst_spectrum_db: vec![-110.0; 256],
             peak_envelope_db: vec![-110.0; 256],
+            inst_spectrum_low24_db: vec![-110.0; 256],
+            peak_envelope_low24_db: vec![-110.0; 256],
             tier_code: "waiting".to_string(),
             verdict_title: "等待音频输出...".to_string(),
             estimated_bitrate: "-".to_string(),
@@ -474,6 +484,8 @@ pub struct ForensicAccumulator {
     fft_im: Vec<f32>,
     pub peak_env_db: Vec<f32>,
     pub smooth_inst_db: Vec<f32>,
+    pub peak_env_low24_db: Vec<f32>,
+    pub smooth_inst_low24_db: Vec<f32>,
     pub analyzed_frames: u64,
     pub mdct_hole_ema: f32,
     pub mdct_frames: u64,
@@ -496,6 +508,8 @@ impl ForensicAccumulator {
             fft_im: vec![0.0; fft_size],
             peak_env_db: vec![-110.0; 256],
             smooth_inst_db: vec![-110.0; 256],
+            peak_env_low24_db: vec![-110.0; 256],
+            smooth_inst_low24_db: vec![-110.0; 256],
             analyzed_frames: 0,
             mdct_hole_ema: 0.0,
             mdct_frames: 0,
@@ -513,6 +527,8 @@ impl ForensicAccumulator {
     pub fn reset(&mut self) {
         self.peak_env_db.fill(-110.0);
         self.smooth_inst_db.fill(-110.0);
+        self.peak_env_low24_db.fill(-110.0);
+        self.smooth_inst_low24_db.fill(-110.0);
         self.analyzed_frames = 0;
         self.mdct_hole_ema = 0.0;
         self.mdct_frames = 0;
@@ -596,6 +612,29 @@ impl ForensicAccumulator {
         }
 
         let nyquist = (self.sample_rate as f32) * 0.5;
+        let low_cap_hz = nyquist.min(24_000.0);
+        let low_half = (((low_cap_hz / nyquist.max(1.0)) * (half as f32)).round() as usize)
+            .clamp(32.min(half), half);
+        let mut disp_low24 = vec![-110.0f32; 256];
+        for b in 0..256 {
+            let s_f = (b as f32 / 256.0) * (low_half as f32);
+            let e_f = ((b + 1) as f32 / 256.0) * (low_half as f32);
+            let start = (s_f.floor() as usize).min(low_half.saturating_sub(1));
+            let end = (e_f.ceil() as usize).clamp(start + 1, low_half);
+            let mut mx = -110.0f32;
+            for &v in &raw_bins[start..end] {
+                if v > mx {
+                    mx = v;
+                }
+            }
+            disp_low24[b] = mx;
+            if mx > self.smooth_inst_low24_db[b] {
+                self.smooth_inst_low24_db[b] = self.smooth_inst_low24_db[b] * 0.32 + mx * 0.68;
+            } else {
+                self.smooth_inst_low24_db[b] = self.smooth_inst_low24_db[b] * 0.74 + mx * 0.26;
+            }
+        }
+
         let hz_per_disp = nyquist / 256.0;
 
         let mid_b0 = ((600.0 / hz_per_disp) as usize).min(255);
@@ -616,6 +655,8 @@ impl ForensicAccumulator {
             for b in 0..256 {
                 let decayed = (self.peak_env_db[b] - 0.012).max(-110.0);
                 self.peak_env_db[b] = decayed.max(disp[b]);
+                let decayed_low = (self.peak_env_low24_db[b] - 0.012).max(-110.0);
+                self.peak_env_low24_db[b] = decayed_low.max(disp_low24[b]);
             }
 
             let hf_b0 = ((10_000.0 / hz_per_disp) as usize).min(255);
@@ -892,6 +933,120 @@ pub fn parse_enhanced_hls_variants(
     )
 }
 
+fn json_u32_flexible(v: &Value) -> Option<u32> {
+    v.as_u64()
+        .map(|n| n as u32)
+        .or_else(|| v.as_f64().filter(|f| *f > 0.0).map(|f| f.round() as u32))
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u32>().ok()))
+}
+
+fn parse_sr_bd_from_group_id(group_id: &str) -> (Option<u32>, Option<u16>) {
+    let mut sr: Option<u32> = None;
+    let mut bd: Option<u16> = None;
+    for part in group_id.split(|c: char| !c.is_ascii_digit()) {
+        if let Ok(n) = part.parse::<u32>() {
+            if matches!(n, 44_100 | 48_000 | 88_200 | 96_000 | 176_400 | 192_000 | 384_000) {
+                sr = Some(sr.map_or(n, |cur| cur.max(n)));
+            } else if matches!(n, 16 | 24 | 32) && sr.is_some() {
+                bd = Some(n as u16);
+            }
+        }
+    }
+    (sr, bd)
+}
+
+pub fn enrich_stream_specs_with_live_and_traits(
+    specs: Option<StreamAudioSpecs>,
+    live_sr: Option<u32>,
+    live_bd: Option<u16>,
+    live_fmt: Option<&str>,
+    has_hires_trait: bool,
+    lossless_enabled: bool,
+    streaming_quality: i64,
+    atmos_setting: i64,
+) -> Option<StreamAudioSpecs> {
+    let mut sp = match specs {
+        Some(s) => s,
+        None => {
+            let sr = live_sr.filter(|&v| v > 0)?;
+            let is_aac = live_fmt.is_some_and(|f| f.eq_ignore_ascii_case("aac"));
+            let bd = if is_aac { None } else { Some(live_bd.unwrap_or(24)) };
+            let pcm = bd.map(|b| (sr * (b as u32) * 2) / 1000);
+            let tier_label = if is_aac {
+                "高质量 AAC".to_string()
+            } else if sr > 48_000 {
+                "Hi-Res 无损".to_string()
+            } else {
+                "无损 Lossless".to_string()
+            };
+            StreamAudioSpecs {
+                codec: if is_aac { "MP4A.40.2" } else { "ALAC" }.to_string(),
+                codec_label: if is_aac {
+                    "AAC-LC".to_string()
+                } else {
+                    "ALAC (Apple Lossless)".to_string()
+                },
+                tier_label,
+                sample_rate_hz: sr,
+                bit_depth: bd,
+                channels: "2.0 立体声".to_string(),
+                bitrate_kbps: if is_aac { 256 } else { pcm.map(|p| (p * 58) / 100).unwrap_or(1411) },
+                peak_bitrate_kbps: if is_aac { 275 } else { pcm.map(|p| (p * 64) / 100).unwrap_or(1600) },
+                uncompressed_pcm_kbps: pcm,
+                compression_ratio_pct: None,
+                atmos_fallback_reason: None,
+                hires_catalog_trait: has_hires_trait,
+                available_variants: Vec::new(),
+            }
+        }
+    };
+
+    if let Some(sr) = live_sr.filter(|&v| v > 0) {
+        let is_aac = live_fmt.is_some_and(|f| f.eq_ignore_ascii_case("aac"));
+        if sr != sp.sample_rate_hz || (!is_aac && sr > 48_000) {
+            sp.sample_rate_hz = sr;
+            if let Some(bd) = live_bd.filter(|&b| b >= 16) {
+                sp.bit_depth = Some(bd);
+            }
+            if !is_aac && sp.codec.eq_ignore_ascii_case("ALAC") {
+                sp.tier_label = if sr > 48_000 {
+                    "Hi-Res 无损".to_string()
+                } else {
+                    "无损 Lossless".to_string()
+                };
+                if let Some(bd) = sp.bit_depth {
+                    let pcm = (sr * (bd as u32) * 2) / 1000;
+                    sp.uncompressed_pcm_kbps = Some(pcm);
+                    if sp.bitrate_kbps > 0 && pcm > 0 {
+                        if sr > 48_000 && sp.bitrate_kbps < 2200 {
+                            sp.bitrate_kbps = (pcm * 58) / 100;
+                            sp.peak_bitrate_kbps = (pcm * 64) / 100;
+                        }
+                        sp.compression_ratio_pct =
+                            Some(((sp.bitrate_kbps as f32 / pcm as f32) * 1000.0).round() / 10.0);
+                    }
+                }
+            }
+        }
+    }
+
+    if has_hires_trait {
+        sp.hires_catalog_trait = true;
+        if lossless_enabled
+            && streaming_quality >= 20
+            && atmos_setting != 20
+            && sp.codec.eq_ignore_ascii_case("ALAC")
+        {
+            sp.tier_label = "Hi-Res 无损".to_string();
+            if sp.bit_depth.is_none() {
+                sp.bit_depth = Some(24);
+            }
+        }
+    }
+
+    Some(sp)
+}
+
 pub fn parse_enhanced_hls_variants_with_endpoint(
     m3u8: &str,
     lossless_enabled: bool,
@@ -900,12 +1055,24 @@ pub fn parse_enhanced_hls_variants_with_endpoint(
     endpoint_spatial_ready: bool,
 ) -> Option<StreamAudioSpecs> {
     let mut asset_meta: HashMap<String, Value> = HashMap::new();
+    let mut asset_meta_by_gid: HashMap<String, Value> = HashMap::new();
     for line in m3u8.lines() {
         if line.contains("com.apple.hls.audioAssetMetadata") {
             if let Some(b64) = extract_m3u8_attr(line, "VALUE") {
                 if let Ok(decoded) = general_purpose::STANDARD.decode(b64) {
                     if let Ok(Value::Object(map)) = serde_json::from_slice::<Value>(&decoded) {
                         for (k, v) in map {
+                            if let Some(gid) = v.get("GROUP-ID").and_then(Value::as_str) {
+                                let new_sr = v.get("SAMPLE-RATE").and_then(json_u32_flexible).unwrap_or(0);
+                                let prev_sr = asset_meta_by_gid
+                                    .get(gid)
+                                    .and_then(|e| e.get("SAMPLE-RATE"))
+                                    .and_then(json_u32_flexible)
+                                    .unwrap_or(0);
+                                if new_sr >= prev_sr {
+                                    asset_meta_by_gid.insert(gid.to_string(), v.clone());
+                                }
+                            }
                             asset_meta.insert(k, v);
                         }
                     }
@@ -918,12 +1085,23 @@ pub fn parse_enhanced_hls_variants_with_endpoint(
     for line in m3u8.lines() {
         if line.starts_with("#EXT-X-MEDIA:") {
             if let Some(gid) = extract_m3u8_attr(line, "GROUP-ID") {
-                let sr = extract_m3u8_attr(line, "SAMPLE-RATE").and_then(|s| s.parse::<u32>().ok());
-                let bd = extract_m3u8_attr(line, "BIT-DEPTH").and_then(|s| s.parse::<u16>().ok());
+                let (gid_sr, gid_bd) = parse_sr_bd_from_group_id(gid);
+                let sr = extract_m3u8_attr(line, "SAMPLE-RATE")
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .or(gid_sr);
+                let bd = extract_m3u8_attr(line, "BIT-DEPTH")
+                    .and_then(|s| s.parse::<u16>().ok())
+                    .or(gid_bd);
                 let ch = extract_m3u8_attr(line, "CHANNELS")
                     .unwrap_or("2")
                     .to_string();
-                media_groups.insert(gid.to_string(), (sr, bd, ch));
+                let replace = match media_groups.get(gid) {
+                    Some((prev_sr, _, _)) => sr.unwrap_or(0) >= prev_sr.unwrap_or(0),
+                    None => true,
+                };
+                if replace {
+                    media_groups.insert(gid.to_string(), (sr, bd, ch));
+                }
             }
         }
     }
@@ -953,18 +1131,24 @@ pub fn parse_enhanced_hls_variants_with_endpoint(
             .get(&group_id)
             .cloned()
             .unwrap_or((None, None, "2".to_string()));
+        if sr.is_none() {
+            sr = extract_m3u8_attr(line, "SAMPLE-RATE").and_then(|s| s.parse::<u32>().ok());
+        }
+        if bd.is_none() {
+            bd = extract_m3u8_attr(line, "BIT-DEPTH").and_then(|s| s.parse::<u16>().ok());
+        }
 
-        if let Some(meta_entry) = asset_meta.get(variant_id) {
-            if sr.is_none() {
-                sr = meta_entry
-                    .get("SAMPLE-RATE")
-                    .and_then(Value::as_u64)
-                    .map(|n| n as u32);
+        if let Some(meta_entry) = asset_meta
+            .get(variant_id)
+            .or_else(|| asset_meta_by_gid.get(&group_id))
+        {
+            if let Some(msr) = meta_entry.get("SAMPLE-RATE").and_then(json_u32_flexible) {
+                sr = Some(sr.map_or(msr, |cur| cur.max(msr)));
             }
             if bd.is_none() {
                 bd = meta_entry
                     .get("BIT-DEPTH")
-                    .and_then(Value::as_u64)
+                    .and_then(json_u32_flexible)
                     .map(|n| n as u16);
             }
             if let Some(c_str) = meta_entry.get("CHANNEL-COUNT").and_then(Value::as_str) {
@@ -972,6 +1156,13 @@ pub fn parse_enhanced_hls_variants_with_endpoint(
                     ch = c_str.to_string();
                 }
             }
+        }
+        let (gid_sr, gid_bd) = parse_sr_bd_from_group_id(&group_id);
+        if let Some(gsr) = gid_sr {
+            sr = Some(sr.map_or(gsr, |cur| cur.max(gsr)));
+        }
+        if bd.is_none() {
+            bd = gid_bd;
         }
 
         let is_alac = codecs_raw.eq_ignore_ascii_case("alac");
@@ -1119,8 +1310,72 @@ pub fn parse_enhanced_hls_variants_with_endpoint(
         uncompressed_pcm_kbps,
         compression_ratio_pct,
         atmos_fallback_reason,
+        hires_catalog_trait: false,
         available_variants: variants,
     })
+}
+
+/// Splits stereo `(L, R)` samples into 5 frequency bands (Low -> High) using cascaded 1-pole
+/// Linkwitz crossover filters at `160 Hz / 500 Hz / 2000 Hz / 6000 Hz`, returning `[l, r, band_idx]`
+/// (`0 = Bass`, `1 = Low-Mid`, `2 = Mid`, `3 = High-Mid`, `4 = Treble`) for true per-band Soundstage!
+pub fn split_stereo_5band_soundstage(stereo_lr: &[[f32; 2]], sample_rate: u32) -> Vec<[f32; 3]> {
+    let n = stereo_lr.len();
+    if n < 8 {
+        return Vec::new();
+    }
+    let sr = (sample_rate.max(8_000)) as f32;
+    let alpha = |fc: f32| -> f32 {
+        let clamped = fc.min(sr * 0.42);
+        1.0 - (-2.0 * PI * clamped / sr).exp()
+    };
+    let a0 = alpha(160.0);
+    let a1 = alpha(500.0);
+    let a2 = alpha(2000.0);
+    let a3 = alpha(6000.0);
+
+    let mut lp0 = [0.0f32; 2];
+    let mut lp1 = [0.0f32; 2];
+    let mut lp2 = [0.0f32; 2];
+    let mut lp3 = [0.0f32; 2];
+
+    // Gentle perceptual tilt so upper-mid/treble stereo details remain crisp alongside bass
+    const BAND_TILT: [f32; 5] = [0.88, 1.04, 1.18, 1.42, 1.78];
+
+    // Warm up filter state on leading samples so DC/transient settling doesn't skew points
+    let warmup = (n / 5).min(40);
+    let stride = if n >= 200 { 4 } else if n >= 96 { 2 } else { 1 };
+    let mut out = Vec::with_capacity(((n - warmup) / stride + 1) * 5);
+
+    for (idx, &[l, r]) in stereo_lr.iter().enumerate() {
+        lp0[0] += a0 * (l - lp0[0]);
+        lp0[1] += a0 * (r - lp0[1]);
+        lp1[0] += a1 * (l - lp1[0]);
+        lp1[1] += a1 * (r - lp1[1]);
+        lp2[0] += a2 * (l - lp2[0]);
+        lp2[1] += a2 * (r - lp2[1]);
+        lp3[0] += a3 * (l - lp3[0]);
+        lp3[1] += a3 * (r - lp3[1]);
+
+        if idx < warmup || ((idx - warmup) % stride != 0) {
+            continue;
+        }
+        let bands: [[f32; 2]; 5] = [
+            [lp0[0], lp0[1]],
+            [lp1[0] - lp0[0], lp1[1] - lp0[1]],
+            [lp2[0] - lp1[0], lp2[1] - lp1[1]],
+            [lp3[0] - lp2[0], lp3[1] - lp2[1]],
+            [l - lp3[0], r - lp3[1]],
+        ];
+        for (b, &[bl, br]) in bands.iter().enumerate() {
+            let g = BAND_TILT[b];
+            let sl = (bl * g).clamp(-1.5, 1.5);
+            let sr_s = (br * g).clamp(-1.5, 1.5);
+            if sl.abs() + sr_s.abs() > 1.5e-4 {
+                out.push([sl, sr_s, b as f32]);
+            }
+        }
+    }
+    out
 }
 
 pub fn compute_spectrum_32(samples: &[f32], sample_rate: f32) -> [f32; 32] {
@@ -1208,6 +1463,8 @@ impl Default for SharedRingState {
 struct SharedForensicSummary {
     inst_spectrum_db: Vec<f32>,
     peak_envelope_db: Vec<f32>,
+    inst_spectrum_low24_db: Vec<f32>,
+    peak_envelope_low24_db: Vec<f32>,
     tier_code: String,
     verdict_title: String,
     estimated_bitrate: String,
@@ -1230,6 +1487,8 @@ impl Default for SharedForensicSummary {
         Self {
             inst_spectrum_db: def.inst_spectrum_db,
             peak_envelope_db: def.peak_envelope_db,
+            inst_spectrum_low24_db: def.inst_spectrum_low24_db,
+            peak_envelope_low24_db: def.peak_envelope_low24_db,
             tier_code: def.tier_code,
             verdict_title: def.verdict_title,
             estimated_bitrate: def.estimated_bitrate,
@@ -2148,6 +2407,12 @@ pub fn sample_live_visualizer(dt_sec: f32) -> LiveVisualizerSnapshot {
     let mid_energy = sm.spec_32[8..20].iter().sum::<f32>() / 12.0;
     let high_energy = sm.spec_32[20..32].iter().sum::<f32>() / 12.0;
 
+    let soundstage_band_pts = if active_signal && !stage_lr.is_empty() {
+        split_stereo_5band_soundstage(&stage_lr, sr)
+    } else {
+        Vec::new()
+    };
+
     let forensic = FORENSIC_SUMMARY.read().map(|f| f.clone()).unwrap_or_default();
 
     let snap = LiveVisualizerSnapshot {
@@ -2167,8 +2432,11 @@ pub fn sample_live_visualizer(dt_sec: f32) -> LiveVisualizerSnapshot {
         wave_l,
         wave_r,
         soundstage_lr: stage_lr,
+        soundstage_band_pts,
         inst_spectrum_db: forensic.inst_spectrum_db,
         peak_envelope_db: forensic.peak_envelope_db,
+        inst_spectrum_low24_db: forensic.inst_spectrum_low24_db,
+        peak_envelope_low24_db: forensic.peak_envelope_low24_db,
         tier_code: forensic.tier_code,
         verdict_title: forensic.verdict_title,
         estimated_bitrate: forensic.estimated_bitrate,
@@ -3536,6 +3804,8 @@ mod win {
                             if let Ok(mut fs) = FORENSIC_SUMMARY.write() {
                                 fs.inst_spectrum_db = inst_spec;
                                 fs.peak_envelope_db = accum.peak_env_db.clone();
+                                fs.inst_spectrum_low24_db = accum.smooth_inst_low24_db.clone();
+                                fs.peak_envelope_low24_db = accum.peak_env_low24_db.clone();
                                 fs.tier_code = tier_code;
                                 fs.verdict_title = verdict_title;
                                 fs.estimated_bitrate = estimated_bitrate;
@@ -3583,6 +3853,11 @@ mod win {
                                     if *v > -109.5 {
                                         *v = (*v - 4.0).max(-110.0);
                                         any_above = true;
+                                    }
+                                }
+                                for v in &mut fs.inst_spectrum_low24_db {
+                                    if *v > -109.5 {
+                                        *v = (*v - 4.0).max(-110.0);
                                     }
                                 }
                                 if !any_above {

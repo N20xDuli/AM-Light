@@ -2,9 +2,11 @@
 
 use crate::d2d_renderer::{D2DRenderer, GlassBtnVariant, LyricsLineBmpKey, SfIcon, TextAlign};
 use crate::lyrics::{
-    LyricCharUnit, LyricsAnimator, LyricsSourcePref, NonEmphasisLyricsEffect, ParsedLyrics,
-    Spring1D,
+    eval_frontier_glow_profile, eval_frontier_lift_weight, eval_frontier_scale_delta,
+    eval_frontier_wave_shear, should_use_frontier_lift, LyricCharUnit, LyricsAnimator,
+    LyricsSourcePref, NonEmphasisLyricsEffect, ParsedLyrics, Spring1D,
 };
+use crate::motion_art::MotionFrameSnapshot;
 use crate::smtc::SmtcState;
 use crate::theme::{Color, RectF, Theme};
 use windows_numerics::Matrix3x2;
@@ -43,6 +45,13 @@ pub struct DisjointUnitCell {
     pub raw_rect: RectF,
     pub glyph_rect: RectF,
     pub clip_rect: RectF,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SubGlyphCell {
+    glyph_rect: RectF,
+    clip_rect: RectF,
+    local_u: f32,
 }
 
 /// Partitions character/word hit-test rectangles into mathematically disjoint clip cells per visual row
@@ -118,12 +127,12 @@ pub fn build_disjoint_unit_cells(unit_rects: &[Vec<RectF>]) -> Vec<Vec<DisjointU
         for i in 0..row.len() {
             let rc = row[i].1;
             let l = if i == 0 {
-                rc.x - 2.0
+                rc.x - 10.0
             } else {
                 (row[i - 1].1.right() + rc.x) * 0.5
             };
             let r = if i + 1 >= row.len() {
-                rc.right() + 2.0
+                rc.right() + 10.0
             } else {
                 (rc.right() + row[i + 1].1.x) * 0.5
             };
@@ -158,6 +167,8 @@ struct CachedLyricLineLayout {
     char_cells: Vec<Vec<DisjointUnitCell>>,
     bg_word_cjk_cells: Vec<Vec<DisjointUnitCell>>,
     bg_char_cells: Vec<Vec<DisjointUnitCell>>,
+    word_cjk_sub_glyphs: Vec<Vec<SubGlyphCell>>,
+    bg_word_cjk_sub_glyphs: Vec<Vec<SubGlyphCell>>,
 }
 
 #[derive(Clone, PartialEq, Eq, Default)]
@@ -358,11 +369,16 @@ impl LyricsViewState {
         mouse_down: bool,
         is_maximized: bool,
         reduce_motion: bool,
-        reduce_transparency: bool,
+        _reduce_transparency: bool,
         glass_off: bool,
         latin_by_word: bool,
         non_emph_fx: NonEmphasisLyricsEffect,
+        auto_emphasis: bool,
+        frontier_wave: bool,
+        sheet_alpha: f32,
+        motion_frame: Option<&MotionFrameSnapshot>,
     ) {
+        let sa = sheet_alpha.clamp(0.0, 1.0);
         self.animator.latin_by_word = latin_by_word;
         self.hit_zones.clear();
         self.progress_bar_rect = RectF::default();
@@ -391,18 +407,15 @@ impl LyricsViewState {
         r.set_lyrics_bmp_track(&cache_tag);
 
         // 1. True GPU Rotating Album-Artwork Mesh Background (1:1 with LyricsBlossom & MusicFreeBlur!)
-        let drew_mesh = if !reduce_transparency {
-            r.draw_lyrics_artwork_mesh_bg(
-                win_rect,
-                artwork_key,
-                self.mesh_phase,
-                bass_energy,
-                &self.smooth_palette,
-                self.music_free_blur,
-            )
-        } else {
-            false
-        };
+        // Always preserved even when「降低透明度」is enabled so UI opacity never disables Lyrics aurora!
+        let drew_mesh = r.draw_lyrics_artwork_mesh_bg(
+            win_rect,
+            artwork_key,
+            self.mesh_phase,
+            bass_energy,
+            &self.smooth_palette,
+            self.music_free_blur,
+        );
 
         if !drew_mesh {
             let base_bg = self.smooth_palette[0].lerp(Color::rgb(8, 8, 12), 0.72);
@@ -585,9 +598,17 @@ impl LyricsViewState {
             Color::rgba(0, 0, 0, 0.0),
         );
 
-        let drew_art = artwork_key
-            .map(|k| r.draw_rounded_artwork(k, true, cov_rect, cov_radius, 1.0))
-            .unwrap_or(false);
+        let drew_motion = if !reduce_motion {
+            motion_frame
+                .map(|mf| r.draw_motion_artwork(mf, cov_rect, cov_radius, sa))
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        let drew_art = drew_motion
+            || artwork_key
+                .map(|k| r.draw_rounded_artwork(k, true, cov_rect, cov_radius, sa))
+                .unwrap_or(false);
         if !drew_art {
             r.fill_rounded_rect(cov_rect, cov_radius, Color::rgba(255, 255, 255, 0.10));
             r.draw_icon(
@@ -888,7 +909,7 @@ impl LyricsViewState {
         );
 
         // --- Draw Right Column: SyncedLyricsViewController (Hidden smoothly when Instrumental / No Lyrics!) ---
-        let lyrics_col_alpha = (1.0 - center_t * 1.38).clamp(0.0, 1.0);
+        let lyrics_col_alpha = ((1.0 - center_t * 1.38).clamp(0.0, 1.0) * sa).clamp(0.0, 1.0);
         if lyrics_col_alpha > 0.01 {
             let shifted_right = RectF::new(
                 right_col.x + (1.0 - lyrics_col_alpha) * 32.0,
@@ -919,6 +940,8 @@ impl LyricsViewState {
                     hovered_pt,
                     reduce_motion,
                     non_emph_fx,
+                    auto_emphasis,
+                    frontier_wave,
                     lyrics_col_alpha,
                 );
             } else if lyrics_loading {
@@ -953,6 +976,11 @@ impl LyricsViewState {
     pub fn invalidate_layout_cache(&mut self) {
         self.cached_layout_key = CachedLyricsLayoutKey::default();
         self.cached_line_layouts.clear();
+    }
+
+    pub fn on_viewport_changed(&mut self) {
+        self.invalidate_layout_cache();
+        self.animator.reset_layout_snap();
     }
 
     pub fn release_gpu_caches(&mut self, r: &mut D2DRenderer) {
@@ -1087,16 +1115,99 @@ impl LyricsViewState {
                 st.measured_height = total_h;
             }
 
+            let query_sub_glyphs = |lay: &windows::Win32::Graphics::DirectWrite::IDWriteTextLayout,
+                                    units: &[LyricCharUnit],
+                                    unit_cells: &[Vec<DisjointUnitCell>]|
+             -> Vec<Vec<SubGlyphCell>> {
+                units
+                    .iter()
+                    .enumerate()
+                    .map(|(u_idx, cu)| {
+                        let Some(cells) = unit_cells.get(u_idx) else {
+                            return Vec::new();
+                        };
+                        if cells.len() != 1 || cu.utf16_len <= 1 {
+                            return Vec::new();
+                        }
+                        let cell = cells[0];
+                        let non_ws_chars: Vec<(u32, u32)> = cu
+                            .ch_str
+                            .char_indices()
+                            .filter_map(|(byte_idx, ch)| {
+                                if ch.is_whitespace() {
+                                    None
+                                } else {
+                                    let u16_off =
+                                        cu.ch_str[..byte_idx].encode_utf16().count() as u32;
+                                    Some((u16_off, ch.len_utf16() as u32))
+                                }
+                            })
+                            .collect();
+                        if non_ws_chars.len() <= 1 {
+                            return Vec::new();
+                        }
+                        let total_chars = non_ws_chars.len();
+                        let mut glyphs: Vec<(RectF, f32)> = Vec::with_capacity(total_chars);
+                        for (g_idx, (rel_u16, len_u16)) in non_ws_chars.into_iter().enumerate() {
+                            let rects = D2DRenderer::hit_test_syllable_rects(
+                                lay,
+                                cu.utf16_start + rel_u16,
+                                len_u16,
+                                0.0,
+                                0.0,
+                            );
+                            if rects.len() == 1 && rects[0].w > 0.1 && rects[0].h > 0.1 {
+                                let local_u = (g_idx as f32 + 0.5) / (total_chars as f32);
+                                glyphs.push((rects[0], local_u));
+                            }
+                        }
+                        if glyphs.len() <= 1 {
+                            return Vec::new();
+                        }
+                        glyphs.sort_by(|a, b| a.0.x.total_cmp(&b.0.x));
+                        let n = glyphs.len();
+                        let mut out = Vec::with_capacity(n);
+                        for k in 0..n {
+                            let (rc, lu) = glyphs[k];
+                            let cl = if k == 0 {
+                                cell.clip_rect.x.min(rc.x - 4.0)
+                            } else {
+                                (glyphs[k - 1].0.right() + rc.x) * 0.5
+                            };
+                            let cr = if k + 1 >= n {
+                                cell.clip_rect.right().max(rc.right() + 4.0)
+                            } else {
+                                (rc.right() + glyphs[k + 1].0.x) * 0.5
+                            };
+                            out.push(SubGlyphCell {
+                                glyph_rect: rc,
+                                clip_rect: RectF::new(
+                                    cl,
+                                    cell.clip_rect.y,
+                                    (cr - cl).max(0.25),
+                                    cell.clip_rect.h,
+                                ),
+                                local_u: lu,
+                            });
+                        }
+                        out
+                    })
+                    .collect()
+            };
+
             let word_cjk_cells = query_unit_cells(&main_layout, &line.word_cjk_units);
             let char_cells = query_unit_cells(&main_layout, &line.char_units);
-            let (bg_word_cjk_cells, bg_char_cells) = if let Some((ref bg_lay, _)) = bg_layout_opt {
-                (
-                    query_unit_cells(bg_lay, &line.bg_word_cjk_units),
-                    query_unit_cells(bg_lay, &line.bg_char_units),
-                )
-            } else {
-                (Vec::new(), Vec::new())
-            };
+            let word_cjk_sub_glyphs =
+                query_sub_glyphs(&main_layout, &line.word_cjk_units, &word_cjk_cells);
+            let (bg_word_cjk_cells, bg_char_cells, bg_word_cjk_sub_glyphs) =
+                if let Some((ref bg_lay, _)) = bg_layout_opt {
+                    let bwc = query_unit_cells(bg_lay, &line.bg_word_cjk_units);
+                    let bcc = query_unit_cells(bg_lay, &line.bg_char_units);
+                    let bwsg = query_sub_glyphs(bg_lay, &line.bg_word_cjk_units, &bwc);
+                    (bwc, bcc, bwsg)
+                } else {
+                    (Vec::new(), Vec::new(), Vec::new())
+                };
 
             self.cached_line_layouts.push(CachedLyricLineLayout {
                 align,
@@ -1113,11 +1224,14 @@ impl LyricsViewState {
                 char_cells,
                 bg_word_cjk_cells,
                 bg_char_cells,
+                word_cjk_sub_glyphs,
+                bg_word_cjk_sub_glyphs,
             });
         }
         self.cached_layout_key = key;
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_synced_lyrics_column(
         &mut self,
         r: &mut D2DRenderer,
@@ -1128,14 +1242,20 @@ impl LyricsViewState {
         hovered_pt: (f32, f32),
         reduce_motion: bool,
         non_emph_fx: NonEmphasisLyricsEffect,
+        auto_emphasis: bool,
+        frontier_wave: bool,
         col_alpha: f32,
     ) {
         r.set_lyrics_subpixel_text_mode(true);
         let vocal_max_w = (right_col.w * 0.85).max(180.0); // Specs.vocalGroupWidthCoefficient = 0.85 (+496)
         let max_w_q = vocal_max_w.round().clamp(120.0, 2400.0) as u16;
-        let base_font_sz = (right_col.w * 0.056).clamp(26.0, 62.0);
-        let bg_font_sz = (base_font_sz * 0.67).clamp(17.0, 40.0);
-        let trans_font_sz = (base_font_sz * 0.50).clamp(13.8, 30.0);
+        // Match official Apple Music generous bold proportions (`right_col.w * 0.056`) with a
+        // gentle height guard so ultrawide/short windows stay balanced across all DPI scales
+        let base_font_sz = (right_col.w * 0.056)
+            .min((right_col.h * 0.066).max(30.0))
+            .clamp(28.0, 58.0);
+        let bg_font_sz = (base_font_sz * 0.67).clamp(18.0, 38.0);
+        let trans_font_sz = (base_font_sz * 0.50).clamp(14.0, 28.0);
 
         // Build DirectWrite layouts + HitTestTextRange boxes ONCE per song/width (0 calls on subsequent frames!)
         self.ensure_cached_line_layouts(
@@ -1163,6 +1283,7 @@ impl LyricsViewState {
             origin_x: f32,
             screen_y: f32,
             active_w: f32,
+            edge_fade: f32,
             use_vector_layer: bool,
             line_t_sweep: f64,
             bmp_key: LyricsLineBmpKey,
@@ -1172,10 +1293,12 @@ impl LyricsViewState {
 
         let mut visible_lines: Vec<VisibleLineSlot> = Vec::with_capacity(18);
         let mut next_glow_slot = 0usize;
+        let mut blur_bakes_this_frame = 0usize;
 
         // PASS 1 (Clip/Layer Depth == 0!):
         // - O(1) float frustum culling using pre-cached `total_h` (zero DirectWrite calls!)
-        // - Pre-warm blurred depth-of-field bitmaps ONLY for non-vector lines (never draw A+B simultaneously!)
+        // - Pre-warm blurred depth-of-field bitmaps ONLY for actually blurred non-vector lines
+        //   (budgeted to max 2 GPU blur bakes per frame to eliminate first-frame/scroll spikes!)
         // - Bake per-character/word glyph emission into `active_glow_slots[0..2]` only when units glow
         for i in 0..lyr.lines.len() {
             let cl = &self.cached_line_layouts[i];
@@ -1190,6 +1313,13 @@ impl LyricsViewState {
             if screen_y + cl.total_h < right_col.y - 84.0 || screen_y > right_col.bottom() + 84.0 {
                 continue;
             }
+
+            let line_mid_y = screen_y + cl.total_h * 0.5;
+            let top_t = ((line_mid_y - right_col.y) / 68.0).clamp(0.0, 1.0);
+            let bot_t = ((right_col.bottom() - line_mid_y) / 76.0).clamp(0.0, 1.0);
+            let st_top = top_t * top_t * (3.0 - 2.0 * top_t);
+            let st_bot = bot_t * bot_t * (3.0 - 2.0 * bot_t);
+            let edge_fade = (st_top * st_bot).clamp(0.0, 1.0);
 
             let line = &lyr.lines[i];
             let origin_x = if cl.align == TextAlign::Right {
@@ -1213,31 +1343,47 @@ impl LyricsViewState {
             );
             let is_hov_pass1 = hit_pill.contains(hovered_pt.0, hovered_pt.1)
                 && right_col.contains(hovered_pt.0, hovered_pt.1);
-            let has_live_lift = st.char_lifts.iter().any(|sp| sp.value.abs() > 0.03)
-                || st.bg_char_lifts.iter().any(|sp| sp.value.abs() > 0.03);
+            let is_line_selected = st.active_blend.target > 0.5;
             let use_vector_layer = if line.has_word_sync {
-                active_w > 0.15 || has_live_lift
+                is_line_selected || active_w > 0.72
             } else {
-                active_w > 0.15
-                    && (reduce_motion || is_hov_pass1 || user_scrolling || st.blur_spring.value <= 0.12)
+                is_line_selected
+                    || (active_w > 0.72
+                        && (reduce_motion || is_hov_pass1 || user_scrolling || st.blur_spring.value <= 0.12))
             };
 
-            if !use_vector_layer {
-                r.ensure_lyrics_line_bitmap(
-                    bmp_key,
-                    vocal_max_w,
-                    cl.total_h,
-                    cl.align,
-                    &cl.main_layout,
-                    cl.bg_layout.as_ref().map(|l| (l, cl.bg_dy)),
-                    cl.trans_layout.as_ref().map(|l| (l, cl.tr_dy)),
-                );
+            if !use_vector_layer && edge_fade > 0.01 {
+                let handoff_raw = if is_line_selected {
+                    0.0
+                } else {
+                    ((0.72 - active_w) / 0.72).clamp(0.0, 1.0)
+                };
+                let handoff_blur = handoff_raw * handoff_raw * (3.0 - 2.0 * handoff_raw);
+                let pre_sigma = if reduce_motion || is_hov_pass1 || user_scrolling {
+                    0.0
+                } else {
+                    (st.blur_spring.value * handoff_blur).clamp(0.0, 6.2)
+                };
+                if pre_sigma > 0.04 && blur_bakes_this_frame < 20 {
+                    r.ensure_lyrics_line_bitmap(
+                        bmp_key,
+                        vocal_max_w,
+                        cl.total_h,
+                        cl.align,
+                        &cl.main_layout,
+                        cl.bg_layout.as_ref().map(|l| (l, cl.bg_dy)),
+                        cl.trans_layout.as_ref().map(|l| (l, cl.tr_dy)),
+                    );
+                    if r.prepare_lyrics_line_blurred(bmp_key, pre_sigma) {
+                        blur_bakes_this_frame += 1;
+                    }
+                }
             }
 
             let mut glow_slot = None;
             let mut glow_peak = 0.0f32;
 
-            if !reduce_motion && active_w > 0.012 && next_glow_slot < 2 && col_alpha > 0.02 {
+            if !reduce_motion && active_w > 0.012 && next_glow_slot < 2 && col_alpha * edge_fade > 0.02 {
                 let units: &[LyricCharUnit] = if line.has_word_sync {
                     line.units_for_mode(by_word)
                 } else {
@@ -1245,7 +1391,7 @@ impl LyricsViewState {
                 };
                 let any_glow_candidate = if line.has_word_sync {
                     units.iter().any(|cu| {
-                        (cu.is_sustained || non_emph_fx.glow())
+                        (cu.is_emphasized(auto_emphasis) || non_emph_fx.glow())
                             && cu.sweep_progress(line_t_sweep) > 0.002
                     })
                 } else {
@@ -1258,6 +1404,11 @@ impl LyricsViewState {
                     } else {
                         &cl.char_cells
                     };
+                    let sub_glyphs: &[Vec<SubGlyphCell>] = if by_word {
+                        &cl.word_cjk_sub_glyphs
+                    } else {
+                        &[]
+                    };
                     let font_sz = cl.main_font_sz;
                     if let Some(pad_dip) =
                         r.begin_active_lyrics_glow_slot(slot, vocal_max_w, cl.total_h)
@@ -1268,19 +1419,35 @@ impl LyricsViewState {
                             font_sz,
                             units,
                             unit_cells,
+                            sub_glyphs,
                             &st.char_lifts,
                             pad_dip,
                             pad_dip,
                             line_t_sweep,
+                            line.end_sec,
                             line.is_rtl,
-                            active_w,
+                            active_w * col_alpha * edge_fade,
                             non_emph_fx,
+                            auto_emphasis,
+                            frontier_wave,
                         );
-                        r.end_active_lyrics_glow_slot();
                         if has_glow && peak > 0.005 {
+                            let inner_sigma = 3.6f32;
+                            let inner_alpha = (0.24 + peak * 0.26) * active_w * col_alpha * edge_fade;
+                            let outer_sigma = 8.8 + peak * 6.0;
+                            let outer_alpha = (0.20 + peak * 0.34) * active_w * col_alpha * edge_fade;
+                            r.finish_and_bake_active_lyrics_glow_slot(
+                                slot,
+                                inner_sigma,
+                                inner_alpha,
+                                outer_sigma,
+                                outer_alpha,
+                            );
                             glow_peak = peak;
                             glow_slot = Some(slot);
                             next_glow_slot += 1;
+                        } else {
+                            r.end_active_lyrics_glow_slot();
                         }
                     }
                 }
@@ -1291,6 +1458,7 @@ impl LyricsViewState {
                 origin_x,
                 screen_y,
                 active_w,
+                edge_fade,
                 use_vector_layer,
                 line_t_sweep,
                 bmp_key,
@@ -1299,11 +1467,16 @@ impl LyricsViewState {
             });
         }
 
-        // PASS 2: Push True Vertical Alpha-Gradient Mask Layer (`0% -> 100% -> 100% -> 0%`)!
-        let fade_pushed = r.push_vertical_fade_layer(right_col, 48.0, 56.0);
-        if !fade_pushed {
-            r.push_clip(right_col);
-        }
+        // PASS 2: Fast hardware axis-aligned clip with +/- 64 DIP horizontal glow bleed
+        // (replaces expensive 4K full-column PushLayer; smooth vertical edge fade is applied per-line!)
+        let fade_left = (right_col.x - 64.0).max(0.0);
+        let fade_rect = RectF::new(
+            fade_left,
+            right_col.y,
+            right_col.w + (right_col.x - fade_left) + 64.0,
+            right_col.h,
+        );
+        r.push_clip(fade_rect);
 
         // Draw Instrumental Break 3-Dot Indicator (`Specs.instrumentalBreakCountdownDotCount = 3`)
         if self.animator.interlude.visible && self.animator.interlude.scale_alpha > 0.02 {
@@ -1408,35 +1581,64 @@ impl LyricsViewState {
 
             // Exclusive single-layer rendering: NEVER draw blurred Layer A and lifted/scaled Layer B
             // simultaneously so there is zero double-layer ghosting ("露馅")!
+            let line_vis_alpha = col_alpha * pl.edge_fade;
+            if line_vis_alpha <= 0.005 {
+                r.reset_transform();
+                continue;
+            }
             if !pl.use_vector_layer {
-                let handoff_blur = ((0.15 - pl.active_w) / 0.15).clamp(0.0, 1.0);
+                let is_line_selected = st.active_blend.target > 0.5;
+                let handoff_raw = if is_line_selected {
+                    0.0
+                } else {
+                    ((0.72 - pl.active_w) / 0.72).clamp(0.0, 1.0)
+                };
+                let handoff_blur = handoff_raw * handoff_raw * (3.0 - 2.0 * handoff_raw);
                 let sigma = if reduce_motion || is_hov || user_scrolling {
                     0.0
                 } else {
                     (st.blur_spring.value * handoff_blur).clamp(0.0, 6.2)
                 };
                 let draw_a =
-                    (inactive_base_alpha + (0.99 - inactive_base_alpha) * pl.active_w) * col_alpha;
-                if !r.draw_cached_lyrics_line_blurred(
-                    pl.bmp_key,
-                    pl.origin_x,
-                    pl.screen_y,
-                    sigma,
-                    draw_a,
-                ) {
+                    (inactive_base_alpha + (0.99 - inactive_base_alpha) * pl.active_w) * line_vis_alpha;
+                let drew_cached = sigma > 0.04
+                    && r.draw_cached_lyrics_line_blurred(
+                        pl.bmp_key,
+                        pl.origin_x,
+                        pl.screen_y,
+                        sigma,
+                        draw_a,
+                    );
+                if !drew_cached {
                     r.draw_text_layout_subpixel(
                         &cl.main_layout,
                         pl.origin_x,
                         pl.screen_y,
                         Color::rgba(255, 255, 255, draw_a),
                     );
+                    if let Some(ref bg_lay) = cl.bg_layout {
+                        r.draw_text_layout_subpixel(
+                            bg_lay,
+                            pl.origin_x,
+                            pl.screen_y + cl.bg_dy,
+                            Color::rgba(255, 255, 255, draw_a * 0.72),
+                        );
+                    }
+                    if let Some(ref tr_lay) = cl.trans_layout {
+                        r.draw_text_layout_subpixel(
+                            tr_lay,
+                            pl.origin_x,
+                            pl.screen_y + cl.tr_dy,
+                            Color::rgba(255, 255, 255, draw_a * 0.68),
+                        );
+                    }
                 }
             } else {
                 if let Some(slot) = pl.glow_slot {
                     let inner_sigma = 3.8f32;
-                    let inner_alpha = (0.48 + pl.glow_peak * 0.44) * pl.active_w * col_alpha;
+                    let inner_alpha = (0.48 + pl.glow_peak * 0.44) * pl.active_w * line_vis_alpha;
                     let outer_sigma = 9.0 + pl.glow_peak * 6.5;
-                    let outer_alpha = (0.22 + pl.glow_peak * 0.44) * pl.active_w * col_alpha;
+                    let outer_alpha = (0.22 + pl.glow_peak * 0.44) * pl.active_w * line_vis_alpha;
                     r.composite_active_lyrics_glow_slot(
                         slot,
                         pl.origin_x,
@@ -1450,9 +1652,9 @@ impl LyricsViewState {
                 }
 
                 let sung_a =
-                    (inactive_base_alpha + (0.99 - inactive_base_alpha) * pl.active_w) * col_alpha;
+                    (inactive_base_alpha + (0.99 - inactive_base_alpha) * pl.active_w) * line_vis_alpha;
                 let up_a =
-                    (inactive_base_alpha + (0.34 - inactive_base_alpha) * pl.active_w) * col_alpha;
+                    (inactive_base_alpha + (0.34 - inactive_base_alpha) * pl.active_w) * line_vis_alpha;
                 let sung_col = Color::rgba(255, 255, 255, sung_a);
                 let up_col = Color::rgba(255, 255, 255, up_a);
                 let main_units = line.units_for_mode(by_word);
@@ -1464,12 +1666,18 @@ impl LyricsViewState {
                 let main_font_sz = cl.main_font_sz;
 
                 if line.has_word_sync && !main_units.is_empty() {
+                    let main_sub_glyphs: &[Vec<SubGlyphCell>] = if by_word {
+                        &cl.word_cjk_sub_glyphs
+                    } else {
+                        &[]
+                    };
                     Self::draw_char_sequence(
                         r,
                         &cl.main_layout,
                         main_font_sz,
                         main_units,
                         main_cells,
+                        main_sub_glyphs,
                         &st.char_lifts,
                         pl.origin_x,
                         pl.screen_y,
@@ -1481,6 +1689,8 @@ impl LyricsViewState {
                         reduce_motion,
                         true,
                         non_emph_fx,
+                        auto_emphasis,
+                        frontier_wave,
                         sung_col,
                         up_col,
                     );
@@ -1494,10 +1704,10 @@ impl LyricsViewState {
                     let bg_y = pl.screen_y + cl.bg_dy;
                     let bg_sung_a =
                         (inactive_base_alpha * 0.72 + (0.78 - inactive_base_alpha * 0.72) * pl.active_w)
-                            * col_alpha;
+                            * line_vis_alpha;
                     let bg_up_a =
                         (inactive_base_alpha * 0.72 + (0.20 - inactive_base_alpha * 0.72) * pl.active_w)
-                            * col_alpha;
+                            * line_vis_alpha;
                     let bg_sung = Color::rgba(255, 255, 255, bg_sung_a);
                     let bg_up = Color::rgba(255, 255, 255, bg_up_a);
                     let bg_units = line.bg_units_for_mode(by_word);
@@ -1505,6 +1715,11 @@ impl LyricsViewState {
                         &cl.bg_word_cjk_cells
                     } else {
                         &cl.bg_char_cells
+                    };
+                    let bg_sub_glyphs: &[Vec<SubGlyphCell>] = if by_word {
+                        &cl.bg_word_cjk_sub_glyphs
+                    } else {
+                        &[]
                     };
                     let bg_font_sz = cl.bg_font_sz;
                     if !line.bg_syllables.is_empty() && !bg_units.is_empty() {
@@ -1514,6 +1729,7 @@ impl LyricsViewState {
                             bg_font_sz,
                             bg_units,
                             bg_cells,
+                            bg_sub_glyphs,
                             &st.bg_char_lifts,
                             pl.origin_x,
                             bg_y,
@@ -1525,6 +1741,8 @@ impl LyricsViewState {
                             reduce_motion,
                             false,
                             non_emph_fx,
+                            auto_emphasis,
+                            frontier_wave,
                             bg_sung,
                             bg_up,
                         );
@@ -1538,7 +1756,7 @@ impl LyricsViewState {
                 if let Some(ref tr_lay) = cl.trans_layout {
                     let tr_alpha =
                         (inactive_base_alpha * 0.72 + (0.68 - inactive_base_alpha * 0.72) * pl.active_w)
-                            * col_alpha;
+                            * line_vis_alpha;
                     r.draw_text_layout_subpixel(
                         tr_lay,
                         pl.origin_x,
@@ -1577,11 +1795,7 @@ impl LyricsViewState {
 
         self.animator.hovered_line = hovered_line_now;
 
-        if fade_pushed {
-            r.pop_layer();
-        } else {
-            r.pop_clip();
-        }
+        r.pop_clip();
         r.set_lyrics_subpixel_text_mode(false);
     }
 
@@ -1592,16 +1806,20 @@ impl LyricsViewState {
     fn bake_active_line_glyph_emission(
         r: &mut D2DRenderer,
         layout: &windows::Win32::Graphics::DirectWrite::IDWriteTextLayout,
-        font_sz: f32,
+        _font_sz: f32,
         char_units: &[LyricCharUnit],
         unit_cells: &[Vec<DisjointUnitCell>],
+        sub_glyphs: &[Vec<SubGlyphCell>],
         lifts: &[Spring1D],
         local_x: f32,
         local_y: f32,
         t_headstart: f64,
+        line_end_sec: f64,
         is_rtl: bool,
         active_w: f32,
         non_emph_fx: NonEmphasisLyricsEffect,
+        auto_emphasis: bool,
+        frontier_wave: bool,
     ) -> (f32, bool) {
         if char_units.is_empty() {
             if non_emph_fx.glow() {
@@ -1623,7 +1841,8 @@ impl LyricsViewState {
             if cu.utf16_len == 0 {
                 continue;
             }
-            let glow_enabled = cu.is_sustained || non_emph_fx.glow();
+            let is_emph = cu.is_emphasized(auto_emphasis);
+            let glow_enabled = is_emph || non_emph_fx.glow();
             if !glow_enabled {
                 continue;
             }
@@ -1632,39 +1851,47 @@ impl LyricsViewState {
                 continue;
             }
 
-            let t_after = (t_headstart - cu.end_sec).max(0.0) as f32;
-            let after_tail = (1.0 - t_after / 0.34).clamp(0.0, 1.0);
-            let after_glow = after_tail * after_tail;
-
-            let scale_enabled = cu.is_sustained || non_emph_fx.scale();
-            let mut char_scale = 1.0f32;
-            let emit_alpha = if prog < 0.996 {
-                let bell = (prog * std::f32::consts::PI).sin().max(0.0);
-                if cu.is_sustained {
-                    let dur_factor = (((cu.word_dur_sec - 0.28) / 1.40).clamp(0.32, 1.0)) as f32;
-                    if scale_enabled {
-                        char_scale =
-                            1.0 + LyricsAnimator::EMPHASIZING_SCALE_DELTA * dur_factor * bell;
-                    }
-                    peak_emphasis = peak_emphasis.max((0.35 + 0.65 * dur_factor) * bell);
-                    (0.58 + 0.42 * dur_factor * bell).clamp(0.0, 1.0)
-                } else {
-                    if scale_enabled {
-                        char_scale = 1.0 + 0.055 * bell;
-                    }
-                    peak_emphasis = peak_emphasis.max(0.28 * bell);
-                    (0.36 + 0.40 * bell).clamp(0.0, 0.85)
-                }
+            let next_boundary_sec = char_units[c_idx + 1..]
+                .iter()
+                .find(|ncu| ncu.utf16_len > 0 && !ncu.ch_str.trim().is_empty())
+                .map(|ncu| ncu.start_sec.max(cu.end_sec))
+                .unwrap_or_else(|| line_end_sec.max(cu.end_sec + 0.55));
+            let has_hold_gap = next_boundary_sec > cu.end_sec + 0.025;
+            let is_holding = has_hold_gap && prog >= 0.996 && t_headstart < next_boundary_sec;
+            let hold_after_end_sec = if is_holding {
+                (t_headstart - cu.end_sec).max(0.0) as f32
+            } else if has_hold_gap {
+                (next_boundary_sec - cu.end_sec).max(0.0) as f32
             } else {
-                let base_tail = if cu.is_sustained { 0.56 } else { 0.28 };
-                let tail_a = (base_tail * after_glow).clamp(0.0, 0.60);
-                peak_emphasis = peak_emphasis.max(tail_a * 0.5);
-                tail_a
+                0.0
+            };
+            let decay_sec = if is_holding {
+                0.0
+            } else if has_hold_gap {
+                (t_headstart - next_boundary_sec).max(0.0) as f32
+            } else {
+                (t_headstart - cu.end_sec).max(0.0) as f32
             };
 
-            if emit_alpha <= 0.015 {
+            let dur_factor = (((cu.word_dur_sec - 0.28) / 1.40).clamp(0.32, 1.0)) as f32;
+            let (body_a, peak_a, _tail_decay) = eval_frontier_glow_profile(
+                prog,
+                hold_after_end_sec,
+                decay_sec,
+                is_holding,
+                is_emph,
+                dur_factor,
+            );
+            if body_a <= 0.01 && peak_a <= 0.015 {
                 continue;
             }
+            peak_emphasis = peak_emphasis.max(
+                peak_a * if is_emph {
+                    0.35 + 0.65 * dur_factor
+                } else {
+                    0.45
+                },
+            );
 
             let Some(cells) = unit_cells.get(c_idx) else {
                 continue;
@@ -1673,56 +1900,94 @@ impl LyricsViewState {
                 continue;
             }
             let lift_y = lifts.get(c_idx).map(|sp| sp.value).unwrap_or(0.0);
+            let scale_enabled = is_emph || non_emph_fx.scale();
+            let max_scale_delta = if is_emph {
+                LyricsAnimator::EMPHASIZING_SCALE_DELTA * dur_factor
+            } else if scale_enabled {
+                0.055
+            } else {
+                0.0
+            };
+            let unit_w: f32 = cells
+                .iter()
+                .map(|c| c.raw_rect.w.max(1.0))
+                .sum::<f32>()
+                .max(1.0);
+            let use_frontier = frontier_wave
+                && should_use_frontier_lift(
+                    is_emph || scale_enabled,
+                    cu.end_sec - cu.start_sec,
+                    unit_w,
+                );
 
-            if (char_scale - 1.0).abs() > 0.001 && cells.len() == 1 {
+            if cells.len() == 1
+                && use_frontier
+                && prog < 0.996
+                && sub_glyphs.get(c_idx).is_some_and(|v| v.len() > 1)
+            {
                 let cell = cells[0];
-                let trimmed = cu.ch_str.trim();
-                if !trimmed.is_empty() {
-                    let g_rel = cell.glyph_rect;
-                    let gx = g_rel.x + local_x;
-                    let gy = g_rel.y + local_y;
-                    let gw = g_rel.w.max(1.0);
-                    let gh = g_rel.h.max(1.0);
-                    if let Some((unit_lay, ux, uy, uw)) = r.get_or_create_lyrics_unit_layout(
-                        trimmed,
-                        font_sz,
-                        (gw + 96.0).max(200.0),
-                    ) {
-                        let draw_x = gx + (gw - uw) * 0.5 - ux;
-                        let draw_y = gy - uy;
-                        let scx = gx + gw * 0.5;
-                        let scy = gy + gh * 0.5 + lift_y;
-                        let char_xform = Matrix3x2 {
-                            M11: char_scale,
-                            M12: 0.0,
-                            M21: 0.0,
-                            M22: char_scale,
-                            M31: scx * (1.0 - char_scale),
-                            M32: scy * (1.0 - char_scale) + lift_y * char_scale,
-                        };
-                        r.set_transform(&char_xform);
-                        let sweep_rc = RectF::new(gx - 2.0, gy - 14.0, gw + 4.0, gh + 28.0);
-                        let feather = (gw * 0.55).clamp(6.0, LyricsAnimator::GRADIENT_FEATHER_PX);
-                        r.draw_text_layout_feathered_sweep(
-                            &unit_lay,
-                            draw_x,
-                            draw_y,
-                            sweep_rc,
-                            prog,
-                            feather,
-                            is_rtl,
-                            Color::rgba(255, 255, 255, emit_alpha * active_w),
-                            Color::rgba(255, 255, 255, 0.0),
-                        );
-                        has_any_glow = true;
-                        continue;
-                    }
+                let gr = RectF::new(
+                    cell.raw_rect.x + local_x,
+                    cell.raw_rect.y + local_y,
+                    cell.raw_rect.w.max(1.0),
+                    cell.raw_rect.h.max(1.0),
+                );
+                let clip_r = RectF::new(
+                    cell.clip_rect.x + local_x,
+                    cell.clip_rect.y + local_y,
+                    cell.clip_rect.w,
+                    cell.clip_rect.h,
+                );
+                let sweep_rc = RectF::new(gr.x, clip_r.y, gr.w, clip_r.h);
+                let feather = (gr.w * 0.55).clamp(8.0, LyricsAnimator::GRADIENT_FEATHER_PX);
+                let sgs = &sub_glyphs[c_idx];
+                for sg in sgs {
+                    let g_lift = lift_y * eval_frontier_lift_weight(sg.local_u, prog, false);
+                    let g_scale = if scale_enabled {
+                        1.0 + eval_frontier_scale_delta(sg.local_u, prog, max_scale_delta, false)
+                    } else {
+                        1.0
+                    };
+                    let scx = sg.glyph_rect.center_x() + local_x;
+                    let scy = sg.glyph_rect.center_y() + local_y + g_lift;
+                    let xf = Matrix3x2 {
+                        M11: g_scale,
+                        M12: 0.0,
+                        M21: 0.0,
+                        M22: g_scale,
+                        M31: scx * (1.0 - g_scale),
+                        M32: scy * (1.0 - g_scale) + g_lift * g_scale,
+                    };
+                    let wl = sg.clip_rect.x + local_x;
+                    let wr = sg.clip_rect.right() + local_x;
+                    let cl = scx + (wl - scx) / g_scale;
+                    let cr = scx + (wr - scx) / g_scale;
+                    let sg_clip = RectF::new(
+                        cl,
+                        sg.clip_rect.y + local_y,
+                        (cr - cl).max(0.25),
+                        sg.clip_rect.h,
+                    );
+                    r.set_transform(&xf);
+                    r.push_clip(sg_clip);
+                    r.draw_text_layout_frontier_glow_sweep(
+                        layout,
+                        local_x,
+                        local_y,
+                        sweep_rc,
+                        prog,
+                        feather,
+                        is_rtl,
+                        body_a * active_w,
+                        peak_a * active_w,
+                    );
+                    r.pop_clip();
+                    has_any_glow = true;
                 }
+                continue;
             }
 
-            let sum_w: f32 = cells.iter().map(|c| c.raw_rect.w.max(1.0)).sum::<f32>().max(1.0);
             let mut acc_w = 0.0f32;
-
             for cell in cells {
                 let gr = RectF::new(
                     cell.raw_rect.x + local_x,
@@ -1740,25 +2005,40 @@ impl LyricsViewState {
                 let sub_prog = if prog >= 0.996 {
                     1.0
                 } else {
-                    ((prog * sum_w - acc_w) / seg_w).clamp(0.0, 1.0)
+                    ((prog * unit_w - acc_w) / seg_w).clamp(0.0, 1.0)
                 };
                 acc_w += seg_w;
                 if sub_prog <= 0.002 {
                     continue;
                 }
 
+                let c_scale = if scale_enabled && prog < 0.996 && cells.len() == 1 {
+                    1.0 + eval_frontier_scale_delta(0.5, sub_prog, max_scale_delta * 0.85, is_rtl)
+                } else {
+                    1.0
+                };
+                let (c_lift, c_shear) = if use_frontier && prog < 0.996 && cells.len() == 1 {
+                    eval_frontier_wave_shear(lift_y, gr.w, sub_prog, is_rtl)
+                } else {
+                    (lift_y, 0.0)
+                };
+                let scx = gr.center_x();
+                let scy = gr.center_y();
                 r.set_transform(&Matrix3x2 {
-                    M11: 1.0,
-                    M12: 0.0,
+                    M11: c_scale,
+                    M12: c_shear,
                     M21: 0.0,
-                    M22: 1.0,
-                    M31: 0.0,
-                    M32: lift_y,
+                    M22: c_scale,
+                    M31: scx * (1.0 - c_scale),
+                    M32: scy * (1.0 - c_scale) + c_lift - scx * c_shear,
                 });
-                r.push_clip(clip_r);
+                let cl = scx + (clip_r.x - scx) / c_scale;
+                let cr = scx + (clip_r.right() - scx) / c_scale;
+                let adj_clip = RectF::new(cl, clip_r.y - 8.0, (cr - cl).max(0.25), clip_r.h + 16.0);
+                r.push_clip(adj_clip);
                 let sweep_rc = RectF::new(gr.x, clip_r.y, gr.w, clip_r.h);
-                let feather = (gr.w * 0.55).clamp(6.0, LyricsAnimator::GRADIENT_FEATHER_PX);
-                r.draw_text_layout_feathered_sweep(
+                let feather = (gr.w * 0.55).clamp(8.0, LyricsAnimator::GRADIENT_FEATHER_PX);
+                r.draw_text_layout_frontier_glow_sweep(
                     layout,
                     local_x,
                     local_y,
@@ -1766,8 +2046,8 @@ impl LyricsViewState {
                     sub_prog,
                     feather,
                     is_rtl,
-                    Color::rgba(255, 255, 255, emit_alpha * active_w),
-                    Color::rgba(255, 255, 255, 0.0),
+                    body_a * active_w,
+                    peak_a * active_w,
                 );
                 r.pop_clip();
                 has_any_glow = true;
@@ -1781,9 +2061,10 @@ impl LyricsViewState {
     fn draw_char_sequence(
         r: &mut D2DRenderer,
         layout: &windows::Win32::Graphics::DirectWrite::IDWriteTextLayout,
-        font_sz: f32,
+        _font_sz: f32,
         char_units: &[LyricCharUnit],
         unit_cells: &[Vec<DisjointUnitCell>],
+        unit_sub_glyphs: &[Vec<SubGlyphCell>],
         lifts: &[Spring1D],
         origin_x: f32,
         origin_y: f32,
@@ -1795,6 +2076,8 @@ impl LyricsViewState {
         reduce_motion: bool,
         allow_emphasis: bool,
         non_emph_fx: NonEmphasisLyricsEffect,
+        auto_emphasis: bool,
+        frontier_wave: bool,
         sung_col: Color,
         up_col: Color,
     ) {
@@ -1838,22 +2121,9 @@ impl LyricsViewState {
 
             let prog = cu.sweep_progress(t_headstart);
 
-            let scale_enabled = allow_emphasis && !reduce_motion && (cu.is_sustained || non_emph_fx.scale());
-            let mut char_scale = 1.0f32;
-            if scale_enabled && prog > 0.004 && prog < 0.996 {
-                let bell = (prog * std::f32::consts::PI).sin().max(0.0);
-                if cu.is_sustained {
-                    let dur_factor = (((cu.word_dur_sec - 0.28) / 1.40).clamp(0.32, 1.0)) as f32;
-                    char_scale =
-                        1.0 + LyricsAnimator::EMPHASIZING_SCALE_DELTA * dur_factor * bell;
-                } else {
-                    char_scale = 1.0 + 0.055 * bell;
-                }
-            }
-
             // Fast batch path for unscaled completely unsung/sung units using strictly disjoint clip cells
-            if (prog <= 0.001 || prog >= 0.999) && (char_scale - 1.0).abs() < 0.0005 {
-                let is_sung = prog >= 0.999;
+            if prog <= 0.002 || prog >= 0.996 {
+                let is_sung = prog >= 0.996;
                 for cell in cells {
                     let p_clip = RectF::new(
                         cell.clip_rect.x + origin_x,
@@ -1882,58 +2152,142 @@ impl LyricsViewState {
 
             flush_run(r, &mut solid_run);
 
-            // Scaled emphasized / animated unit -> render from an isolated cached single-unit IDWriteTextLayout
-            // so expanded strokes never clip on neighbor bounds and neighbor glyphs never bleed!
-            if (char_scale - 1.0).abs() > 0.001 && cells.len() == 1 {
+            let is_emph = cu.is_emphasized(auto_emphasis);
+            let scale_enabled = allow_emphasis && !reduce_motion && (is_emph || non_emph_fx.scale());
+            let dur_factor = (((cu.word_dur_sec - 0.28) / 1.40).clamp(0.32, 1.0)) as f32;
+            let max_scale_delta = if !scale_enabled {
+                0.0
+            } else if is_emph {
+                LyricsAnimator::EMPHASIZING_SCALE_DELTA * dur_factor
+            } else {
+                0.055
+            };
+            let sum_w: f32 = cells
+                .iter()
+                .map(|c| c.raw_rect.w.max(1.0))
+                .sum::<f32>()
+                .max(1.0);
+            let use_frontier = frontier_wave
+                && !reduce_motion
+                && should_use_frontier_lift(
+                    is_emph || scale_enabled,
+                    cu.end_sec - cu.start_sec,
+                    sum_w,
+                );
+
+            if use_frontier && cells.len() == 1 {
                 let cell = cells[0];
-                let trimmed = cu.ch_str.trim();
-                if !trimmed.is_empty() {
-                    let g_rel = cell.glyph_rect;
-                    let gx = g_rel.x + origin_x;
-                    let gy = g_rel.y + origin_y;
-                    let gw = g_rel.w.max(1.0);
-                    let gh = g_rel.h.max(1.0);
-                    if let Some((unit_lay, ux, uy, uw)) = r.get_or_create_lyrics_unit_layout(
-                        trimmed,
-                        font_sz,
-                        (gw + 96.0).max(200.0),
-                    ) {
-                        let draw_x = gx + (gw - uw) * 0.5 - ux;
-                        let draw_y = gy - uy;
-                        let scx = gx + gw * 0.5;
-                        let scy = gy + gh * 0.5 + lift_y;
-                        let char_xform = Matrix3x2 {
-                            M11: combined_scale * char_scale,
+                let gr = RectF::new(
+                    cell.raw_rect.x + origin_x,
+                    cell.raw_rect.y + origin_y,
+                    cell.raw_rect.w.max(1.0),
+                    cell.raw_rect.h.max(1.0),
+                );
+                let clip_r = RectF::new(
+                    cell.clip_rect.x + origin_x,
+                    cell.clip_rect.y + origin_y,
+                    cell.clip_rect.w,
+                    cell.clip_rect.h,
+                );
+                let word_sweep_rc = RectF::new(gr.x, clip_r.y, gr.w, clip_r.h);
+                let feather = (gr.w * 0.55).clamp(5.0, LyricsAnimator::GRADIENT_FEATHER_PX);
+
+                if let Some(sgs) = unit_sub_glyphs.get(c_idx).filter(|v| v.len() > 1) {
+                    // Multi-character English/Latin word: per-glyph whole-letter frontier lift & scale!
+                    for sg in sgs {
+                        let g_lift = lift_y * eval_frontier_lift_weight(sg.local_u, prog, false);
+                        let g_scale = if scale_enabled {
+                            1.0 + eval_frontier_scale_delta(sg.local_u, prog, max_scale_delta, false)
+                        } else {
+                            1.0
+                        };
+                        let scx = sg.glyph_rect.center_x() + origin_x;
+                        let scy = sg.glyph_rect.center_y() + origin_y;
+                        let xf = Matrix3x2 {
+                            M11: combined_scale * g_scale,
                             M12: 0.0,
                             M21: 0.0,
-                            M22: combined_scale * char_scale,
+                            M22: combined_scale * g_scale,
                             M31: pivot_x * (1.0 - combined_scale)
-                                + scx * (1.0 - char_scale) * combined_scale,
+                                + scx * (1.0 - g_scale) * combined_scale,
                             M32: pivot_y * (1.0 - combined_scale)
-                                + (scy * (1.0 - char_scale) + lift_y * char_scale) * combined_scale,
+                                + (scy * (1.0 - g_scale) + g_lift) * combined_scale,
                         };
-                        r.set_transform(&char_xform);
-                        let sweep_rc = RectF::new(gx - 2.0, gy - 14.0, gw + 4.0, gh + 28.0);
-                        let feather = (gw * 0.55).clamp(5.0, LyricsAnimator::GRADIENT_FEATHER_PX);
+                        let wl = sg.clip_rect.x + origin_x;
+                        let wr = sg.clip_rect.right() + origin_x;
+                        let cl = scx + (wl - scx) / g_scale;
+                        let cr = scx + (wr - scx) / g_scale;
+                        let sg_clip = RectF::new(
+                            cl,
+                            sg.clip_rect.y + origin_y - 6.0,
+                            (cr - cl).max(0.25),
+                            sg.clip_rect.h + 12.0,
+                        );
+                        r.set_transform(&xf);
+                        r.push_clip(sg_clip);
                         r.draw_text_layout_feathered_sweep(
-                            &unit_lay,
-                            draw_x,
-                            draw_y,
-                            sweep_rc,
-                            prog.clamp(0.0, 1.0),
+                            layout,
+                            origin_x,
+                            origin_y,
+                            word_sweep_rc,
+                            prog,
                             feather,
                             is_rtl,
                             sung_col,
                             up_col,
                         );
-                        continue;
+                        r.pop_clip();
                     }
+                    continue;
                 }
+
+                // Single-character / CJK sustained or slow unit: continuous zero-tear affine elastic shear!
+                // Never slices a Chinese character into disjoint vertical strips — strokes stay 100% unbroken!
+                let (c_lift, c_shear) = eval_frontier_wave_shear(lift_y, gr.w, prog, is_rtl);
+                let s_scale = if scale_enabled {
+                    1.0 + eval_frontier_scale_delta(0.5, prog, max_scale_delta, is_rtl)
+                } else {
+                    1.0
+                };
+                let scx = gr.center_x();
+                let scy = gr.center_y();
+                let xf = Matrix3x2 {
+                    M11: combined_scale * s_scale,
+                    M12: combined_scale * c_shear,
+                    M21: 0.0,
+                    M22: combined_scale * s_scale,
+                    M31: pivot_x * (1.0 - combined_scale)
+                        + scx * (1.0 - s_scale) * combined_scale,
+                    M32: pivot_y * (1.0 - combined_scale)
+                        + (scy * (1.0 - s_scale) + c_lift - scx * c_shear) * combined_scale,
+                };
+                let cl = scx + (clip_r.x - scx) / s_scale;
+                let cr = scx + (clip_r.right() - scx) / s_scale;
+                let glyph_clip = RectF::new(
+                    cl,
+                    clip_r.y - 8.0,
+                    (cr - cl).max(0.25),
+                    clip_r.h + 16.0,
+                );
+                r.set_transform(&xf);
+                r.push_clip(glyph_clip);
+                r.draw_text_layout_feathered_sweep(
+                    layout,
+                    origin_x,
+                    origin_y,
+                    word_sweep_rc,
+                    prog,
+                    feather,
+                    is_rtl,
+                    sung_col,
+                    up_col,
+                );
+                r.pop_clip();
+                continue;
             }
 
-            let sum_w: f32 = cells.iter().map(|c| c.raw_rect.w.max(1.0)).sum::<f32>().max(1.0);
+            // Whole-unit path (fast non-emphasized words, wrapped multi-cell lines, or when frontier_wave is disabled)
             let mut acc_w = 0.0f32;
-
             for cell in cells {
                 let gr = RectF::new(
                     cell.raw_rect.x + origin_x,
@@ -1957,15 +2311,27 @@ impl LyricsViewState {
                 };
                 acc_w += seg_w;
 
+                let unit_scale = if scale_enabled && cells.len() == 1 {
+                    1.0 + eval_frontier_scale_delta(0.5, sub_prog, max_scale_delta * 0.85, is_rtl)
+                } else {
+                    1.0
+                };
+                let scx = gr.center_x();
+                let scy = gr.center_y();
                 r.set_transform(&Matrix3x2 {
-                    M11: combined_scale,
+                    M11: combined_scale * unit_scale,
                     M12: 0.0,
                     M21: 0.0,
-                    M22: combined_scale,
-                    M31: pivot_x * (1.0 - combined_scale),
-                    M32: pivot_y * (1.0 - combined_scale) + lift_y * combined_scale,
+                    M22: combined_scale * unit_scale,
+                    M31: pivot_x * (1.0 - combined_scale)
+                        + scx * (1.0 - unit_scale) * combined_scale,
+                    M32: pivot_y * (1.0 - combined_scale)
+                        + (scy * (1.0 - unit_scale) + lift_y) * combined_scale,
                 });
-                r.push_clip(clip_r);
+                let cl = scx + (clip_r.x - scx) / unit_scale;
+                let cr = scx + (clip_r.right() - scx) / unit_scale;
+                let adj_clip = RectF::new(cl, clip_r.y - 4.0, (cr - cl).max(0.25), clip_r.h + 8.0);
+                r.push_clip(adj_clip);
                 let sweep_rc = RectF::new(gr.x, clip_r.y, gr.w, clip_r.h);
                 let feather = (gr.w * 0.55).clamp(5.0, LyricsAnimator::GRADIENT_FEATHER_PX);
                 r.draw_text_layout_feathered_sweep(

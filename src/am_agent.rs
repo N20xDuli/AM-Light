@@ -361,10 +361,14 @@ struct SharedSnapshot {
     optimistic_seek_target: Option<(f64, Instant)>,
     artwork_url: Option<String>,
     audio_quality: Option<String>,
+    live_agent_sample_rate: Option<u32>,
+    live_agent_bit_depth: Option<u16>,
+    live_agent_format: Option<String>,
     volume: f64,
     prefs: AudioPrefs,
     stream_specs: Option<crate::audio_viz::StreamAudioSpecs>,
     track_cache: HashMap<String, CachedTrackMeta>,
+    track_traits_cache: HashMap<String, Vec<String>>,
     hls_cache: HashMap<String, String>,
     agent_lyrics_cache: HashMap<String, (String, bool)>,
     queue_tracks: Vec<AgentTrackInput>,
@@ -406,10 +410,14 @@ impl Default for SharedSnapshot {
             optimistic_seek_target: None,
             artwork_url: None,
             audio_quality: None,
+            live_agent_sample_rate: None,
+            live_agent_bit_depth: None,
+            live_agent_format: None,
             volume: 0.75,
             prefs: AudioPrefs::default(),
             stream_specs: None,
             track_cache: HashMap::new(),
+            track_traits_cache: HashMap::new(),
             hls_cache: HashMap::new(),
             agent_lyrics_cache: HashMap::new(),
             queue_tracks: Vec::new(),
@@ -425,8 +433,14 @@ fn format_specs_badge(sp: &crate::audio_viz::StreamAudioSpecs) -> String {
         format!("{:.1}kHz", khz)
     };
     if sp.codec.eq_ignore_ascii_case("ALAC") {
-        let bd = sp.bit_depth.unwrap_or(16);
-        format!("ALAC {bd}-bit/{sr_str} • {} kbps", sp.bitrate_kbps)
+        let bd = sp.bit_depth.unwrap_or(24);
+        if sp.hires_catalog_trait && sp.sample_rate_hz <= 48_000 {
+            format!("Hi-Res ALAC {bd}-bit/最高192kHz")
+        } else if sp.available_variants.is_empty() {
+            format!("ALAC {bd}-bit / {sr_str}")
+        } else {
+            format!("ALAC {bd}-bit/{sr_str} • {} kbps", sp.bitrate_kbps)
+        }
     } else if sp.tier_label.contains("全景声") {
         format!("Dolby Atmos • {} kbps", sp.bitrate_kbps)
     } else {
@@ -462,22 +476,36 @@ impl SharedSnapshot {
     }
 
     fn recompute_current_stream_specs(&mut self) {
-        let Some(ref aid) = self.adam_id else {
-            self.stream_specs = None;
-            return;
-        };
-        if let Some(m3u8) = self.hls_cache.get(aid) {
-            let spatial_ready = crate::audio_viz::is_default_endpoint_spatial_ready();
-            self.stream_specs = crate::audio_viz::parse_enhanced_hls_variants_with_endpoint(
-                m3u8,
-                self.prefs.lossless_enabled,
-                self.prefs.streaming_audio_quality,
-                self.prefs.dolby_atmos_setting,
-                spatial_ready,
-            );
-        } else {
-            self.stream_specs = None;
-        }
+        let aid_opt = self.adam_id.as_deref();
+        let base_specs = aid_opt
+            .and_then(|aid| self.hls_cache.get(aid))
+            .and_then(|m3u8| {
+                let spatial_ready = crate::audio_viz::is_default_endpoint_spatial_ready();
+                crate::audio_viz::parse_enhanced_hls_variants_with_endpoint(
+                    m3u8,
+                    self.prefs.lossless_enabled,
+                    self.prefs.streaming_audio_quality,
+                    self.prefs.dolby_atmos_setting,
+                    spatial_ready,
+                )
+            });
+        let has_hires_trait = aid_opt
+            .and_then(|aid| self.track_traits_cache.get(aid))
+            .is_some_and(|tr| tr.iter().any(|t| t == "hi-res-lossless"))
+            || self
+                .audio_quality
+                .as_deref()
+                .is_some_and(|q| q.contains("Hi-Res"));
+        self.stream_specs = crate::audio_viz::enrich_stream_specs_with_live_and_traits(
+            base_specs,
+            self.live_agent_sample_rate,
+            self.live_agent_bit_depth,
+            self.live_agent_format.as_deref(),
+            has_hires_trait,
+            self.prefs.lossless_enabled,
+            self.prefs.streaming_audio_quality,
+            self.prefs.dolby_atmos_setting,
+        );
     }
 
     fn to_smtc_state(&self) -> SmtcState {
@@ -1054,6 +1082,9 @@ mod win {
                         snap.duration_sec = dur_opt.filter(|&d| d > 0.0).unwrap_or(0.0);
                         snap.artwork_url = None;
                         snap.audio_quality = None;
+                        snap.live_agent_sample_rate = None;
+                        snap.live_agent_bit_depth = None;
+                        snap.live_agent_format = None;
                         if cur_time_opt.is_none_or(|t| t <= 0.02) {
                             snap.anchor_pos_sec = cur_time_opt.unwrap_or(0.0).max(0.0);
                             snap.anchor_instant = None;
@@ -1346,6 +1377,13 @@ mod win {
 
             if let Some(sr) = sr_opt {
                 if sr > 0 {
+                    snap.live_agent_sample_rate = Some(sr as u32);
+                    if let Some(bd) = bd_opt.filter(|&b| b >= 16 && b <= 32) {
+                        snap.live_agent_bit_depth = Some(bd as u16);
+                    }
+                    if let Some(fmt) = fmt_opt {
+                        snap.live_agent_format = Some(fmt.to_string());
+                    }
                     let khz = (sr as f64) / 1000.0;
                     let sr_text = if (khz.fract()).abs() < 0.01 {
                         format!("{:.0}kHz", khz)
@@ -1359,6 +1397,7 @@ mod win {
                         let bd = bd_opt.unwrap_or(24);
                         format!("ALAC {bd}-bit / {sr_text}")
                     });
+                    snap.recompute_current_stream_specs();
                     changed = true;
                 }
             }
@@ -2492,6 +2531,9 @@ mod win {
                         snap.duration_sec = if dur > 0.0 { dur } else { 0.0 };
                         snap.artwork_url = None;
                         snap.audio_quality = None;
+                        snap.live_agent_sample_rate = None;
+                        snap.live_agent_bit_depth = None;
+                        snap.live_agent_format = None;
                         snap.resolved_epoch = snap
                             .cmd_epoch
                             .max(PLAY_CMD_EPOCH.load(Ordering::Acquire))
@@ -2776,6 +2818,10 @@ mod win {
                                 for t in &tracks {
                                     let aid = t.effective_adam_id();
                                     if !aid.is_empty() {
+                                        if !t.audio_traits.is_empty() {
+                                            snap.track_traits_cache
+                                                .insert(aid.clone(), t.audio_traits.clone());
+                                        }
                                         snap.track_cache.insert(
                                             aid,
                                             CachedTrackMeta {
@@ -2822,6 +2868,9 @@ mod win {
                                 snap.duration_sec = chosen.duration_sec;
                                 snap.artwork_url = chosen.artwork_url.clone();
                                 snap.audio_quality = format_audio_traits_badge(&chosen.audio_traits);
+                                snap.live_agent_sample_rate = None;
+                                snap.live_agent_bit_depth = None;
+                                snap.live_agent_format = None;
                                 snap.anchor_pos_sec = 0.0;
                                 snap.anchor_instant = None;
                                 snap.track_started_at = Some(Instant::now());
@@ -3934,6 +3983,18 @@ pub fn set_track_hls_manifest(adam_id: &str, m3u8_text: String) {
     }
 }
 
+pub fn set_track_audio_traits(adam_id: &str, traits: Vec<String>) {
+    if adam_id.is_empty() || traits.is_empty() {
+        return;
+    }
+    if let Ok(mut snap) = SHARED.write() {
+        snap.track_traits_cache.insert(adam_id.to_string(), traits);
+        if snap.adam_id.as_deref() == Some(adam_id) {
+            snap.recompute_current_stream_specs();
+        }
+    }
+}
+
 pub fn has_cached_hls_manifest(adam_id: &str) -> bool {
     SHARED
         .read()
@@ -4070,6 +4131,151 @@ pub async fn play_container_by_api(
             arr.iter()
                 .filter_map(|t| parse_track_from_am_json(t, None, None))
                 .collect()
+        }
+        "stations" | "station" | "radioStation" | "radio-stations" => {
+            let clean_id = id.trim().to_string();
+            if clean_id.is_empty() {
+                return Err("电台 ID 不能为空".to_string());
+            }
+            // Play Apple Music stations natively through AMPLibraryAgent without ever launching
+            // the official Apple Music desktop GUI (`musics://`).
+            let mut station_tracks: Vec<AgentTrackInput> = Vec::new();
+            if let Ok(next_json) = crate::am_api::fetch_station_next_tracks(
+                &clean_id,
+                user_token.clone(),
+                Some(sf.clone()),
+                15,
+            )
+            .await
+            {
+                if let Some(arr) = next_json.get("data").and_then(Value::as_array) {
+                    station_tracks = arr
+                        .iter()
+                        .filter_map(|t| parse_track_from_am_json(t, None, None))
+                        .collect();
+                }
+            }
+
+            if station_tracks.is_empty() {
+                // Fallback for catalog/live stations: inspect station metadata & related playable episodes/songs
+                let st_path = format!(
+                    "v1/catalog/{sf}/stations/{clean_id}?include=next-tracks&extend=audioTraits&l=zh-Hans-CN"
+                );
+                if let Ok(st_json) =
+                    crate::am_api::fetch_am_api(st_path, user_token.clone(), None, Some(sf.clone()))
+                        .await
+                {
+                    let root = st_json.pointer("/data/0");
+                    let st_name = root
+                        .and_then(|r| r.pointer("/attributes/name"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    let st_art = root
+                        .and_then(|r| r.pointer("/attributes/artwork/url"))
+                        .and_then(Value::as_str)
+                        .map(|u| format_artwork_template(u, 600));
+                    let is_live = root
+                        .and_then(|r| r.pointer("/attributes/isLive"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+
+                    if let Some(arr) = root
+                        .and_then(|r| r.pointer("/relationships/next-tracks/data"))
+                        .and_then(Value::as_array)
+                    {
+                        station_tracks = arr
+                            .iter()
+                            .filter_map(|t| {
+                                parse_track_from_am_json(t, Some(&st_name), st_art.as_deref())
+                            })
+                            .collect();
+                    }
+
+                    // For live broadcast radio (e.g. Apple Music 1 / Hits / Country), pull its
+                    // official curated playlist tracks natively so it still plays inside AM Light!
+                    if station_tracks.is_empty() && !st_name.is_empty() {
+                        let enc: String =
+                            url::form_urlencoded::byte_serialize(st_name.as_bytes()).collect();
+                        let search_p = format!(
+                            "v1/catalog/{sf}/search?term={enc}&types=playlists,songs&limit=6&l=zh-Hans-CN"
+                        );
+                        if let Ok(sj) = crate::am_api::fetch_am_api(
+                            search_p,
+                            user_token.clone(),
+                            None,
+                            Some(sf.clone()),
+                        )
+                        .await
+                        {
+                            if let Some(pl_id) = sj
+                                .pointer("/results/playlists/data/0/id")
+                                .and_then(Value::as_str)
+                            {
+                                let pl_p = format!(
+                                    "v1/catalog/{sf}/playlists/{pl_id}?include=tracks&extend=audioTraits&l=zh-Hans-CN"
+                                );
+                                if let Ok(pj) = crate::am_api::fetch_am_api(
+                                    pl_p,
+                                    user_token.clone(),
+                                    None,
+                                    Some(sf.clone()),
+                                )
+                                .await
+                                {
+                                    if let Some(arr) = pj
+                                        .pointer("/data/0/relationships/tracks/data")
+                                        .and_then(Value::as_array)
+                                    {
+                                        station_tracks = arr
+                                            .iter()
+                                            .filter_map(|t| {
+                                                parse_track_from_am_json(
+                                                    t,
+                                                    Some(&st_name),
+                                                    st_art.as_deref(),
+                                                )
+                                            })
+                                            .collect();
+                                    }
+                                }
+                            }
+                            if station_tracks.is_empty() {
+                                if let Some(arr) = sj
+                                    .pointer("/results/songs/data")
+                                    .and_then(Value::as_array)
+                                {
+                                    station_tracks = arr
+                                        .iter()
+                                        .filter_map(|t| {
+                                            parse_track_from_am_json(
+                                                t,
+                                                Some(&st_name),
+                                                st_art.as_deref(),
+                                            )
+                                        })
+                                        .collect();
+                                }
+                            }
+                        }
+                    }
+
+                    if station_tracks.is_empty() && is_live {
+                        return Err(format!(
+                            "「{st_name}」为实时直播电台流，当前未获取到可点播节目曲目（已保持内置播放，不唤起原版客户端）"
+                        ));
+                    }
+                }
+            }
+
+            if station_tracks.is_empty() {
+                if user_token.as_deref().is_none_or(|t| t.trim().is_empty()) {
+                    return Err("播放个人或推荐电台需在设置中配置 Media-User-Token（已保持内置模式，不唤起原版客户端）".to_string());
+                }
+                return Err("该电台暂未返回可播放曲目，请稍后重试".to_string());
+            }
+            station_tracks
         }
         other => return Err(format!("不支持的播放容器类型: {other}")),
     };

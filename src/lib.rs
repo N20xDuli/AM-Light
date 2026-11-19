@@ -6,6 +6,7 @@ pub mod bplist;
 pub mod downloads;
 pub mod drm_fix;
 pub mod lyrics;
+pub mod motion_art;
 pub mod smtc;
 pub mod theme;
 
@@ -58,8 +59,9 @@ mod win_app {
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetCursorPos,
         GetForegroundWindow, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, IsIconic,
-        IsZoomed, KillTimer, LoadCursorW, LoadIconW, MINMAXINFO, MSG, NCCALCSIZE_PARAMS,
-        PeekMessageW, PostQuitMessage, RegisterClassExW, SetCursor, SetTimer, SetWindowLongPtrW,
+        IsZoomed, KillTimer, LoadCursorW, LoadIconW, MsgWaitForMultipleObjectsEx, MINMAXINFO, MSG,
+        MWMO_INPUTAVAILABLE, NCCALCSIZE_PARAMS, PeekMessageW, PostQuitMessage, QS_INPUT,
+        RegisterClassExW, SetCursor, SetTimer, SetWindowLongPtrW,
         SetWindowPos, ShowWindow, TranslateMessage, GWL_EXSTYLE, HTBOTTOM, HTBOTTOMLEFT,
         HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT,
         IDC_ARROW, IDC_HAND, PM_REMOVE, SM_CXSCREEN, SM_CYSCREEN, SWP_FRAMECHANGED,
@@ -152,14 +154,19 @@ mod win_app {
         }
         let maximized = IsZoomed(hwnd).as_bool();
         let scale = dpi_scale_for_hwnd(hwnd);
+        let prev_max = ctx.ui.is_window_maximized;
+        let max_changed = maximized != prev_max;
         let changed = w_px != ctx.renderer.width_px
             || h_px != ctx.renderer.height_px
             || (scale - ctx.renderer.dpi_scale).abs() > 0.005
-            || maximized != ctx.ui.is_window_maximized;
+            || max_changed;
         if changed {
             ctx.ui.is_window_maximized = maximized;
+            if max_changed {
+                ctx.ui.on_window_maximize_toggled(maximized);
+            }
             ctx.renderer.resize(w_px, h_px, scale);
-            ctx.ui.lyrics_view.invalidate_layout_cache();
+            ctx.ui.lyrics_view.on_viewport_changed();
             ctx.dirty = true;
         }
         changed
@@ -472,10 +479,30 @@ mod win_app {
             }
 
             WM_DISPLAYCHANGE => {
+                if IsZoomed(hwnd).as_bool() {
+                    let hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                    let mut mi = MONITORINFO {
+                        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                        ..Default::default()
+                    };
+                    if GetMonitorInfoW(hmon, &mut mi).as_bool() {
+                        let _ = SetWindowPos(
+                            hwnd,
+                            None,
+                            mi.rcWork.left,
+                            mi.rcWork.top,
+                            mi.rcWork.right - mi.rcWork.left,
+                            mi.rcWork.bottom - mi.rcWork.top,
+                            SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                        );
+                    }
+                }
                 WIN_CTX.with(|cell| {
                     if let Ok(mut borrow) = cell.try_borrow_mut() {
                         if let Some(ctx) = borrow.as_mut() {
                             ctx.force_mon_refresh = true;
+                            let _ = sync_window_geometry_if_needed(hwnd, ctx);
+                            ctx.ui.lyrics_view.on_viewport_changed();
                             ctx.dirty = true;
                         }
                     }
@@ -485,9 +512,14 @@ mod win_app {
             }
 
             WM_ACTIVATE => {
+                let deactivated = (wparam.0 & 0xFFFF) == 0;
                 WIN_CTX.with(|cell| {
                     if let Ok(mut borrow) = cell.try_borrow_mut() {
                         if let Some(ctx) = borrow.as_mut() {
+                            if deactivated && ctx.ui.settings.aggressive_memory_release {
+                                ctx.renderer
+                                    .perform_aggressive_memory_trim(ctx.ui.show_lyrics_overlay);
+                            }
                             ctx.dirty = true;
                         }
                     }
@@ -496,22 +528,42 @@ mod win_app {
             }
 
             WM_DPICHANGED => {
-                let suggested = &*(lparam.0 as *const RECT);
-                let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
-                    hwnd,
-                    None,
-                    suggested.left,
-                    suggested.top,
-                    suggested.right - suggested.left,
-                    suggested.bottom - suggested.top,
-                    windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
-                        | windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
-                );
+                if IsZoomed(hwnd).as_bool() {
+                    let hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                    let mut mi = MONITORINFO {
+                        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                        ..Default::default()
+                    };
+                    if GetMonitorInfoW(hmon, &mut mi).as_bool() {
+                        let _ = SetWindowPos(
+                            hwnd,
+                            None,
+                            mi.rcWork.left,
+                            mi.rcWork.top,
+                            mi.rcWork.right - mi.rcWork.left,
+                            mi.rcWork.bottom - mi.rcWork.top,
+                            SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                        );
+                    }
+                } else {
+                    let suggested = &*(lparam.0 as *const RECT);
+                    let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
+                        hwnd,
+                        None,
+                        suggested.left,
+                        suggested.top,
+                        suggested.right - suggested.left,
+                        suggested.bottom - suggested.top,
+                        windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
+                            | windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
+                    );
+                }
                 WIN_CTX.with(|cell| {
                     if let Ok(mut borrow) = cell.try_borrow_mut() {
                         if let Some(ctx) = borrow.as_mut() {
                             ctx.force_mon_refresh = true;
                             let _ = sync_window_geometry_if_needed(hwnd, ctx);
+                            ctx.ui.lyrics_view.on_viewport_changed();
                             ctx.dirty = true;
                         }
                     }
@@ -668,7 +720,20 @@ mod win_app {
                                 } else if ctx.ui.search_focused {
                                     ctx.ui.search_focused = false;
                                     handled = true;
+                                } else if ctx.ui.route == PageRoute::LibAlbums
+                                    && ctx.ui.albums_cover_flow
+                                {
+                                    ctx.ui.albums_cover_flow = false;
+                                    handled = true;
                                 }
+                            } else if !ctx.ui.search_focused
+                                && !ctx.ui.show_lyrics_overlay
+                                && ctx.ui.route == PageRoute::LibAlbums
+                                && ctx.ui.albums_cover_flow
+                                && (vk == 0x25 || vk == 0x27 || vk == 0x0D)
+                            {
+                                // Left (0x25), Right (0x27), Enter (0x0D) navigation in Cover Flow Easter Egg!
+                                handled = ctx.ui.on_cover_flow_key(vk);
                             } else if ctrl && vk == b'F' as u16 {
                                 ctx.ui.execute_action(UiAction::FocusSearch);
                                 handled = true;
@@ -1090,7 +1155,18 @@ mod win_app {
                         if let Some(th) = hr_timer {
                             let due_100ns = -((wait_ns / 100) as i64);
                             if SetWaitableTimer(th, &due_100ns, 0, None, None, false).is_ok() {
-                                let _ = WaitForSingleObject(th, 40);
+                                if resolved_hz <= 35 {
+                                    // Wake immediately (<0.1ms) on mouse/wheel/key input during calm 30Hz playback!
+                                    let handles = [th];
+                                    let _ = MsgWaitForMultipleObjectsEx(
+                                        Some(&handles),
+                                        40,
+                                        QS_INPUT,
+                                        MWMO_INPUTAVAILABLE,
+                                    );
+                                } else {
+                                    let _ = WaitForSingleObject(th, 40);
+                                }
                             }
                         } else {
                             std::thread::sleep(std::time::Duration::from_nanos(wait_ns));
@@ -1132,6 +1208,7 @@ mod win_app {
                     WIN_CTX.with(|cell| {
                         if let Some(ctx) = cell.borrow_mut().as_mut() {
                             if is_minimized {
+                                ctx.ui.pause_motion_art_for_minimize();
                                 ctx.ui.lyrics_view.release_gpu_caches(&mut ctx.renderer);
                                 ctx.renderer.release_row_fx_surfaces();
                                 ctx.renderer.trim_gpu_staging_if_dirty();

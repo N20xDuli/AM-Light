@@ -15,8 +15,11 @@ pub struct LyricSyllable {
     pub utf16_start: u32,
     /// UTF-16 code unit length
     pub utf16_len: u32,
-    /// True if this syllable is a sustained/emphasized vocal note
+    /// True if this syllable is a sustained/emphasized vocal note (auto or explicit)
     pub is_sustained: bool,
+    /// True ONLY when TTML/source explicitly marked emphasis (italic/bold/emphasis)
+    #[serde(default)]
+    pub is_explicit_emphasis: bool,
 }
 
 /// Piecewise syllable timing keyframe within a merged multi-syllable `LyricCharUnit`
@@ -71,10 +74,152 @@ pub struct LyricCharUnit {
     pub utf16_len: u32,
     pub is_sustained: bool,
     #[serde(default)]
+    pub is_explicit_emphasis: bool,
+    #[serde(default)]
     pub sub_spans: Vec<LyricSubSpan>,
 }
 
+pub const SLOW_NON_EMPH_MIN_DUR_SEC: f64 = 0.55;
+pub const SLOW_NON_EMPH_MAX_SPEED_DIP_PER_SEC: f32 = 160.0;
+
+#[inline]
+pub fn should_use_frontier_lift(is_emphasized: bool, dur_sec: f64, unit_width_dip: f32) -> bool {
+    if is_emphasized {
+        return true;
+    }
+    if dur_sec < SLOW_NON_EMPH_MIN_DUR_SEC {
+        return false;
+    }
+    let speed = unit_width_dip.max(1.0) / (dur_sec as f32).max(0.05);
+    speed <= SLOW_NON_EMPH_MAX_SPEED_DIP_PER_SEC
+}
+
+#[inline]
+pub fn eval_frontier_lift_weight(local_u: f32, prog: f32, is_rtl: bool) -> f32 {
+    if prog <= 0.002 {
+        return 0.0;
+    }
+    if prog >= 0.996 {
+        return 1.0;
+    }
+    let u = if is_rtl { 1.0 - local_u } else { local_u }.clamp(0.0, 1.0);
+    let p = prog.clamp(0.0, 1.0);
+    let half_w = 0.22f32;
+    let f = p * 1.24 - 0.12 * (1.0 - p);
+    let x = ((f - u + half_w) / (half_w * 2.0)).clamp(0.0, 1.0);
+    let s = x * x * (3.0 - 2.0 * x);
+    let onset = (p / 0.08).clamp(0.0, 1.0);
+    (s * onset).clamp(0.0, 1.0)
+}
+
+/// Computes continuous zero-tear elastic vertical lift & shear `(center_lift, shear_m12)` for a
+/// single glyph (e.g. a Chinese/CJK character) sweeping through the highlight frontier so the
+/// leading edge lifts smoothly ahead of the trailing edge without ever slicing the glyph strokes.
+#[inline]
+pub fn eval_frontier_wave_shear(lift_y: f32, glyph_w: f32, prog: f32, is_rtl: bool) -> (f32, f32) {
+    if prog <= 0.002 {
+        return (0.0, 0.0);
+    }
+    if prog >= 0.996 {
+        return (lift_y, 0.0);
+    }
+    let w_l = eval_frontier_lift_weight(0.0, prog, is_rtl);
+    let w_r = eval_frontier_lift_weight(1.0, prog, is_rtl);
+    let y_l = lift_y * w_l;
+    let y_r = lift_y * w_r;
+    let center_lift = 0.5 * (y_l + y_r);
+    let shear_m12 = ((y_r - y_l) / glyph_w.max(12.0)).clamp(-0.14, 0.14);
+    (center_lift, shear_m12)
+}
+
+#[inline]
+pub fn eval_frontier_scale_delta(local_u: f32, prog: f32, max_delta: f32, is_rtl: bool) -> f32 {
+    if prog <= 0.002 || prog >= 0.998 || max_delta <= 0.0001 {
+        return 0.0;
+    }
+    let u = if is_rtl { 1.0 - local_u } else { local_u }.clamp(0.0, 1.0);
+    let p = prog.clamp(0.0, 1.0);
+    let dist = u - p;
+    let sigma = 0.26f32;
+    let bump = (-0.5 * (dist / sigma) * (dist / sigma)).exp();
+    let entry_env = (p / 0.08).clamp(0.0, 1.0);
+    let exit_env = ((1.0 - p) / 0.10).clamp(0.0, 1.0);
+    max_delta * bump * entry_env.min(exit_env)
+}
+
+/// Computes `(body_alpha, frontier_peak_alpha, tail_decay)` for a glowing unit:
+/// - During sweep (`prog < 0.996`), swept body glow is weakened (`body_base`) while the highlight
+///   frontier peaks sharply (`peak_base`).
+/// - After the unit finishes sweeping and rests at word end (`is_holding_at_word_end`), body glow
+///   gradually rises toward `frontier_peak_alpha`.
+/// - Once moving past the word hold window, `decay_sec` smoothly attenuates glow to `0.0`.
+#[inline]
+pub fn eval_frontier_glow_profile(
+    prog: f32,
+    hold_after_end_sec: f32,
+    decay_sec: f32,
+    is_holding_at_word_end: bool,
+    is_emphasized: bool,
+    dur_factor: f32,
+) -> (f32, f32, f32) {
+    if prog <= 0.002 {
+        return (0.0, 0.0, 0.0);
+    }
+    let df = dur_factor.clamp(0.0, 1.0);
+    let peak_base = if is_emphasized {
+        0.58 + 0.20 * df
+    } else {
+        0.40
+    };
+    let body_base = if is_emphasized {
+        0.34 + 0.14 * df
+    } else {
+        0.24
+    };
+    // Target body glow reached seamlessly by the time the frontier arrives at word end (~78% of frontier peak)
+    let body_at_end = (peak_base * 0.78).max(body_base);
+
+    if prog < 0.996 {
+        let entry = (prog / 0.08).clamp(0.0, 1.0);
+        let bell = 0.86 + 0.14 * (prog * std::f32::consts::PI).sin().max(0.0);
+        let env = entry * bell;
+        let ramp_t = ((prog - 0.25) / 0.75).clamp(0.0, 1.0);
+        let ramp = ramp_t * ramp_t * (3.0 - 2.0 * ramp_t);
+        let swept_body = body_base + (body_at_end - body_base) * ramp;
+        return (
+            (swept_body * env).clamp(0.0, 1.0),
+            (peak_base * env).clamp(0.0, 1.0),
+            1.0,
+        );
+    }
+
+    // Gentle, organic final rise from `body_at_end` (~80% peak) up to `peak_base` when resting at word end
+    let rise_t = (hold_after_end_sec.max(0.0) / 0.42).clamp(0.0, 1.0);
+    let rise = rise_t * rise_t * (3.0 - 2.0 * rise_t);
+    let body_held = body_at_end + (peak_base - body_at_end) * rise;
+    if is_holding_at_word_end {
+        (body_held.clamp(0.0, 1.0), peak_base.clamp(0.0, 1.0), 1.0)
+    } else {
+        let after = (1.0 - decay_sec.max(0.0) / 0.34).clamp(0.0, 1.0);
+        let tail_decay = after * after;
+        (
+            (body_held * tail_decay).clamp(0.0, 1.0),
+            (peak_base * tail_decay).clamp(0.0, 1.0),
+            tail_decay,
+        )
+    }
+}
+
 impl LyricCharUnit {
+    #[inline]
+    pub fn is_emphasized(&self, auto_detect: bool) -> bool {
+        if auto_detect {
+            self.is_sustained
+        } else {
+            self.is_explicit_emphasis
+        }
+    }
+
     /// Computes `[0.0 .. 1.0]` karaoke sweep progress at `t_sec`, preserving exact piecewise
     /// syllable timing inside merged multi-syllable English words!
     #[inline]
@@ -329,9 +474,9 @@ impl LineAnimState {
             stagger_delay_rem: 0.0,
             scale_spring: Spring1D::new(0.98, 1.0, 115.0, 21.6),
             press_spring: Spring1D::new(1.0, 2.0, 300.0, 50.0),
-            // Slightly overdamped (zeta ~ 1.05) so active_blend and blur_spring NEVER ring or flicker!
-            active_blend: Spring1D::new(0.0, 1.0, 108.0, 21.8),
-            blur_spring: Spring1D::new(0.0, 1.0, 96.0, 20.6),
+            // Critically damped so active_blend and blur_spring ramp promptly & smoothly without ringing
+            active_blend: Spring1D::new(0.0, 1.0, 128.0, 22.8),
+            blur_spring: Spring1D::new(0.0, 1.0, 138.0, 23.5),
             syllable_lifts: vec![Spring1D::syllable_lift(0.0); syllable_count],
             bg_syllable_lifts: vec![Spring1D::syllable_lift(0.0); bg_syllable_count],
             char_lifts: vec![Spring1D::char_lift(0.0); char_count],
@@ -486,6 +631,10 @@ impl LyricsAnimator {
             st.max_word_t = -1.0;
         }
         self.last_playhead_sec = -1.0;
+    }
+
+    pub fn reset_layout_snap(&mut self) {
+        self.layout_initialized = false;
     }
 
     pub fn on_user_wheel(&mut self, delta_px: f32) {
@@ -810,8 +959,8 @@ impl LyricsAnimator {
                 0.0
             } else {
                 match dist {
-                    0 => 0.85,
-                    1 => 1.75,
+                    0 => 1.35,
+                    1 => 1.85,
                     2 => 3.15,
                     3 => 4.45,
                     _ => 5.65,
@@ -844,6 +993,8 @@ impl LyricsAnimator {
             };
 
             // Step per-syllable lift springs ONLY when `line.has_word_sync` is true!
+            // When `!is_sel`, return to baseline briskly so post-line blur handoff happens smoothly and promptly.
+            let lift_dt = if is_sel { dt_sec } else { (dt_sec * 2.5).min(0.05) };
             if st.syllable_lifts.len() != line.syllables.len() {
                 st.syllable_lifts = vec![Spring1D::syllable_lift(0.0); line.syllables.len()];
             }
@@ -854,7 +1005,7 @@ impl LyricsAnimator {
                     0.0
                 };
                 st.syllable_lifts[s_idx].target = lift_target;
-                st.syllable_lifts[s_idx].step(dt_sec);
+                st.syllable_lifts[s_idx].step(lift_dt);
             }
 
             if st.bg_syllable_lifts.len() != line.bg_syllables.len() {
@@ -867,7 +1018,7 @@ impl LyricsAnimator {
                     0.0
                 };
                 st.bg_syllable_lifts[b_idx].target = lift_target;
-                st.bg_syllable_lifts[b_idx].step(dt_sec);
+                st.bg_syllable_lifts[b_idx].step(lift_dt);
             }
 
             // Step per-unit (`字` for CJK; `word` or `char` for Latin per user switch!) lift springs!
@@ -885,7 +1036,7 @@ impl LyricsAnimator {
                     0.0
                 };
                 st.char_lifts[c_idx].target = lift_target;
-                st.char_lifts[c_idx].step(dt_sec);
+                st.char_lifts[c_idx].step(lift_dt);
             }
 
             let active_bg_units = line.bg_units_for_mode(self.latin_by_word);
@@ -901,7 +1052,7 @@ impl LyricsAnimator {
                     0.0
                 };
                 st.bg_char_lifts[bc_idx].target = lift_target;
-                st.bg_char_lifts[bc_idx].step(dt_sec);
+                st.bg_char_lifts[bc_idx].step(lift_dt);
             }
         }
 
@@ -1112,6 +1263,7 @@ pub fn build_char_units_from_syllables(syllables: &[LyricSyllable]) -> Vec<Lyric
                 utf16_start: syl.utf16_start + rel_s,
                 utf16_len: u16_len,
                 is_sustained: syl.is_sustained,
+                is_explicit_emphasis: syl.is_explicit_emphasis,
                 sub_spans: Vec::new(),
             });
         }
@@ -1134,6 +1286,7 @@ pub fn build_word_cjk_units_from_syllables(syllables: &[LyricSyllable]) -> Vec<L
         end_sec: f64,
         word_dur_sec: f64,
         is_sustained: bool,
+        is_explicit_emphasis: bool,
         preceded_by_ws: bool,
         is_cjk: bool,
         is_punct_only: bool,
@@ -1190,6 +1343,7 @@ pub fn build_word_cjk_units_from_syllables(syllables: &[LyricSyllable]) -> Vec<L
                 end_sec: c_end,
                 word_dur_sec: span_dur,
                 is_sustained: syl.is_sustained,
+                is_explicit_emphasis: syl.is_explicit_emphasis,
                 preceded_by_ws: prec_ws,
                 is_cjk: cjk,
                 is_punct_only: punct,
@@ -1219,6 +1373,7 @@ pub fn build_word_cjk_units_from_syllables(syllables: &[LyricSyllable]) -> Vec<L
                 prev.end_sec = a.end_sec;
                 prev.word_dur_sec = a.word_dur_sec;
                 prev.is_sustained |= a.is_sustained;
+                prev.is_explicit_emphasis |= a.is_explicit_emphasis;
                 if let Some(sp) = unit_atom_spans.last_mut() {
                     sp.push((a.weight, a.start_sec, a.end_sec));
                 }
@@ -1231,6 +1386,7 @@ pub fn build_word_cjk_units_from_syllables(syllables: &[LyricSyllable]) -> Vec<L
                     utf16_start: a.u16_start,
                     utf16_len: a.u16_len,
                     is_sustained: a.is_sustained,
+                    is_explicit_emphasis: a.is_explicit_emphasis,
                     sub_spans: Vec::new(),
                 });
                 unit_atom_spans.push(vec![(a.weight, a.start_sec, a.end_sec)]);
@@ -1246,6 +1402,8 @@ pub fn build_word_cjk_units_from_syllables(syllables: &[LyricSyllable]) -> Vec<L
                 prev.ch_str.push_str(&a.txt);
                 prev.utf16_len += a.u16_len;
                 prev.end_sec = prev.end_sec.max(a.end_sec);
+                prev.is_sustained |= a.is_sustained;
+                prev.is_explicit_emphasis |= a.is_explicit_emphasis;
                 if !last_was_cjk {
                     prev.word_dur_sec = (prev.end_sec - prev.start_sec).max(prev.word_dur_sec);
                 }
@@ -1261,6 +1419,7 @@ pub fn build_word_cjk_units_from_syllables(syllables: &[LyricSyllable]) -> Vec<L
                     utf16_start: a.u16_start,
                     utf16_len: a.u16_len,
                     is_sustained: a.is_sustained,
+                    is_explicit_emphasis: a.is_explicit_emphasis,
                     sub_spans: Vec::new(),
                 });
                 unit_atom_spans.push(vec![(a.weight, a.start_sec, a.end_sec)]);
@@ -1280,8 +1439,9 @@ pub fn build_word_cjk_units_from_syllables(syllables: &[LyricSyllable]) -> Vec<L
                 prev.end_sec = a.end_sec.max(prev.end_sec);
                 let dur = (prev.end_sec - prev.start_sec).max(0.03);
                 prev.word_dur_sec = dur;
-                // Strictly preserve per-syllable sustained flag (`Specs.glowRange` applies to single sustained syllables!)
+                // Strictly preserve per-syllable sustained/explicit emphasis flags
                 prev.is_sustained |= a.is_sustained;
+                prev.is_explicit_emphasis |= a.is_explicit_emphasis;
                 if let Some(sp) = unit_atom_spans.last_mut() {
                     sp.push((a.weight, a.start_sec, a.end_sec));
                 }
@@ -1294,6 +1454,7 @@ pub fn build_word_cjk_units_from_syllables(syllables: &[LyricSyllable]) -> Vec<L
                     utf16_start: a.u16_start,
                     utf16_len: a.u16_len,
                     is_sustained: a.is_sustained,
+                    is_explicit_emphasis: a.is_explicit_emphasis,
                     sub_spans: Vec::new(),
                 });
                 unit_atom_spans.push(vec![(a.weight, a.start_sec, a.end_sec)]);
@@ -1343,7 +1504,7 @@ fn recompute_utf16_offsets(text: &mut String, syllables: &mut [LyricSyllable]) {
                 || ((0.85..=30.0).contains(&dur)
                     && trimmed_chars <= 6
                     && avg_char_dur >= 0.42));
-        syl.is_sustained = syl.is_sustained || sustained_by_dur;
+        syl.is_sustained = syl.is_explicit_emphasis || syl.is_sustained || sustained_by_dur;
         rebuilt.push_str(&syl.text);
         u16_cursor += u16_len;
     }
@@ -1419,6 +1580,7 @@ pub fn synthesize_natural_syllables(text: &str, start_sec: f64, end_sec: f64) ->
             utf16_start: u16_pos,
             utf16_len: u16_len,
             is_sustained: false,
+            is_explicit_emphasis: false,
         });
         acc_t += dur;
         u16_pos += u16_len;
@@ -1861,6 +2023,7 @@ fn parse_ttml_inline_spans(fragment: &str, span_re: &Regex) -> Vec<LyricSyllable
             utf16_start: 0,
             utf16_len: 0,
             is_sustained: explicit_emph,
+            is_explicit_emphasis: explicit_emph,
         });
     }
 
@@ -1924,6 +2087,7 @@ pub fn parse_yrc_lyrics(yrc: &str, tlyric: Option<&str>) -> Option<ParsedLyrics>
                 utf16_start: 0,
                 utf16_len: 0,
                 is_sustained: false,
+                is_explicit_emphasis: false,
             });
         }
 
@@ -2100,6 +2264,7 @@ pub fn parse_lrc_lyrics(lrc: &str, tlyric: Option<&str>, source_label: &str) -> 
                         utf16_start: 0,
                         utf16_len: 0,
                         is_sustained: false,
+                        is_explicit_emphasis: false,
                     });
                 }
             }
@@ -2131,6 +2296,7 @@ pub fn parse_lrc_lyrics(lrc: &str, tlyric: Option<&str>, source_label: &str) -> 
                     utf16_start: 0,
                     utf16_len: 0,
                     is_sustained: false,
+                    is_explicit_emphasis: false,
                 });
             }
 

@@ -17,21 +17,21 @@ use windows::Win32::Graphics::DirectComposition::{
     DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
 };
 use windows::Win32::Graphics::Direct2D::{
-    CLSID_D2D1GaussianBlur, D2D1CreateFactory, ID2D1Bitmap1, ID2D1BitmapBrush1, ID2D1Device,
-    ID2D1DeviceContext, ID2D1Effect, ID2D1Factory, ID2D1Factory1, ID2D1Geometry, ID2D1Image,
-    ID2D1LinearGradientBrush, ID2D1PathGeometry, ID2D1RenderTarget, ID2D1SolidColorBrush,
-    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_BRUSH_PROPERTIES1,
+    CLSID_D2D1ColorMatrix, CLSID_D2D1GaussianBlur, D2D1CreateFactory, ID2D1Bitmap1,
+    ID2D1BitmapBrush1, ID2D1Device, ID2D1DeviceContext, ID2D1Effect, ID2D1Factory, ID2D1Factory1,
+    ID2D1Geometry, ID2D1Image, ID2D1LinearGradientBrush, ID2D1PathGeometry, ID2D1RenderTarget,
+    ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_BRUSH_PROPERTIES1,
     D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_NONE, D2D1_BITMAP_OPTIONS_TARGET,
-    D2D1_BITMAP_PROPERTIES1, D2D1_CAP_STYLE_ROUND,
+    D2D1_BITMAP_PROPERTIES1, D2D1_CAP_STYLE_ROUND, D2D1_COLORMATRIX_PROP_COLOR_MATRIX,
     D2D1_COMBINE_MODE_EXCLUDE, D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_DRAW_TEXT_OPTIONS_CLIP,
     D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT, D2D1_DRAW_TEXT_OPTIONS_NO_SNAP, D2D1_ELLIPSE,
-    D2D1_EXTEND_MODE_CLAMP,
-    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_GAMMA_2_2, D2D1_GAUSSIANBLUR_OPTIMIZATION_SPEED,
+    D2D1_EXTEND_MODE_CLAMP, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_GAMMA_2_2,
+    D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED, D2D1_GAUSSIANBLUR_OPTIMIZATION_SPEED,
     D2D1_GAUSSIANBLUR_PROP_BORDER_MODE, D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION,
-    D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
-    D2D1_INTERPOLATION_MODE_LINEAR, D2D1_LAYER_OPTIONS1_NONE, D2D1_LAYER_PARAMETERS1,
-    D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_LINE_JOIN_ROUND, D2D1_PRIMITIVE_BLEND_COPY,
-    D2D1_PRIMITIVE_BLEND_SOURCE_OVER, D2D1_PROPERTY_TYPE_FLOAT, D2D1_PROPERTY_TYPE_UINT32,
+    D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, D2D1_INTERPOLATION_MODE_LINEAR,
+    D2D1_LAYER_OPTIONS1_NONE, D2D1_LAYER_PARAMETERS1, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES,
+    D2D1_LINE_JOIN_ROUND, D2D1_PRIMITIVE_BLEND_COPY, D2D1_PRIMITIVE_BLEND_SOURCE_OVER,
+    D2D1_PROPERTY_TYPE_BLOB, D2D1_PROPERTY_TYPE_FLOAT, D2D1_PROPERTY_TYPE_UINT32,
     D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES, D2D1_ROUNDED_RECT, D2D1_STROKE_STYLE_PROPERTIES,
     D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
 };
@@ -64,12 +64,13 @@ use windows::Win32::Graphics::Dxgi::{
 };
 use windows::Win32::Graphics::Imaging::{
     CLSID_WICImagingFactory, GUID_WICPixelFormat32bppBGRA, IWICImagingFactory,
-    WICBitmapDitherTypeNone, WICBitmapInterpolationModeLinear, WICBitmapPaletteTypeCustom,
+    WICBitmapDitherTypeNone, WICBitmapInterpolationModeFant, WICBitmapPaletteTypeCustom,
     WICDecodeMetadataCacheOnDemand,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
 };
+use windows::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
 use windows::Win32::UI::Shell::SHCreateMemStream;
 use windows_numerics::{Matrix3x2, Vector2};
 
@@ -167,9 +168,12 @@ pub struct LyricsLineBmpKey {
 
 pub struct CachedLyricsLineBmp {
     pub bitmap: ID2D1Bitmap1,
+    pub blurred_bmp: Option<ID2D1Bitmap1>,
+    pub blurred_sigma_q: u16,
     pub dip_w: f32,
     pub dip_h: f32,
     pub pad_dip: f32,
+    pub scale: f32,
 }
 
 #[derive(Default)]
@@ -184,6 +188,7 @@ pub struct RowFxSlot {
 
 pub struct ActiveGlowSlot {
     pub bitmap: Option<ID2D1Bitmap1>,
+    pub baked_bitmap: Option<ID2D1Bitmap1>,
     pub alloc_w: u32,
     pub alloc_h: u32,
     pub used_dip_w: f32,
@@ -195,11 +200,12 @@ impl Default for ActiveGlowSlot {
     fn default() -> Self {
         Self {
             bitmap: None,
+            baked_bitmap: None,
             alloc_w: 0,
             alloc_h: 0,
             used_dip_w: 0.0,
             used_dip_h: 0.0,
-            pad_dip: 36.0,
+            pad_dip: 56.0,
         }
     }
 }
@@ -225,7 +231,13 @@ pub struct D2DRenderer {
     pub solid_brush: ID2D1SolidColorBrush,
     pub round_stroke: windows::Win32::Graphics::Direct2D::ID2D1StrokeStyle,
     pub blur_effect: Option<ID2D1Effect>,
+    pub line_blur_effect: Option<ID2D1Effect>,
+    pub trans_bg_blur_effect: Option<ID2D1Effect>,
+    pub trans_fg_blur_effect: Option<ID2D1Effect>,
     pub glow_blur_effect: Option<ID2D1Effect>,
+    pub glow_inner_blur_effect: Option<ID2D1Effect>,
+    pub glow_outer_alpha_effect: Option<ID2D1Effect>,
+    pub glow_inner_alpha_effect: Option<ID2D1Effect>,
     pub mesh_blur_effect: Option<ID2D1Effect>,
     cherenkov_brush: Option<windows::Win32::Graphics::Direct2D::ID2D1RadialGradientBrush>,
     window_rim_brush: Option<ID2D1LinearGradientBrush>,
@@ -249,6 +261,12 @@ pub struct D2DRenderer {
     pub row_fx_slots: Vec<RowFxSlot>,
     lyrics_mesh_bmp: Option<ID2D1Bitmap1>,
     lyrics_mesh_out_bmp: Option<ID2D1Bitmap1>,
+    mesh_last_bake_at: Option<std::time::Instant>,
+    mesh_last_art_stem: String,
+    mesh_last_free_blur: bool,
+    fade_mask_key: Option<(i32, i32, i32, i32, i32, i32)>,
+    fade_mask_brush: Option<ID2D1LinearGradientBrush>,
+    motion_textures: HashMap<String, (ID2D1Bitmap1, ID2D1BitmapBrush1, u32, u32, u64)>,
 
     // Reusable low-res 128x128 bitmap for Spek waterfall & dynamic lyrics mesh background
     pub waterfall_bmp: Option<ID2D1Bitmap1>,
@@ -256,6 +274,7 @@ pub struct D2DRenderer {
     pub waterfall_w: u32,
     pub waterfall_h: u32,
     pub waterfall_scroll_acc: f32,
+    pub waterfall_display_max_hz: f32,
 
     font_cache: HashMap<FontKey, IDWriteTextFormat>,
     ellipsis_cache: HashMap<FontKey, IDWriteInlineObject>,
@@ -274,6 +293,15 @@ pub struct D2DRenderer {
     pub width_px: u32,
     pub height_px: u32,
     pub dpi_scale: f32,
+    offscreen_base_scale: f32,
+    pub lyrics_blur_downsample: bool,
+    pub aggressive_memory_release: bool,
+    lyrics_trans_bg_96: Option<ID2D1Bitmap1>,
+    lyrics_trans_fg_bmp: Option<ID2D1Bitmap1>,
+    lyrics_trans_fg_96: Option<ID2D1Bitmap1>,
+    lyrics_trans_w: u32,
+    lyrics_trans_h: u32,
+    in_lyrics_transition_sheet: bool,
 }
 
 #[inline]
@@ -460,7 +488,13 @@ impl D2DRenderer {
                 .map_err(|e| format!("CreateStrokeStyle 失败: {e}"))?;
 
             let blur_effect = dc.CreateEffect(&CLSID_D2D1GaussianBlur).ok();
+            let line_blur_effect = dc.CreateEffect(&CLSID_D2D1GaussianBlur).ok();
+            let trans_bg_blur_effect = dc.CreateEffect(&CLSID_D2D1GaussianBlur).ok();
+            let trans_fg_blur_effect = dc.CreateEffect(&CLSID_D2D1GaussianBlur).ok();
             let glow_blur_effect = dc.CreateEffect(&CLSID_D2D1GaussianBlur).ok();
+            let glow_inner_blur_effect = dc.CreateEffect(&CLSID_D2D1GaussianBlur).ok();
+            let glow_outer_alpha_effect = dc.CreateEffect(&CLSID_D2D1ColorMatrix).ok();
+            let glow_inner_alpha_effect = dc.CreateEffect(&CLSID_D2D1ColorMatrix).ok();
             let mesh_blur_effect = dc.CreateEffect(&CLSID_D2D1GaussianBlur).ok();
 
             let cherenkov_stops = [
@@ -540,7 +574,13 @@ impl D2DRenderer {
                 solid_brush,
                 round_stroke,
                 blur_effect,
+                line_blur_effect,
+                trans_bg_blur_effect,
+                trans_fg_blur_effect,
                 glow_blur_effect,
+                glow_inner_blur_effect,
+                glow_outer_alpha_effect,
+                glow_inner_alpha_effect,
                 mesh_blur_effect,
                 cherenkov_brush,
                 window_rim_brush,
@@ -556,15 +596,22 @@ impl D2DRenderer {
                 row_fx_slots: Vec::with_capacity(24),
                 lyrics_mesh_bmp: None,
                 lyrics_mesh_out_bmp: None,
+                mesh_last_bake_at: None,
+                mesh_last_art_stem: String::new(),
+                mesh_last_free_blur: false,
+                fade_mask_key: None,
+                fade_mask_brush: None,
+                motion_textures: HashMap::new(),
                 waterfall_bmp: None,
                 waterfall_pixels: Vec::new(),
                 waterfall_w: 0,
                 waterfall_h: 0,
                 waterfall_scroll_acc: 0.0,
+                waterfall_display_max_hz: 24_000.0,
                 font_cache: HashMap::new(),
                 ellipsis_cache: HashMap::new(),
-                text_layout_cache: HashMap::with_capacity(512),
-                text_layout_fifo: VecDeque::with_capacity(512),
+                text_layout_cache: HashMap::with_capacity(1024),
+                text_layout_fifo: VecDeque::with_capacity(1024),
                 lyrics_unit_layout_cache: HashMap::with_capacity(256),
                 lyrics_unit_layout_fifo: VecDeque::with_capacity(256),
                 thumb_cache: HashMap::new(),
@@ -576,6 +623,15 @@ impl D2DRenderer {
                 width_px: w,
                 height_px: h,
                 dpi_scale: dpi_scale.max(1.0),
+                offscreen_base_scale: 1.0,
+                lyrics_blur_downsample: false,
+                aggressive_memory_release: false,
+                lyrics_trans_bg_96: None,
+                lyrics_trans_fg_bmp: None,
+                lyrics_trans_fg_96: None,
+                lyrics_trans_w: 0,
+                lyrics_trans_h: 0,
+                in_lyrics_transition_sheet: false,
             };
             renderer.recreate_backbuffer_target()?;
             Ok(renderer)
@@ -628,27 +684,58 @@ impl D2DRenderer {
         let w = width_px.max(64);
         let h = height_px.max(64);
         let new_scale = dpi_scale.max(1.0);
-        if (new_scale - self.dpi_scale).abs() > 0.01 {
+        let dpi_changed = (new_scale - self.dpi_scale).abs() > 0.01;
+        if dpi_changed {
             self.clear_lyrics_line_cache();
             self.text_layout_cache.clear();
             self.text_layout_fifo.clear();
             self.corner_cutout_geom = None;
+            self.fade_mask_key = None;
+            self.fade_mask_brush = None;
+            self.glass_capture_bmp = None;
+            self.glass_cap_w = 0;
+            self.glass_cap_h = 0;
+            self.release_lyrics_transition_surfaces();
+            for slot in &mut self.active_glow_slots {
+                slot.bitmap = None;
+                slot.baked_bitmap = None;
+                slot.alloc_w = 0;
+                slot.alloc_h = 0;
+                slot.used_dip_w = 0.0;
+                slot.used_dip_h = 0.0;
+            }
         }
         self.dpi_scale = new_scale;
+        self.offscreen_base_scale = 1.0;
         if w == self.width_px && h == self.height_px {
-            unsafe {
-                let dpi = 96.0 * self.dpi_scale;
-                self.dc.SetDpi(dpi, dpi);
+            if dpi_changed {
+                let _ = self.recreate_backbuffer_target();
+            } else {
+                unsafe {
+                    let dpi = 96.0 * self.dpi_scale;
+                    self.dc.SetDpi(dpi, dpi);
+                }
             }
             return;
         }
         self.width_px = w;
         self.height_px = h;
         self.corner_cutout_geom = None;
+        self.release_lyrics_transition_surfaces();
         unsafe {
             self.dc.SetTarget(None);
             self.target_bitmap = None;
-            for eff in [&self.blur_effect, &self.glow_blur_effect, &self.mesh_blur_effect] {
+            for eff in [
+                &self.blur_effect,
+                &self.line_blur_effect,
+                &self.trans_bg_blur_effect,
+                &self.trans_fg_blur_effect,
+                &self.glow_blur_effect,
+                &self.glow_inner_blur_effect,
+                &self.glow_outer_alpha_effect,
+                &self.glow_inner_alpha_effect,
+                &self.mesh_blur_effect,
+            ] {
                 if let Some(ref blur) = eff {
                     blur.SetInput(0, None::<&ID2D1Image>, true);
                 }
@@ -803,13 +890,38 @@ impl D2DRenderer {
 
     pub fn set_transform(&self, m: &Matrix3x2) {
         unsafe {
-            self.dc.SetTransform(m);
+            let s = self.offscreen_base_scale;
+            if (s - 1.0).abs() > 0.001 {
+                let scaled = Matrix3x2 {
+                    M11: m.M11 * s,
+                    M12: m.M12 * s,
+                    M21: m.M21 * s,
+                    M22: m.M22 * s,
+                    M31: m.M31 * s,
+                    M32: m.M32 * s,
+                };
+                self.dc.SetTransform(&scaled);
+            } else {
+                self.dc.SetTransform(m);
+            }
         }
     }
 
     pub fn reset_transform(&self) {
         unsafe {
-            self.dc.SetTransform(&Matrix3x2::identity());
+            let s = self.offscreen_base_scale;
+            if (s - 1.0).abs() > 0.001 {
+                self.dc.SetTransform(&Matrix3x2 {
+                    M11: s,
+                    M12: 0.0,
+                    M21: 0.0,
+                    M22: s,
+                    M31: 0.0,
+                    M32: 0.0,
+                });
+            } else {
+                self.dc.SetTransform(&Matrix3x2::identity());
+            }
         }
     }
 
@@ -2007,7 +2119,8 @@ impl D2DRenderer {
                     brush,
                     D2D1_DRAW_TEXT_OPTIONS_CLIP | D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
                 );
-                while self.text_layout_fifo.len() >= 480 {
+                let max_layouts = if self.aggressive_memory_release { 320 } else { 1024 };
+                while self.text_layout_fifo.len() >= max_layouts {
                     if let Some(old_k) = self.text_layout_fifo.pop_front() {
                         self.text_layout_cache.remove(&old_k);
                     }
@@ -2264,46 +2377,217 @@ impl D2DRenderer {
         self.pop_clip();
     }
 
-    /// Pushes an `ID2D1Layer` with a smooth vertical alpha-gradient mask (`0 -> 1 -> 1 -> 0`)
-    /// so scrolling lyrics smoothly dissolve into any animated background with zero dark band!
-    pub fn push_vertical_fade_layer(&self, rect: RectF, top_fade_dip: f32, bot_fade_dip: f32) -> bool {
-        if rect.w <= 2.0 || rect.h <= 8.0 {
-            return false;
+    /// Draws glowing emission for an active lyrics word/unit where glow across the already-swept
+    /// body is subdued (`body_alpha`), peaks strongly at the highlight progress frontier (`peak_alpha`),
+    /// and cleanly fades to zero ahead of the frontier (in both LTR and RTL reading directions).
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_text_layout_frontier_glow_sweep(
+        &self,
+        layout: &IDWriteTextLayout,
+        origin_x: f32,
+        origin_y: f32,
+        clip_rect: RectF,
+        progress: f32,
+        feather_px: f32,
+        is_rtl: bool,
+        body_alpha: f32,
+        peak_alpha: f32,
+    ) {
+        if clip_rect.w <= 0.2 || clip_rect.h <= 0.2 {
+            return;
         }
-        let t_stop = (top_fade_dip / rect.h).clamp(0.01, 0.35);
-        let b_stop = (1.0 - (bot_fade_dip / rect.h)).clamp(t_stop + 0.1, 0.99);
+        let body_a = body_alpha.clamp(0.0, 1.0);
+        let peak_a = peak_alpha.clamp(0.0, 1.0);
+        if body_a <= 0.005 && peak_a <= 0.005 {
+            return;
+        }
+
+        self.push_clip(clip_rect);
+        if progress <= 0.002 {
+            self.pop_clip();
+            return;
+        }
+        if progress >= 0.996 && (peak_a - body_a).abs() <= 0.015 {
+            self.draw_text_layout_subpixel(
+                layout,
+                origin_x,
+                origin_y,
+                Color::rgba(255, 255, 255, peak_a),
+            );
+            self.pop_clip();
+            return;
+        }
+
+        let p = progress.clamp(0.0, 1.0);
+        let w = clip_rect.w.max(2.0);
+        let band_back = (feather_px * 0.72 / w).clamp(0.12, 0.55);
+        let band_front = (feather_px * 0.34 / w).clamp(0.06, 0.32);
+        let p_back = (p - band_back).clamp(0.0, 1.0);
+        let p_mid_back = (p - band_back * 0.35).clamp(p_back, 1.0);
+        let p_peak = p.clamp(p_mid_back, 1.0);
+        let p_front = (p + band_front).clamp(p_peak, 1.0);
+        let start_a = if p_back <= 0.001 {
+            peak_a
+        } else {
+            body_a
+        };
+        let mid_a = body_a + (peak_a - body_a) * 0.58;
+        let front_a = if p >= 0.996 { peak_a } else { 0.0 };
+
+        let (start_pt, end_pt) = if is_rtl {
+            (
+                pt2(clip_rect.right(), clip_rect.y),
+                pt2(clip_rect.right() - w, clip_rect.y),
+            )
+        } else {
+            (
+                pt2(clip_rect.x, clip_rect.y),
+                pt2(clip_rect.x + w, clip_rect.y),
+            )
+        };
+
         unsafe {
             let stops = [
                 D2D1_GRADIENT_STOP {
                     position: 0.0,
-                    color: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.0 },
+                    color: D2D1_COLOR_F {
+                        r: 1.0,
+                        g: 1.0,
+                        b: 1.0,
+                        a: start_a,
+                    },
                 },
                 D2D1_GRADIENT_STOP {
-                    position: t_stop,
-                    color: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
+                    position: p_back,
+                    color: D2D1_COLOR_F {
+                        r: 1.0,
+                        g: 1.0,
+                        b: 1.0,
+                        a: start_a,
+                    },
                 },
                 D2D1_GRADIENT_STOP {
-                    position: b_stop,
-                    color: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
+                    position: p_mid_back,
+                    color: D2D1_COLOR_F {
+                        r: 1.0,
+                        g: 1.0,
+                        b: 1.0,
+                        a: mid_a,
+                    },
+                },
+                D2D1_GRADIENT_STOP {
+                    position: p_peak,
+                    color: D2D1_COLOR_F {
+                        r: 1.0,
+                        g: 1.0,
+                        b: 1.0,
+                        a: peak_a,
+                    },
+                },
+                D2D1_GRADIENT_STOP {
+                    position: p_front,
+                    color: D2D1_COLOR_F {
+                        r: 1.0,
+                        g: 1.0,
+                        b: 1.0,
+                        a: front_a,
+                    },
                 },
                 D2D1_GRADIENT_STOP {
                     position: 1.0,
-                    color: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.0 },
+                    color: D2D1_COLOR_F {
+                        r: 1.0,
+                        g: 1.0,
+                        b: 1.0,
+                        a: front_a,
+                    },
                 },
             ];
-            let Ok(coll) = ID2D1RenderTarget::CreateGradientStopCollection(
+            if let Ok(coll) = ID2D1RenderTarget::CreateGradientStopCollection(
                 &self.dc,
                 &stops,
                 D2D1_GAMMA_2_2,
                 D2D1_EXTEND_MODE_CLAMP,
-            ) else {
-                return false;
-            };
-            let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
-                startPoint: pt2(rect.x, rect.y),
-                endPoint: pt2(rect.x, rect.bottom()),
-            };
-            let Ok(mask_brush) = self.dc.CreateLinearGradientBrush(&props, None, &coll) else {
+            ) {
+                let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+                    startPoint: start_pt,
+                    endPoint: end_pt,
+                };
+                if let Ok(grad) = self.dc.CreateLinearGradientBrush(&props, None, &coll) {
+                    self.dc.DrawTextLayout(
+                        pt2(origin_x, origin_y),
+                        layout,
+                        &grad,
+                        D2D1_DRAW_TEXT_OPTIONS_NO_SNAP
+                            | D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
+                    );
+                }
+            }
+        }
+        self.pop_clip();
+    }
+
+    /// Pushes an `ID2D1Layer` with a cached smooth vertical alpha-gradient mask (`0 -> 1 -> 1 -> 0`)
+    /// so scrolling lyrics smoothly dissolve into any animated background with zero per-frame brush allocation!
+    pub fn push_vertical_fade_layer(
+        &mut self,
+        rect: RectF,
+        top_fade_dip: f32,
+        bot_fade_dip: f32,
+    ) -> bool {
+        if rect.w <= 2.0 || rect.h <= 8.0 {
+            return false;
+        }
+        let key = (
+            (rect.x * 2.0).round() as i32,
+            (rect.y * 2.0).round() as i32,
+            (rect.w * 2.0).round() as i32,
+            (rect.h * 2.0).round() as i32,
+            (top_fade_dip * 2.0).round() as i32,
+            (bot_fade_dip * 2.0).round() as i32,
+        );
+        unsafe {
+            if self.fade_mask_key != Some(key) || self.fade_mask_brush.is_none() {
+                let t_stop = (top_fade_dip / rect.h).clamp(0.01, 0.35);
+                let b_stop = (1.0 - (bot_fade_dip / rect.h)).clamp(t_stop + 0.1, 0.99);
+                let stops = [
+                    D2D1_GRADIENT_STOP {
+                        position: 0.0,
+                        color: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.0 },
+                    },
+                    D2D1_GRADIENT_STOP {
+                        position: t_stop,
+                        color: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
+                    },
+                    D2D1_GRADIENT_STOP {
+                        position: b_stop,
+                        color: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
+                    },
+                    D2D1_GRADIENT_STOP {
+                        position: 1.0,
+                        color: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.0 },
+                    },
+                ];
+                let Ok(coll) = ID2D1RenderTarget::CreateGradientStopCollection(
+                    &self.dc,
+                    &stops,
+                    D2D1_GAMMA_2_2,
+                    D2D1_EXTEND_MODE_CLAMP,
+                ) else {
+                    return false;
+                };
+                let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+                    startPoint: pt2(rect.x, rect.y),
+                    endPoint: pt2(rect.x, rect.bottom()),
+                };
+                let Ok(mask_brush) = self.dc.CreateLinearGradientBrush(&props, None, &coll) else {
+                    return false;
+                };
+                self.fade_mask_brush = Some(mask_brush);
+                self.fade_mask_key = Some(key);
+            }
+
+            let Some(ref mask_brush) = self.fade_mask_brush else {
                 return false;
             };
             let layer_params = D2D1_LAYER_PARAMETERS1 {
@@ -2366,6 +2650,7 @@ impl D2DRenderer {
         self.clear_lyrics_line_cache();
         for slot in &mut self.active_glow_slots {
             slot.bitmap = None;
+            slot.baked_bitmap = None;
             slot.alloc_w = 0;
             slot.alloc_h = 0;
             slot.used_dip_w = 0.0;
@@ -2380,22 +2665,81 @@ impl D2DRenderer {
             slot.used_dip_w = 0.0;
             slot.used_dip_h = 0.0;
         }
-        if let Some(ref blur) = self.blur_effect {
-            unsafe {
-                blur.SetInput(0, None::<&ID2D1Image>, true);
-            }
-        }
-        if let Some(ref blur) = self.glow_blur_effect {
-            unsafe {
-                blur.SetInput(0, None::<&ID2D1Image>, true);
-            }
-        }
-        if let Some(ref blur) = self.mesh_blur_effect {
-            unsafe {
-                blur.SetInput(0, None::<&ID2D1Image>, true);
+        for eff in [
+            &self.blur_effect,
+            &self.line_blur_effect,
+            &self.trans_bg_blur_effect,
+            &self.trans_fg_blur_effect,
+            &self.glow_blur_effect,
+            &self.glow_inner_blur_effect,
+            &self.glow_outer_alpha_effect,
+            &self.glow_inner_alpha_effect,
+            &self.mesh_blur_effect,
+        ] {
+            if let Some(ref blur) = eff {
+                unsafe {
+                    blur.SetInput(0, None::<&ID2D1Image>, true);
+                }
             }
         }
         self.gpu_staging_dirty = true;
+    }
+
+    pub fn set_aggressive_memory_release(&mut self, enabled: bool) {
+        if self.aggressive_memory_release != enabled {
+            self.aggressive_memory_release = enabled;
+            if enabled {
+                self.perform_aggressive_memory_trim(true);
+            }
+        }
+    }
+
+    /// Reclaims excess artwork, text layouts, D2D staging resources, DXGI GPU memory, and
+    /// optionally trims the Win32 process working set when「增强内存释放」is enabled.
+    pub fn perform_aggressive_memory_trim(&mut self, keep_lyrics_caches: bool) {
+        let max_thumbs = if self.aggressive_memory_release { 84 } else { 220 };
+        while self.thumb_lru.len() > max_thumbs {
+            if let Some(old) = self.thumb_lru.pop_front() {
+                self.thumb_cache.remove(&old);
+            }
+        }
+        let max_heroes = if self.aggressive_memory_release { 8 } else { 24 };
+        while self.hero_lru.len() > max_heroes {
+            if let Some(old) = self.hero_lru.pop_front() {
+                self.hero_cache.remove(&old);
+            }
+        }
+        let max_layouts = if self.aggressive_memory_release { 220 } else { 1024 };
+        while self.text_layout_fifo.len() > max_layouts {
+            if let Some(old_k) = self.text_layout_fifo.pop_front() {
+                self.text_layout_cache.remove(&old_k);
+            }
+        }
+        if !keep_lyrics_caches {
+            self.release_lyrics_gpu_surfaces();
+            self.release_lyrics_transition_surfaces();
+            self.release_row_fx_surfaces();
+        } else if self.aggressive_memory_release {
+            while self.lyrics_bmp_lru.len() > 18 {
+                if let Some(old_k) = self.lyrics_bmp_lru.pop_front() {
+                    self.lyrics_bmp_cache.remove(&old_k);
+                }
+            }
+        }
+        if self.aggressive_memory_release {
+            self.seen_art_stems.clear();
+        }
+        self.gpu_staging_dirty = true;
+        self.trim_gpu_staging_if_dirty();
+        if self.aggressive_memory_release {
+            Self::trim_process_working_set();
+        }
+    }
+
+    pub fn trim_process_working_set() {
+        unsafe {
+            let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+        }
     }
 
     pub fn trim_gpu_staging_if_dirty(&mut self) {
@@ -2404,8 +2748,20 @@ impl D2DRenderer {
         }
         self.gpu_staging_dirty = false;
         unsafe {
-            if let Some(ref blur) = self.blur_effect {
-                blur.SetInput(0, None::<&ID2D1Image>, true);
+            for eff in [
+                &self.blur_effect,
+                &self.line_blur_effect,
+                &self.trans_bg_blur_effect,
+                &self.trans_fg_blur_effect,
+                &self.glow_blur_effect,
+                &self.glow_inner_blur_effect,
+                &self.glow_outer_alpha_effect,
+                &self.glow_inner_alpha_effect,
+                &self.mesh_blur_effect,
+            ] {
+                if let Some(ref blur) = eff {
+                    blur.SetInput(0, None::<&ID2D1Image>, true);
+                }
             }
             self.d2d_device.ClearResources(0);
             if let Ok(dxgi3) = self.dxgi_device.cast::<IDXGIDevice3>() {
@@ -2421,8 +2777,17 @@ impl D2DRenderer {
         }
     }
 
+    pub fn set_lyrics_blur_downsample(&mut self, enabled: bool) {
+        if self.lyrics_blur_downsample != enabled {
+            self.lyrics_blur_downsample = enabled;
+            self.clear_lyrics_line_cache();
+        }
+    }
+
     /// Pre-bakes a crisp premultiplied offscreen bitmap for an inactive lyric line (main + bg + translation).
-    /// MUST be called when clip/layer depth on `self.dc` is 0! Bounded to max 12 visible lines (< 4.5 MB).
+    /// MUST be called when clip/layer depth on `self.dc` is 0!
+    /// Uses native `1.0x` DIP resolution by default (creamy optical blur), or gentle `0.75x` when
+    /// `lyrics_blur_downsample` power-save mode is enabled — always `96.0 DPI` for 100% DPI-invariance.
     pub fn ensure_lyrics_line_bitmap(
         &mut self,
         key: LyricsLineBmpKey,
@@ -2433,23 +2798,26 @@ impl D2DRenderer {
         bg_layout: Option<(&IDWriteTextLayout, f32)>,
         trans_layout: Option<(&IDWriteTextLayout, f32)>,
     ) {
-        if self.lyrics_bmp_cache.contains_key(&key) {
-            if self.lyrics_bmp_lru.back() != Some(&key) {
-                self.lyrics_bmp_lru.retain(|k| k != &key);
-                self.lyrics_bmp_lru.push_back(key);
+        let scale = if self.lyrics_blur_downsample { 0.75f32 } else { 1.0f32 };
+        if let Some(existing) = self.lyrics_bmp_cache.get(&key) {
+            if (existing.scale - scale).abs() < 0.01 {
+                if self.lyrics_bmp_lru.back() != Some(&key) {
+                    self.lyrics_bmp_lru.retain(|k| k != &key);
+                    self.lyrics_bmp_lru.push_back(key);
+                }
+                return;
             }
-            return;
+            self.lyrics_bmp_cache.remove(&key);
         }
         if self.target_bitmap.is_none() {
             return;
         }
 
-        let pad_dip = 16.0f32;
+        let pad_dip = 24.0f32;
         let dip_w = (vocal_max_w + pad_dip * 2.0).clamp(64.0, 2400.0);
-        let dip_h = (total_h + pad_dip * 2.0).clamp(32.0, 640.0);
-        let px_w = ((dip_w * self.dpi_scale).ceil() as u32).clamp(64, 4096);
-        let px_h = ((dip_h * self.dpi_scale).ceil() as u32).clamp(32, 1024);
-        let dpi = 96.0 * self.dpi_scale;
+        let dip_h = (total_h + pad_dip * 2.0).clamp(32.0, 680.0);
+        let px_w = ((dip_w * scale).ceil() as u32).clamp(32, 2400);
+        let px_h = ((dip_h * scale).ceil() as u32).clamp(24, 720);
 
         unsafe {
             let props = D2D1_BITMAP_PROPERTIES1 {
@@ -2457,8 +2825,8 @@ impl D2DRenderer {
                     format: DXGI_FORMAT_B8G8R8A8_UNORM,
                     alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
                 },
-                dpiX: dpi,
-                dpiY: dpi,
+                dpiX: 96.0,
+                dpiY: 96.0,
                 bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET,
                 colorContext: std::mem::ManuallyDrop::new(None),
             };
@@ -2474,13 +2842,21 @@ impl D2DRenderer {
                 return;
             };
 
+            let scale_xf = Matrix3x2 {
+                M11: scale,
+                M12: 0.0,
+                M21: 0.0,
+                M22: scale,
+                M31: 0.0,
+                M32: 0.0,
+            };
             self.dc.SetTarget(&bmp);
-            self.dc.SetDpi(dpi, dpi);
+            self.dc.SetDpi(96.0, 96.0);
             if self.lyrics_subpixel_mode {
                 self.dc
                     .SetTextRenderingParams(self.lyrics_text_params.as_ref());
             }
-            self.dc.SetTransform(&Matrix3x2::identity());
+            self.dc.SetTransform(&scale_xf);
             self.dc.Clear(Some(&D2D1_COLOR_F {
                 r: 0.0,
                 g: 0.0,
@@ -2505,12 +2881,12 @@ impl D2DRenderer {
                 };
                 let bg_piv_y = pad_dip + bg_dy;
                 let bg_xf = Matrix3x2 {
-                    M11: bg_scale,
+                    M11: bg_scale * scale,
                     M12: 0.0,
                     M21: 0.0,
-                    M22: bg_scale,
-                    M31: bg_piv_x * (1.0 - bg_scale),
-                    M32: bg_piv_y * (1.0 - bg_scale),
+                    M22: bg_scale * scale,
+                    M31: bg_piv_x * (1.0 - bg_scale) * scale,
+                    M32: bg_piv_y * (1.0 - bg_scale) * scale,
                 };
                 self.dc.SetTransform(&bg_xf);
                 self.draw_text_layout_subpixel(
@@ -2519,7 +2895,7 @@ impl D2DRenderer {
                     pad_dip + bg_dy,
                     Color::rgba(255, 255, 255, 0.72),
                 );
-                self.dc.SetTransform(&Matrix3x2::identity());
+                self.dc.SetTransform(&scale_xf);
             }
 
             if let Some((tr_lay, tr_dy)) = trans_layout {
@@ -2531,9 +2907,10 @@ impl D2DRenderer {
                 );
             }
 
-            if let Some(ref main_tgt) = self.target_bitmap {
+            if let Some(main_tgt) = self.active_draw_target() {
+                let main_dpi = 96.0 * self.dpi_scale;
                 self.dc.SetTarget(main_tgt);
-                self.dc.SetDpi(dpi, dpi);
+                self.dc.SetDpi(main_dpi, main_dpi);
             }
             if self.lyrics_subpixel_mode {
                 self.dc
@@ -2541,7 +2918,8 @@ impl D2DRenderer {
             }
             self.dc.SetTransform(&Matrix3x2::identity());
 
-            while self.lyrics_bmp_lru.len() >= 48 {
+            let max_lines = if self.aggressive_memory_release { 18 } else { 44 };
+            while self.lyrics_bmp_lru.len() >= max_lines {
                 if let Some(old_k) = self.lyrics_bmp_lru.pop_front() {
                     self.lyrics_bmp_cache.remove(&old_k);
                 }
@@ -2551,17 +2929,152 @@ impl D2DRenderer {
                 key,
                 CachedLyricsLineBmp {
                     bitmap: bmp,
+                    blurred_bmp: None,
+                    blurred_sigma_q: 0,
                     dip_w,
                     dip_h,
                     pad_dip,
+                    scale,
                 },
             );
             self.gpu_staging_dirty = true;
         }
     }
 
-    /// Draws a pre-baked lyric line through true GPU `CLSID_D2D1GaussianBlur` (`D2D1_BORDER_MODE_SOFT`)
-    /// matching LyricsBlossom's optical depth-of-field blur (`lb_win_v8.png`)!
+    /// Pre-bakes smooth GPU Gaussian depth-of-field blur (`0.25 DIP` increments, `BALANCED` kernel,
+    /// `96 DPI` at `1.0x` native or `0.75x` gentle downsample) in Pass 1.
+    /// Returns `true` if a GPU blur pass ran (so caller can budget max bakes per frame).
+    pub fn prepare_lyrics_line_blurred(&mut self, key: LyricsLineBmpKey, sigma_dip: f32) -> bool {
+        if sigma_dip <= 0.04 || self.blur_effect.is_none() || self.target_bitmap.is_none() {
+            return false;
+        }
+        // Fine 0.25 DIP steps for silky continuous blur transition as a line finishes!
+        let sigma_q = (sigma_dip.clamp(0.15, 24.0) * 4.0).round().max(1.0) as u16;
+        let Some((src_bmp, existing_blurred, prev_q, dip_w, dip_h, scale)) =
+            self.lyrics_bmp_cache.get(&key).map(|e| {
+                (
+                    e.bitmap.clone(),
+                    e.blurred_bmp.clone(),
+                    e.blurred_sigma_q,
+                    e.dip_w,
+                    e.dip_h,
+                    e.scale,
+                )
+            })
+        else {
+            return false;
+        };
+        if existing_blurred.is_some() && prev_q == sigma_q {
+            return false;
+        }
+
+        let b_px_w = ((dip_w * scale).ceil() as u32).clamp(32, 2400);
+        let b_px_h = ((dip_h * scale).ceil() as u32).clamp(24, 720);
+        let sigma_px = ((sigma_q as f32) / 4.0) * scale;
+
+        unsafe {
+            let target_bmp = if let Some(prev_b) = existing_blurred {
+                let sz = prev_b.GetPixelSize();
+                if sz.width == b_px_w && sz.height == b_px_h {
+                    Some(prev_b)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let b_bmp = match target_bmp {
+                Some(b) => b,
+                None => {
+                    let props = D2D1_BITMAP_PROPERTIES1 {
+                        pixelFormat: D2D1_PIXEL_FORMAT {
+                            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                        },
+                        dpiX: 96.0,
+                        dpiY: 96.0,
+                        bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET,
+                        colorContext: std::mem::ManuallyDrop::new(None),
+                    };
+                    let Ok(b) = self.dc.CreateBitmap(
+                        D2D_SIZE_U {
+                            width: b_px_w,
+                            height: b_px_h,
+                        },
+                        None,
+                        0,
+                        &props,
+                    ) else {
+                        return false;
+                    };
+                    self.gpu_staging_dirty = true;
+                    b
+                }
+            };
+
+            let Some(ref blur) = self.line_blur_effect.as_ref().or(self.blur_effect.as_ref()) else {
+                return false;
+            };
+            // Flush prior line-bitmap draws before sampling `src_bmp` into `line_blur_effect`
+            let _ = self.dc.Flush(None, None);
+            blur.SetInput(0, &src_bmp, true);
+            let _ = blur.SetValue(
+                D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION.0 as u32,
+                D2D1_PROPERTY_TYPE_FLOAT,
+                &sigma_px.to_le_bytes(),
+            );
+            let opt = D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED.0 as u32;
+            let _ = blur.SetValue(
+                D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION.0 as u32,
+                D2D1_PROPERTY_TYPE_UINT32,
+                &opt.to_le_bytes(),
+            );
+            let border = D2D1_BORDER_MODE_SOFT.0 as u32;
+            let _ = blur.SetValue(
+                D2D1_GAUSSIANBLUR_PROP_BORDER_MODE.0 as u32,
+                D2D1_PROPERTY_TYPE_UINT32,
+                &border.to_le_bytes(),
+            );
+
+            self.dc.SetTarget(&b_bmp);
+            self.dc.SetDpi(96.0, 96.0);
+            self.dc.SetTransform(&Matrix3x2::identity());
+            self.dc.Clear(Some(&D2D1_COLOR_F {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.0,
+            }));
+            if let Ok(out_img) = blur.GetOutput() {
+                self.dc.DrawImage(
+                    &out_img,
+                    Some(&pt2(0.0, 0.0)),
+                    None,
+                    D2D1_INTERPOLATION_MODE_LINEAR,
+                    D2D1_COMPOSITE_MODE_SOURCE_OVER,
+                );
+            }
+            // Flush baked blurred line before subsequent lines in the same frame rebind `line_blur_effect`!
+            let _ = self.dc.Flush(None, None);
+
+            if let Some(main_tgt) = self.active_draw_target() {
+                self.dc.SetTarget(main_tgt);
+                let dpi = 96.0 * self.dpi_scale;
+                self.dc.SetDpi(dpi, dpi);
+            }
+            self.dc.SetTransform(&Matrix3x2::identity());
+
+            if let Some(entry) = self.lyrics_bmp_cache.get_mut(&key) {
+                entry.blurred_bmp = Some(b_bmp);
+                entry.blurred_sigma_q = sigma_q;
+            }
+        }
+        true
+    }
+
+    /// Draws a pre-baked `0.5x` (`96 DPI`) blurred lyric line cleanly mapped onto exact DIP bounds
+    /// with zero live blur and zero `PushLayer` in Pass 2!
     pub fn draw_cached_lyrics_line_blurred(
         &self,
         key: LyricsLineBmpKey,
@@ -2584,64 +3097,26 @@ impl D2DRenderer {
             entry.dip_h,
         );
         unsafe {
-            if sigma_dip <= 0.025 || self.blur_effect.is_none() {
-                self.dc.DrawBitmap(
-                    &entry.bitmap,
-                    Some(&to_d2d_rect(dst)),
-                    a,
-                    D2D1_INTERPOLATION_MODE_LINEAR,
-                    None,
-                    None,
-                );
-                return true;
-            }
-            let blur = self.blur_effect.as_ref().unwrap();
-            blur.SetInput(0, &entry.bitmap, true);
-            let _ = blur.SetValue(
-                D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION.0 as u32,
-                D2D1_PROPERTY_TYPE_FLOAT,
-                &sigma_dip.to_le_bytes(),
+            let bmp_ref = if sigma_dip > 0.04 {
+                entry.blurred_bmp.as_ref().unwrap_or(&entry.bitmap)
+            } else {
+                &entry.bitmap
+            };
+            self.dc.DrawBitmap(
+                bmp_ref,
+                Some(&to_d2d_rect(dst)),
+                a,
+                D2D1_INTERPOLATION_MODE_LINEAR,
+                None,
+                None,
             );
-            let opt = D2D1_GAUSSIANBLUR_OPTIMIZATION_SPEED.0 as u32;
-            let _ = blur.SetValue(
-                D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION.0 as u32,
-                D2D1_PROPERTY_TYPE_UINT32,
-                &opt.to_le_bytes(),
-            );
-            let border = D2D1_BORDER_MODE_SOFT.0 as u32;
-            let _ = blur.SetValue(
-                D2D1_GAUSSIANBLUR_PROP_BORDER_MODE.0 as u32,
-                D2D1_PROPERTY_TYPE_UINT32,
-                &border.to_le_bytes(),
-            );
-            if let Ok(out_img) = blur.GetOutput() {
-                let bounds = dst.inset(-16.0, -16.0);
-                let lp = D2D1_LAYER_PARAMETERS1 {
-                    contentBounds: to_d2d_rect(bounds),
-                    geometricMask: std::mem::ManuallyDrop::new(None),
-                    maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-                    maskTransform: Matrix3x2::identity(),
-                    opacity: a,
-                    opacityBrush: std::mem::ManuallyDrop::new(None),
-                    layerOptions: D2D1_LAYER_OPTIONS1_NONE,
-                };
-                self.dc.PushLayer(&lp, None);
-                self.dc.DrawImage(
-                    &out_img,
-                    Some(&pt2(dst.x, dst.y)),
-                    None,
-                    D2D1_INTERPOLATION_MODE_LINEAR,
-                    D2D1_COMPOSITE_MODE_SOURCE_OVER,
-                );
-                self.dc.PopLayer();
-                return true;
-            }
+            true
         }
-        false
     }
 
     /// Begins offscreen glyph emission capture into `active_glow_slots[slot]` (0 or 1).
-    /// MUST be called at clip/layer depth == 0! Returns `Some(pad_dip)` on success.
+    /// Uses native `1.0x` DIP resolution at `96.0 DPI` so emphasized glow has crisp optical smooth
+    /// falloff with zero magnification mosaic across 100%..300% monitors.
     pub fn begin_active_lyrics_glow_slot(
         &mut self,
         slot: usize,
@@ -2651,30 +3126,31 @@ impl D2DRenderer {
         if slot >= 2 || self.target_bitmap.is_none() {
             return None;
         }
-        let pad_dip = 36.0f32;
-        let dip_w = (vocal_max_w + pad_dip * 2.0).clamp(64.0, 2400.0);
-        let dip_h = (total_h + pad_dip * 2.0).clamp(48.0, 680.0);
-        // HiDPI aligned bloom target so active glow glyphs match exact 2K/Retina subpixel positions!
-        let scale = self.dpi_scale.max(1.0);
-        let req_px_w = ((dip_w * scale).ceil() as u32).clamp(64, 4096);
-        let req_px_h = ((dip_h * scale).ceil() as u32).clamp(48, 1280);
-        let dpi = 96.0 * scale;
+        let pad_dip = 56.0f32;
+        let dip_w = (vocal_max_w + pad_dip * 2.0).clamp(64.0, 2600.0);
+        let dip_h = (total_h + pad_dip * 2.0).clamp(48.0, 720.0);
+        let scale = 1.0f32;
+        let req_px_w = ((dip_w * scale).ceil() as u32).clamp(64, 2560);
+        let req_px_h = ((dip_h * scale).ceil() as u32).clamp(48, 768);
 
         unsafe {
             let need_alloc = {
                 let s = &self.active_glow_slots[slot];
-                s.bitmap.is_none() || req_px_w > s.alloc_w || req_px_h > s.alloc_h
+                s.bitmap.is_none()
+                    || s.baked_bitmap.is_none()
+                    || req_px_w > s.alloc_w
+                    || req_px_h > s.alloc_h
             };
             if need_alloc {
-                let alloc_w = ((req_px_w + 255) & !255).clamp(256, 4096);
-                let alloc_h = ((req_px_h + 127) & !127).clamp(128, 1280);
+                let alloc_w = ((req_px_w + 127) & !127).clamp(128, 2560);
+                let alloc_h = ((req_px_h + 63) & !63).clamp(64, 768);
                 let props = D2D1_BITMAP_PROPERTIES1 {
                     pixelFormat: D2D1_PIXEL_FORMAT {
                         format: DXGI_FORMAT_B8G8R8A8_UNORM,
                         alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
                     },
-                    dpiX: dpi,
-                    dpiY: dpi,
+                    dpiX: 96.0,
+                    dpiY: 96.0,
                     bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET,
                     colorContext: std::mem::ManuallyDrop::new(None),
                 };
@@ -2690,24 +3166,38 @@ impl D2DRenderer {
                         &props,
                     )
                     .ok()?;
+                let baked = self
+                    .dc
+                    .CreateBitmap(
+                        D2D_SIZE_U {
+                            width: alloc_w,
+                            height: alloc_h,
+                        },
+                        None,
+                        0,
+                        &props,
+                    )
+                    .ok()?;
                 self.active_glow_slots[slot].alloc_w = alloc_w;
                 self.active_glow_slots[slot].alloc_h = alloc_h;
                 self.active_glow_slots[slot].bitmap = Some(bmp);
+                self.active_glow_slots[slot].baked_bitmap = Some(baked);
                 self.gpu_staging_dirty = true;
             }
 
             self.active_glow_slots[slot].used_dip_w = dip_w;
             self.active_glow_slots[slot].used_dip_h = dip_h;
             self.active_glow_slots[slot].pad_dip = pad_dip;
+            self.offscreen_base_scale = scale;
 
             let bmp_ref = self.active_glow_slots[slot].bitmap.as_ref()?;
             self.dc.SetTarget(bmp_ref);
-            self.dc.SetDpi(dpi, dpi);
+            self.dc.SetDpi(96.0, 96.0);
             if self.lyrics_subpixel_mode {
                 self.dc
                     .SetTextRenderingParams(self.lyrics_text_params.as_ref());
             }
-            self.dc.SetTransform(&Matrix3x2::identity());
+            self.reset_transform();
             self.dc.Clear(Some(&D2D1_COLOR_F {
                 r: 0.0,
                 g: 0.0,
@@ -2718,9 +3208,10 @@ impl D2DRenderer {
         Some(pad_dip)
     }
 
-    pub fn end_active_lyrics_glow_slot(&self) {
+    pub fn end_active_lyrics_glow_slot(&mut self) {
+        self.offscreen_base_scale = 1.0;
         unsafe {
-            if let Some(ref main_tgt) = self.target_bitmap {
+            if let Some(main_tgt) = self.active_draw_target() {
                 self.dc.SetTarget(main_tgt);
                 let dpi = 96.0 * self.dpi_scale;
                 self.dc.SetDpi(dpi, dpi);
@@ -2736,93 +3227,588 @@ impl D2DRenderer {
         }
     }
 
-    /// Composites a baked active-line glyph glow bitmap using TWO real GPU `CLSID_D2D1GaussianBlur` passes
-    /// (`inner_sigma` glyph-stroke core glow `Specs.glowRadius = 5.0` + `outer_sigma` wide atmospheric bloom
-    /// `Specs.glowRange = 0.4..30.0`) with `D2D1_COMPOSITE_MODE_PLUS` additive light blending!
+    /// Finishes Pass 1 emission capture and pre-bakes smooth dual-sigma `1.0x` (`96 DPI`) optical
+    /// bloom using dedicated outer/inner blur + ColorMatrix opacity effects with explicit GPU flushes
+    /// so `outer_alpha` & `inner_alpha` are strictly respected with ZERO intermittent white blowout!
+    pub fn finish_and_bake_active_lyrics_glow_slot(
+        &mut self,
+        slot: usize,
+        inner_sigma: f32,
+        inner_alpha: f32,
+        outer_sigma: f32,
+        outer_alpha: f32,
+    ) -> bool {
+        if slot >= 2 {
+            self.end_active_lyrics_glow_slot();
+            return false;
+        }
+        let s = &self.active_glow_slots[slot];
+        let (Some(ref src_bmp), Some(ref baked_bmp), Some(ref outer_blur)) =
+            (&s.bitmap, &s.baked_bitmap, &self.glow_blur_effect)
+        else {
+            self.end_active_lyrics_glow_slot();
+            return false;
+        };
+
+        let full_rc = D2D_RECT_F {
+            left: 0.0,
+            top: 0.0,
+            right: s.used_dip_w.min(s.alloc_w as f32),
+            bottom: s.used_dip_h.min(s.alloc_h as f32),
+        };
+        let outer_sig = outer_sigma.clamp(3.0, 18.0);
+        let inner_sig = inner_sigma.clamp(1.8, 7.5);
+        let oa = outer_alpha.clamp(0.0, 0.72);
+        let ia = inner_alpha.clamp(0.0, 0.56);
+
+        // Note: Direct2D `CLSID_D2D1ColorMatrix` defaults to `D2D1_COLORMATRIX_ALPHA_MODE_PREMULTIPLIED`,
+        // which un-premultiplies RGB, multiplies by the 5x4 matrix, and re-premultiplies by the new A.
+        // Keeping RGB diagonals at 1.0 and scaling only M44 by `a` preserves pure white optical bloom
+        // at exact linear intensity `a` (avoiding `a^2` darkening/graying).
+        let build_alpha_mat_bytes = |a: f32| -> [u8; 80] {
+            let m: [f32; 20] = [
+                1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, 0.0, a,
+                0.0, 0.0, 0.0, 0.0,
+            ];
+            let mut bytes = [0u8; 80];
+            for (i, f) in m.iter().enumerate() {
+                bytes[i * 4..(i + 1) * 4].copy_from_slice(&f.to_le_bytes());
+            }
+            bytes
+        };
+
+        unsafe {
+            // Flush Pass 1 glyph emission commands into `src_bmp` before sampling it in GaussianBlur!
+            let _ = self.dc.Flush(None, None);
+
+            self.dc.SetTarget(baked_bmp);
+            self.dc.SetDpi(96.0, 96.0);
+            self.dc.SetTransform(&Matrix3x2::identity());
+            self.dc.Clear(Some(&D2D1_COLOR_F {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.0,
+            }));
+
+            let opt = D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED.0 as u32;
+            let border = D2D1_BORDER_MODE_SOFT.0 as u32;
+
+            // Pass A: Soft wide atmospheric bloom (dedicated `glow_blur_effect` + exact `oa` attenuation)
+            let mut drew_outer = false;
+            if oa > 0.02 {
+                outer_blur.SetInput(0, src_bmp, true);
+                let _ = outer_blur.SetValue(
+                    D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION.0 as u32,
+                    D2D1_PROPERTY_TYPE_UINT32,
+                    &opt.to_le_bytes(),
+                );
+                let _ = outer_blur.SetValue(
+                    D2D1_GAUSSIANBLUR_PROP_BORDER_MODE.0 as u32,
+                    D2D1_PROPERTY_TYPE_UINT32,
+                    &border.to_le_bytes(),
+                );
+                let _ = outer_blur.SetValue(
+                    D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION.0 as u32,
+                    D2D1_PROPERTY_TYPE_FLOAT,
+                    &outer_sig.to_le_bytes(),
+                );
+                if let (Some(ref alpha_eff), Ok(blur_out)) =
+                    (&self.glow_outer_alpha_effect, outer_blur.GetOutput())
+                {
+                    alpha_eff.SetInput(0, &blur_out, true);
+                    let mat_b = build_alpha_mat_bytes(oa);
+                    let _ = alpha_eff.SetValue(
+                        D2D1_COLORMATRIX_PROP_COLOR_MATRIX.0 as u32,
+                        D2D1_PROPERTY_TYPE_BLOB,
+                        &mat_b,
+                    );
+                    if let Ok(out_img) = alpha_eff.GetOutput() {
+                        self.dc.DrawImage(
+                            &out_img,
+                            Some(&pt2(0.0, 0.0)),
+                            Some(&full_rc),
+                            D2D1_INTERPOLATION_MODE_LINEAR,
+                            D2D1_COMPOSITE_MODE_SOURCE_OVER,
+                        );
+                        drew_outer = true;
+                    }
+                } else if let Ok(out_img) = outer_blur.GetOutput() {
+                    let lp = D2D1_LAYER_PARAMETERS1 {
+                        contentBounds: full_rc,
+                        geometricMask: std::mem::ManuallyDrop::new(None),
+                        maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                        maskTransform: Matrix3x2::identity(),
+                        opacity: oa,
+                        opacityBrush: std::mem::ManuallyDrop::new(None),
+                        layerOptions: D2D1_LAYER_OPTIONS1_NONE,
+                    };
+                    self.dc.PushLayer(&lp, None);
+                    self.dc.DrawImage(
+                        &out_img,
+                        Some(&pt2(0.0, 0.0)),
+                        Some(&full_rc),
+                        D2D1_INTERPOLATION_MODE_LINEAR,
+                        D2D1_COMPOSITE_MODE_SOURCE_OVER,
+                    );
+                    self.dc.PopLayer();
+                    drew_outer = true;
+                }
+            }
+
+            // Pass B: Smooth tight inner halo (dedicated `glow_inner_blur_effect` + exact `ia` attenuation!)
+            if ia > 0.02 {
+                let inner_blur = self.glow_inner_blur_effect.as_ref().unwrap_or(outer_blur);
+                if self.glow_inner_blur_effect.is_none() {
+                    let _ = self.dc.Flush(None, None);
+                }
+                inner_blur.SetInput(0, src_bmp, true);
+                let _ = inner_blur.SetValue(
+                    D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION.0 as u32,
+                    D2D1_PROPERTY_TYPE_UINT32,
+                    &opt.to_le_bytes(),
+                );
+                let _ = inner_blur.SetValue(
+                    D2D1_GAUSSIANBLUR_PROP_BORDER_MODE.0 as u32,
+                    D2D1_PROPERTY_TYPE_UINT32,
+                    &border.to_le_bytes(),
+                );
+                let _ = inner_blur.SetValue(
+                    D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION.0 as u32,
+                    D2D1_PROPERTY_TYPE_FLOAT,
+                    &inner_sig.to_le_bytes(),
+                );
+                let comp_mode = if drew_outer {
+                    D2D1_COMPOSITE_MODE_PLUS
+                } else {
+                    D2D1_COMPOSITE_MODE_SOURCE_OVER
+                };
+                if let (Some(ref alpha_eff), Ok(blur_out)) =
+                    (&self.glow_inner_alpha_effect, inner_blur.GetOutput())
+                {
+                    alpha_eff.SetInput(0, &blur_out, true);
+                    let mat_b = build_alpha_mat_bytes(ia);
+                    let _ = alpha_eff.SetValue(
+                        D2D1_COLORMATRIX_PROP_COLOR_MATRIX.0 as u32,
+                        D2D1_PROPERTY_TYPE_BLOB,
+                        &mat_b,
+                    );
+                    if let Ok(in_img) = alpha_eff.GetOutput() {
+                        self.dc.DrawImage(
+                            &in_img,
+                            Some(&pt2(0.0, 0.0)),
+                            Some(&full_rc),
+                            D2D1_INTERPOLATION_MODE_LINEAR,
+                            comp_mode,
+                        );
+                    }
+                } else if let Ok(in_img) = inner_blur.GetOutput() {
+                    let lp = D2D1_LAYER_PARAMETERS1 {
+                        contentBounds: full_rc,
+                        geometricMask: std::mem::ManuallyDrop::new(None),
+                        maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                        maskTransform: Matrix3x2::identity(),
+                        opacity: ia,
+                        opacityBrush: std::mem::ManuallyDrop::new(None),
+                        layerOptions: D2D1_LAYER_OPTIONS1_NONE,
+                    };
+                    self.dc.PushLayer(&lp, None);
+                    self.dc.DrawImage(
+                        &in_img,
+                        Some(&pt2(0.0, 0.0)),
+                        Some(&full_rc),
+                        D2D1_INTERPOLATION_MODE_LINEAR,
+                        comp_mode,
+                    );
+                    self.dc.PopLayer();
+                }
+            }
+            // Flush baked glow slot before Slot 1 or Pass 2 touches `glow_*_effect` or `baked_bmp`!
+            let _ = self.dc.Flush(None, None);
+        }
+        self.end_active_lyrics_glow_slot();
+        true
+    }
+
+    /// Composites a pre-baked Pass 1 active-line glyph glow bitmap (`96 DPI`, `1.0x`) in Pass 2
+    /// with a single additive `DrawImage` call (`D2D1_COMPOSITE_MODE_PLUS`, `LINEAR`, zero live blur/PushLayer).
     #[allow(clippy::too_many_arguments)]
     pub fn composite_active_lyrics_glow_slot(
         &self,
         slot: usize,
         origin_x: f32,
         screen_y: f32,
-        inner_sigma: f32,
-        inner_alpha: f32,
-        outer_sigma: f32,
-        outer_alpha: f32,
+        _inner_sigma: f32,
+        _inner_alpha: f32,
+        _outer_sigma: f32,
+        _outer_alpha: f32,
     ) {
         if slot >= 2 {
             return;
         }
         let s = &self.active_glow_slots[slot];
-        let (Some(ref bmp), Some(ref blur)) = (&s.bitmap, &self.glow_blur_effect) else {
+        let Some(ref baked) = s.baked_bitmap else {
             return;
         };
         let dst_x = origin_x - s.pad_dip;
         let dst_y = screen_y - s.pad_dip;
-        let src_rc = D2D_RECT_F {
+        let full_rc = D2D_RECT_F {
             left: 0.0,
             top: 0.0,
-            right: s.used_dip_w,
-            bottom: s.used_dip_h,
+            right: s.used_dip_w.min(s.alloc_w as f32),
+            bottom: s.used_dip_h.min(s.alloc_h as f32),
         };
-        let bounds = RectF::new(dst_x - 32.0, dst_y - 32.0, s.used_dip_w + 64.0, s.used_dip_h + 64.0);
-
         unsafe {
-            blur.SetInput(0, bmp, true);
+            let mut cur_xf = Matrix3x2::identity();
+            self.dc.GetTransform(&mut cur_xf);
+            // Compose `Translate(dst_x, dst_y) * cur_xf` in D2D row-vector order (exact 1:1 DIP!)
+            let glow_xf = Matrix3x2 {
+                M11: cur_xf.M11,
+                M12: cur_xf.M12,
+                M21: cur_xf.M21,
+                M22: cur_xf.M22,
+                M31: dst_x * cur_xf.M11 + dst_y * cur_xf.M21 + cur_xf.M31,
+                M32: dst_x * cur_xf.M12 + dst_y * cur_xf.M22 + cur_xf.M32,
+            };
+            self.dc.SetTransform(&glow_xf);
+            self.dc.DrawImage(
+                baked,
+                Some(&pt2(0.0, 0.0)),
+                Some(&full_rc),
+                D2D1_INTERPOLATION_MODE_LINEAR,
+                D2D1_COMPOSITE_MODE_PLUS,
+            );
+            self.dc.SetTransform(&cur_xf);
+        }
+    }
+
+    #[inline]
+    fn active_draw_target(&self) -> Option<&ID2D1Bitmap1> {
+        if self.in_lyrics_transition_sheet {
+            self.lyrics_trans_fg_bmp
+                .as_ref()
+                .or(self.target_bitmap.as_ref())
+        } else {
+            self.target_bitmap.as_ref()
+        }
+    }
+
+    pub fn release_lyrics_transition_surfaces(&mut self) {
+        self.in_lyrics_transition_sheet = false;
+        if self.lyrics_trans_bg_96.is_none()
+            && self.lyrics_trans_fg_bmp.is_none()
+            && self.lyrics_trans_fg_96.is_none()
+        {
+            return;
+        }
+        self.lyrics_trans_bg_96 = None;
+        self.lyrics_trans_fg_bmp = None;
+        self.lyrics_trans_fg_96 = None;
+        self.lyrics_trans_w = 0;
+        self.lyrics_trans_h = 0;
+        self.gpu_staging_dirty = true;
+    }
+
+    fn ensure_lyrics_transition_surfaces(&mut self) -> bool {
+        let w = self.width_px.max(64);
+        let h = self.height_px.max(64);
+        if self.lyrics_trans_w == w
+            && self.lyrics_trans_h == h
+            && self.lyrics_trans_bg_96.is_some()
+            && self.lyrics_trans_fg_bmp.is_some()
+            && self.lyrics_trans_fg_96.is_some()
+        {
+            return true;
+        }
+        let main_dpi = 96.0 * self.dpi_scale;
+        unsafe {
+            let props_96 = D2D1_BITMAP_PROPERTIES1 {
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                },
+                dpiX: 96.0,
+                dpiY: 96.0,
+                bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
+                colorContext: std::mem::ManuallyDrop::new(None),
+            };
+            let props_fg = D2D1_BITMAP_PROPERTIES1 {
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                },
+                dpiX: main_dpi,
+                dpiY: main_dpi,
+                bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET,
+                colorContext: std::mem::ManuallyDrop::new(None),
+            };
+            let sz = D2D_SIZE_U { width: w, height: h };
+            let (Ok(bg96), Ok(fg), Ok(fg96)) = (
+                self.dc.CreateBitmap(sz, None, 0, &props_96),
+                self.dc.CreateBitmap(sz, None, 0, &props_fg),
+                self.dc.CreateBitmap(sz, None, 0, &props_96),
+            ) else {
+                return false;
+            };
+            self.lyrics_trans_bg_96 = Some(bg96);
+            self.lyrics_trans_fg_bmp = Some(fg);
+            self.lyrics_trans_fg_96 = Some(fg96);
+            self.lyrics_trans_w = w;
+            self.lyrics_trans_h = h;
+            self.gpu_staging_dirty = true;
+            true
+        }
+    }
+
+    /// Smoothly blurs the already-rendered main UI on `target_bitmap` during Lyrics open/close
+    /// transitions (`96 DPI -> 96 DPI` for 100% DPI-invariance, zero edge halo via `BORDER_MODE_HARD`,
+    /// explicit `dc.Flush` before `CopyFromBitmap` so sidebar & miniplayer are never missing!).
+    pub fn blur_current_backbuffer_in_place(&mut self, sigma_dip: f32) {
+        if sigma_dip <= 0.25 || self.target_bitmap.is_none() {
+            return;
+        }
+        if !self.ensure_lyrics_transition_surfaces() {
+            return;
+        }
+        let Some(ref blur) = self
+            .trans_bg_blur_effect
+            .as_ref()
+            .or(self.blur_effect.as_ref())
+        else {
+            return;
+        };
+        let (Some(ref main_tgt), Some(ref bg96)) = (&self.target_bitmap, &self.lyrics_trans_bg_96)
+        else {
+            return;
+        };
+        let main_dpi = 96.0 * self.dpi_scale;
+        let sigma_px = (sigma_dip * self.dpi_scale).clamp(0.5, 42.0);
+        unsafe {
+            // CRITICAL: flush all queued main UI draws (sidebar, top nav, miniplayer) into `main_tgt`
+            // BEFORE `CopyFromBitmap` executes on the GPU copy queue!
+            let _ = self.dc.Flush(None, None);
+            if bg96.CopyFromBitmap(None, main_tgt, None).is_err() {
+                return;
+            }
+            blur.SetInput(0, bg96, true);
+            let _ = blur.SetValue(
+                D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION.0 as u32,
+                D2D1_PROPERTY_TYPE_FLOAT,
+                &sigma_px.to_le_bytes(),
+            );
             let opt = D2D1_GAUSSIANBLUR_OPTIMIZATION_SPEED.0 as u32;
             let _ = blur.SetValue(
                 D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION.0 as u32,
                 D2D1_PROPERTY_TYPE_UINT32,
                 &opt.to_le_bytes(),
             );
-            let border = D2D1_BORDER_MODE_SOFT.0 as u32;
+            let border = D2D1_BORDER_MODE_HARD.0 as u32;
             let _ = blur.SetValue(
                 D2D1_GAUSSIANBLUR_PROP_BORDER_MODE.0 as u32,
                 D2D1_PROPERTY_TYPE_UINT32,
                 &border.to_le_bytes(),
             );
-
-            for (sig, alp) in [(outer_sigma, outer_alpha), (inner_sigma, inner_alpha)] {
-                let a = alp.clamp(0.0, 1.0);
-                if a <= 0.01 || sig <= 0.2 {
-                    continue;
-                }
-                let _ = blur.SetValue(
-                    D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION.0 as u32,
-                    D2D1_PROPERTY_TYPE_FLOAT,
-                    &sig.to_le_bytes(),
+            let full_px = D2D_RECT_F {
+                left: 0.0,
+                top: 0.0,
+                right: self.width_px as f32,
+                bottom: self.height_px as f32,
+            };
+            self.dc.SetDpi(96.0, 96.0);
+            self.dc.SetTransform(&Matrix3x2::identity());
+            if let Ok(out_img) = blur.GetOutput() {
+                self.dc.DrawImage(
+                    &out_img,
+                    Some(&pt2(0.0, 0.0)),
+                    Some(&full_px),
+                    D2D1_INTERPOLATION_MODE_LINEAR,
+                    D2D1_COMPOSITE_MODE_SOURCE_OVER,
                 );
-                if let Ok(out_img) = blur.GetOutput() {
-                    if a < 0.995 {
-                        let lp = D2D1_LAYER_PARAMETERS1 {
-                            contentBounds: to_d2d_rect(bounds),
-                            geometricMask: std::mem::ManuallyDrop::new(None),
-                            maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-                            maskTransform: Matrix3x2::identity(),
-                            opacity: a,
-                            opacityBrush: std::mem::ManuallyDrop::new(None),
-                            layerOptions: D2D1_LAYER_OPTIONS1_NONE,
-                        };
-                        self.dc.PushLayer(&lp, None);
+            }
+            let _ = self.dc.Flush(None, None);
+            self.dc.SetDpi(main_dpi, main_dpi);
+            self.dc.SetTransform(&Matrix3x2::identity());
+        }
+    }
+
+    /// Binds an offscreen native-DPI target so the entire Lyrics overlay can be rendered as one
+    /// unified sheet (after Pass 1 caches are pre-baked at depth 0!) and composited with true
+    /// opacity fade + Gaussian blur.
+    pub fn begin_lyrics_transition_sheet(&mut self) -> bool {
+        if self.target_bitmap.is_none() || !self.ensure_lyrics_transition_surfaces() {
+            return false;
+        }
+        let Some(ref fg) = self.lyrics_trans_fg_bmp else {
+            return false;
+        };
+        let main_dpi = 96.0 * self.dpi_scale;
+        unsafe {
+            self.dc.SetTarget(fg);
+            self.dc.SetDpi(main_dpi, main_dpi);
+            self.dc.SetTransform(&Matrix3x2::identity());
+            self.dc.Clear(Some(&D2D1_COLOR_F {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.0,
+            }));
+        }
+        self.in_lyrics_transition_sheet = true;
+        true
+    }
+
+    /// Restores `target_bitmap` at layer depth 0 and composites the captured Lyrics sheet with
+    /// unified opacity fade (`alpha`), Gaussian blur (`blur_sigma_dip`), vertical slide (`slide_y_dip`),
+    /// subtle centered scale, and rounded-corner geometric mask (zero 90° rectangular corners!).
+    pub fn end_and_composite_lyrics_transition_sheet(
+        &mut self,
+        alpha: f32,
+        blur_sigma_dip: f32,
+        slide_y_dip: f32,
+        scale: f32,
+        corner_radius_dip: f32,
+        is_maximized: bool,
+    ) {
+        self.in_lyrics_transition_sheet = false;
+        let main_dpi = 96.0 * self.dpi_scale;
+        let a = alpha.clamp(0.0, 1.0);
+        let sc = scale.clamp(0.85, 1.08);
+        let w_px = self.width_px as f32;
+        let h_px = self.height_px as f32;
+        let slide_px = slide_y_dip * self.dpi_scale;
+
+        unsafe {
+            // CRITICAL: flush all Lyrics view draws into `fg` BEFORE `CopyFromBitmap`!
+            let _ = self.dc.Flush(None, None);
+            let copied = match (&self.lyrics_trans_fg_bmp, &self.lyrics_trans_fg_96) {
+                (Some(ref fg), Some(ref fg96)) => fg96.CopyFromBitmap(None, fg, None).is_ok(),
+                _ => false,
+            };
+
+            if let Some(ref main_tgt) = self.target_bitmap {
+                self.dc.SetTarget(main_tgt);
+                self.dc.SetDpi(main_dpi, main_dpi);
+                self.dc.SetTransform(&Matrix3x2::identity());
+            } else {
+                return;
+            }
+            if !copied || a <= 0.004 {
+                return;
+            }
+
+            let Some(ref fg96) = self.lyrics_trans_fg_96 else {
+                return;
+            };
+            self.dc.SetDpi(96.0, 96.0);
+            self.dc.SetTransform(&Matrix3x2::identity());
+
+            let full_px = D2D_RECT_F {
+                left: 0.0,
+                top: 0.0,
+                right: w_px,
+                bottom: h_px,
+            };
+            let cx = w_px * 0.5;
+            let cy = h_px * 0.5;
+            let sheet_xf = Matrix3x2 {
+                M11: sc,
+                M12: 0.0,
+                M21: 0.0,
+                M22: sc,
+                M31: cx * (1.0 - sc),
+                M32: cy * (1.0 - sc) + slide_px,
+            };
+
+            // Rounded-corner geometric mask matching window silhouette so the scaling/sliding
+            // transition sheet NEVER exposes sharp 90° rectangular corners!
+            let sheet_rad_dip = if is_maximized {
+                (14.0 * (1.0 - a)).max(0.0)
+            } else {
+                corner_radius_dip.clamp(0.0, 36.0).max(10.0 * (1.0 - a))
+            };
+            let sheet_rad_px = sheet_rad_dip * self.dpi_scale;
+            let mask_geom: Option<ID2D1Geometry> = if sheet_rad_px > 0.5 {
+                let rr = D2D1_ROUNDED_RECT {
+                    rect: full_px,
+                    radiusX: sheet_rad_px,
+                    radiusY: sheet_rad_px,
+                };
+                self.d2d_factory
+                    .CreateRoundedRectangleGeometry(&rr)
+                    .ok()
+                    .and_then(|g| g.cast().ok())
+            } else {
+                None
+            };
+
+            let params = D2D1_LAYER_PARAMETERS1 {
+                contentBounds: full_px,
+                geometricMask: std::mem::ManuallyDrop::new(mask_geom),
+                maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                maskTransform: sheet_xf,
+                opacity: a,
+                opacityBrush: std::mem::ManuallyDrop::new(None),
+                layerOptions: D2D1_LAYER_OPTIONS1_NONE,
+            };
+            self.dc.PushLayer(&params, None);
+            self.dc.SetTransform(&sheet_xf);
+
+            let mut drew_blurred = false;
+            if blur_sigma_dip > 0.25 {
+                if let Some(ref blur) = self
+                    .trans_fg_blur_effect
+                    .as_ref()
+                    .or(self.blur_effect.as_ref())
+                {
+                    let sigma_px = (blur_sigma_dip * self.dpi_scale).clamp(0.4, 36.0);
+                    blur.SetInput(0, fg96, true);
+                    let _ = blur.SetValue(
+                        D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION.0 as u32,
+                        D2D1_PROPERTY_TYPE_FLOAT,
+                        &sigma_px.to_le_bytes(),
+                    );
+                    let opt = D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED.0 as u32;
+                    let _ = blur.SetValue(
+                        D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION.0 as u32,
+                        D2D1_PROPERTY_TYPE_UINT32,
+                        &opt.to_le_bytes(),
+                    );
+                    let border = D2D1_BORDER_MODE_HARD.0 as u32;
+                    let _ = blur.SetValue(
+                        D2D1_GAUSSIANBLUR_PROP_BORDER_MODE.0 as u32,
+                        D2D1_PROPERTY_TYPE_UINT32,
+                        &border.to_le_bytes(),
+                    );
+                    if let Ok(out_img) = blur.GetOutput() {
                         self.dc.DrawImage(
                             &out_img,
-                            Some(&pt2(dst_x, dst_y)),
-                            Some(&src_rc),
+                            Some(&pt2(0.0, 0.0)),
+                            Some(&full_px),
                             D2D1_INTERPOLATION_MODE_LINEAR,
-                            D2D1_COMPOSITE_MODE_PLUS,
+                            D2D1_COMPOSITE_MODE_SOURCE_OVER,
                         );
-                        self.dc.PopLayer();
-                    } else {
-                        self.dc.DrawImage(
-                            &out_img,
-                            Some(&pt2(dst_x, dst_y)),
-                            Some(&src_rc),
-                            D2D1_INTERPOLATION_MODE_LINEAR,
-                            D2D1_COMPOSITE_MODE_PLUS,
-                        );
+                        drew_blurred = true;
                     }
                 }
             }
+            if !drew_blurred {
+                self.dc.DrawBitmap(
+                    fg96,
+                    Some(&full_px),
+                    1.0,
+                    D2D1_INTERPOLATION_MODE_LINEAR,
+                    None,
+                    None,
+                );
+            }
+
+            self.dc.PopLayer();
+            let _ = std::mem::ManuallyDrop::into_inner(params.geometricMask);
+            self.dc.SetDpi(main_dpi, main_dpi);
+            self.dc.SetTransform(&Matrix3x2::identity());
         }
     }
 
@@ -2910,7 +3896,7 @@ impl D2DRenderer {
         Some(pad_dip)
     }
 
-    pub fn end_row_fx_bake(&self) {
+    pub fn end_row_fx_bake(&mut self) {
         self.end_active_lyrics_glow_slot();
     }
 
@@ -3035,10 +4021,14 @@ impl D2DRenderer {
         let Some((cov_bmp, aw, ah)) = art_bmp else {
             return false;
         };
+        let stem = artwork_key
+            .map(crate::am_api::artwork_canonical_stem)
+            .unwrap_or_default();
 
         const MESH_DIM: u32 = 256;
         unsafe {
-            if self.lyrics_mesh_bmp.is_none() || self.lyrics_mesh_out_bmp.is_none() {
+            let need_alloc = self.lyrics_mesh_bmp.is_none() || self.lyrics_mesh_out_bmp.is_none();
+            if need_alloc {
                 let props = D2D1_BITMAP_PROPERTIES1 {
                     pixelFormat: D2D1_PIXEL_FORMAT {
                         format: DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -3056,7 +4046,16 @@ impl D2DRenderer {
                 self.lyrics_mesh_bmp = self.dc.CreateBitmap(sz, None, 0, &props).ok();
                 self.lyrics_mesh_out_bmp = self.dc.CreateBitmap(sz, None, 0, &props).ok();
                 self.gpu_staging_dirty = true;
+                self.mesh_last_bake_at = None;
             }
+
+            let need_rebake = need_alloc
+                || self.mesh_last_art_stem != stem
+                || self.mesh_last_free_blur != free_blur
+                || self
+                    .mesh_last_bake_at
+                    .map(|t| t.elapsed() >= std::time::Duration::from_millis(33))
+                    .unwrap_or(true);
 
             let (Some(ref src_bmp), Some(ref out_bmp), Some(ref blur)) = (
                 &self.lyrics_mesh_bmp,
@@ -3066,103 +4065,112 @@ impl D2DRenderer {
                 return false;
             };
 
-            // Step A: Draw 4 counter-rotating, breathing overlapping copies of the album cover onto 256x256
-            self.dc.SetTarget(src_bmp);
-            self.dc.SetDpi(96.0, 96.0);
-            self.dc.SetTransform(&Matrix3x2::identity());
-            let base = palette[0].lerp(Color::rgb(12, 10, 18), 0.55);
-            self.dc.Clear(Some(&to_d2d_color(base)));
+            if need_rebake {
+                // Step A: Draw 4 counter-rotating, breathing overlapping copies of the album cover onto 256x256
+                self.dc.SetTarget(src_bmp);
+                self.dc.SetDpi(96.0, 96.0);
+                self.dc.SetTransform(&Matrix3x2::identity());
+                let base = palette[0].lerp(Color::rgb(12, 10, 18), 0.55);
+                self.dc.Clear(Some(&to_d2d_color(base)));
 
-            let breath = 1.0 + bass_energy * 0.14;
-            let quads = [
-                (76.0f32, 76.0f32, phase * 0.42, 232.0 * breath, 0.95f32),
-                (186.0, 74.0, -phase * 0.34 + 1.2, 224.0, 0.88),
-                (74.0, 188.0, -phase * 0.29 + 2.5, 236.0 * breath, 0.86),
-                (184.0, 184.0, phase * 0.37 + 3.9, 220.0, 0.84),
-            ];
-            for (cx, cy, ang, draw_sz, alpha) in quads {
-                let (sa, ca) = ang.sin_cos();
-                let sx = draw_sz / aw.max(1.0);
-                let sy = draw_sz / ah.max(1.0);
-                let hw = aw * 0.5;
-                let hh = ah * 0.5;
-                // Translate(-hw, -hh) * Scale(sx, sy) * Rotate(ang) * Translate(cx, cy)
-                let m11 = sx * ca;
-                let m12 = sx * sa;
-                let m21 = -sy * sa;
-                let m22 = sy * ca;
-                let m31 = cx - hw * m11 - hh * m21;
-                let m32 = cy - hw * m12 - hh * m22;
-                self.dc.SetTransform(&Matrix3x2 {
-                    M11: m11,
-                    M12: m12,
-                    M21: m21,
-                    M22: m22,
-                    M31: m31,
-                    M32: m32,
-                });
-                let dst = D2D_RECT_F {
-                    left: 0.0,
-                    top: 0.0,
-                    right: aw,
-                    bottom: ah,
-                };
-                self.dc.DrawBitmap(
-                    &cov_bmp,
-                    Some(&dst),
-                    alpha,
-                    D2D1_INTERPOLATION_MODE_LINEAR,
-                    None,
-                    None,
-                );
-            }
-            self.dc.SetTransform(&Matrix3x2::identity());
-
-            // Step B: Run 1:1 GPU Gaussian Blur into `out_bmp` (256x256 -> <0.04ms GPU time!)
-            self.dc.SetTarget(out_bmp);
-            self.dc.SetDpi(96.0, 96.0);
-            self.dc.Clear(Some(&to_d2d_color(base)));
-
-            let sigma = if free_blur { 2.4f32 } else { 25.0f32 };
-            blur.SetInput(0, src_bmp, true);
-            let _ = blur.SetValue(
-                D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION.0 as u32,
-                D2D1_PROPERTY_TYPE_FLOAT,
-                &sigma.to_le_bytes(),
-            );
-            let opt = D2D1_GAUSSIANBLUR_OPTIMIZATION_SPEED.0 as u32;
-            let _ = blur.SetValue(
-                D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION.0 as u32,
-                D2D1_PROPERTY_TYPE_UINT32,
-                &opt.to_le_bytes(),
-            );
-            let border = D2D1_BORDER_MODE_HARD.0 as u32;
-            let _ = blur.SetValue(
-                D2D1_GAUSSIANBLUR_PROP_BORDER_MODE.0 as u32,
-                D2D1_PROPERTY_TYPE_UINT32,
-                &border.to_le_bytes(),
-            );
-            if let Ok(blurred_img) = blur.GetOutput() {
-                self.dc.DrawImage(
-                    &blurred_img,
-                    Some(&pt2(0.0, 0.0)),
-                    Some(&D2D_RECT_F {
+                let breath = 1.0 + bass_energy * 0.14;
+                let quads = [
+                    (76.0f32, 76.0f32, phase * 0.42, 232.0 * breath, 0.95f32),
+                    (186.0, 74.0, -phase * 0.34 + 1.2, 224.0, 0.88),
+                    (74.0, 188.0, -phase * 0.29 + 2.5, 236.0 * breath, 0.86),
+                    (184.0, 184.0, phase * 0.37 + 3.9, 220.0, 0.84),
+                ];
+                for (cx, cy, ang, draw_sz, alpha) in quads {
+                    let (sa, ca) = ang.sin_cos();
+                    let sx = draw_sz / aw.max(1.0);
+                    let sy = draw_sz / ah.max(1.0);
+                    let hw = aw * 0.5;
+                    let hh = ah * 0.5;
+                    // Translate(-hw, -hh) * Scale(sx, sy) * Rotate(ang) * Translate(cx, cy)
+                    let m11 = sx * ca;
+                    let m12 = sx * sa;
+                    let m21 = -sy * sa;
+                    let m22 = sy * ca;
+                    let m31 = cx - hw * m11 - hh * m21;
+                    let m32 = cy - hw * m12 - hh * m22;
+                    self.dc.SetTransform(&Matrix3x2 {
+                        M11: m11,
+                        M12: m12,
+                        M21: m21,
+                        M22: m22,
+                        M31: m31,
+                        M32: m32,
+                    });
+                    let dst = D2D_RECT_F {
                         left: 0.0,
                         top: 0.0,
-                        right: 256.0,
-                        bottom: 256.0,
-                    }),
-                    D2D1_INTERPOLATION_MODE_LINEAR,
-                    D2D1_COMPOSITE_MODE_SOURCE_OVER,
+                        right: aw,
+                        bottom: ah,
+                    };
+                    self.dc.DrawBitmap(
+                        &cov_bmp,
+                        Some(&dst),
+                        alpha,
+                        D2D1_INTERPOLATION_MODE_LINEAR,
+                        None,
+                        None,
+                    );
+                }
+                self.dc.SetTransform(&Matrix3x2::identity());
+                // Flush the 4 rotated cover draws into `src_bmp` before running GaussianBlur!
+                let _ = self.dc.Flush(None, None);
+
+                // Step B: Run 1:1 GPU Gaussian Blur into `out_bmp` (256x256 -> <0.04ms GPU time!)
+                self.dc.SetTarget(out_bmp);
+                self.dc.SetDpi(96.0, 96.0);
+                self.dc.Clear(Some(&to_d2d_color(base)));
+
+                let sigma = if free_blur { 2.4f32 } else { 25.0f32 };
+                blur.SetInput(0, src_bmp, true);
+                let _ = blur.SetValue(
+                    D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION.0 as u32,
+                    D2D1_PROPERTY_TYPE_FLOAT,
+                    &sigma.to_le_bytes(),
                 );
+                let opt = D2D1_GAUSSIANBLUR_OPTIMIZATION_SPEED.0 as u32;
+                let _ = blur.SetValue(
+                    D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION.0 as u32,
+                    D2D1_PROPERTY_TYPE_UINT32,
+                    &opt.to_le_bytes(),
+                );
+                let border = D2D1_BORDER_MODE_HARD.0 as u32;
+                let _ = blur.SetValue(
+                    D2D1_GAUSSIANBLUR_PROP_BORDER_MODE.0 as u32,
+                    D2D1_PROPERTY_TYPE_UINT32,
+                    &border.to_le_bytes(),
+                );
+                if let Ok(blurred_img) = blur.GetOutput() {
+                    self.dc.DrawImage(
+                        &blurred_img,
+                        Some(&pt2(0.0, 0.0)),
+                        Some(&D2D_RECT_F {
+                            left: 0.0,
+                            top: 0.0,
+                            right: 256.0,
+                            bottom: 256.0,
+                        }),
+                        D2D1_INTERPOLATION_MODE_LINEAR,
+                        D2D1_COMPOSITE_MODE_SOURCE_OVER,
+                    );
+                }
+
+                // Restore active draw target (main backbuffer or lyrics transition sheet)
+                if let Some(main_tgt) = self.active_draw_target() {
+                    self.dc.SetTarget(main_tgt);
+                    let dpi = 96.0 * self.dpi_scale;
+                    self.dc.SetDpi(dpi, dpi);
+                }
+                self.mesh_last_bake_at = Some(std::time::Instant::now());
+                self.mesh_last_art_stem = stem;
+                self.mesh_last_free_blur = free_blur;
             }
 
-            // Step C: Restore main backbuffer target and draw smooth cubic-interpolated mesh across window!
-            if let Some(ref main_tgt) = self.target_bitmap {
-                self.dc.SetTarget(main_tgt);
-                let dpi = 96.0 * self.dpi_scale;
-                self.dc.SetDpi(dpi, dpi);
-            }
+            // Step C: Blit blurred 256x256 mesh across window with LINEAR filtering
             let crop_src = D2D_RECT_F {
                 left: 10.0,
                 top: 10.0,
@@ -3173,7 +4181,7 @@ impl D2DRenderer {
                 out_bmp,
                 Some(&to_d2d_rect(win_rect)),
                 1.0,
-                D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
+                D2D1_INTERPOLATION_MODE_LINEAR,
                 Some(&crop_src),
                 None,
             );
@@ -3223,7 +4231,7 @@ impl D2DRenderer {
 
             let scaler = wic.CreateBitmapScaler().ok()?;
             scaler
-                .Initialize(&conv, dst_w, dst_h, WICBitmapInterpolationModeLinear)
+                .Initialize(&conv, dst_w, dst_h, WICBitmapInterpolationModeFant)
                 .ok()?;
 
             let stride = dst_w * 4;
@@ -3305,7 +4313,7 @@ impl D2DRenderer {
             let b_props = D2D1_BITMAP_BRUSH_PROPERTIES1 {
                 extendModeX: D2D1_EXTEND_MODE_CLAMP,
                 extendModeY: D2D1_EXTEND_MODE_CLAMP,
-                interpolationMode: D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
+                interpolationMode: D2D1_INTERPOLATION_MODE_LINEAR,
             };
             let Ok(bbrush) = self.dc.CreateBitmapBrush(&bmp, Some(&b_props), None) else {
                 return false;
@@ -3327,8 +4335,9 @@ impl D2DRenderer {
         };
 
         if hero_res {
+            let max_heroes = if self.aggressive_memory_release { 8 } else { 24 };
             self.hero_lru.retain(|k| k != &stem);
-            while self.hero_lru.len() >= 8 {
+            while self.hero_lru.len() >= max_heroes {
                 if let Some(old) = self.hero_lru.pop_front() {
                     self.hero_cache.remove(&old);
                 }
@@ -3336,8 +4345,9 @@ impl D2DRenderer {
             self.hero_lru.push_back(stem.clone());
             self.hero_cache.insert(stem, cached);
         } else {
+            let max_thumbs = if self.aggressive_memory_release { 84 } else { 220 };
             self.thumb_lru.retain(|k| k != &stem);
-            while self.thumb_lru.len() >= 200 {
+            while self.thumb_lru.len() >= max_thumbs {
                 if let Some(old) = self.thumb_lru.pop_front() {
                     self.thumb_cache.remove(&old);
                 }
@@ -3350,11 +4360,130 @@ impl D2DRenderer {
     }
 
     pub fn insert_artwork_bytes(&mut self, key: String, bytes: &[u8], hero_res: bool) -> bool {
-        let max_dim = if hero_res { 560u32 } else { 160u32 };
+        let max_dim = if hero_res {
+            if self.aggressive_memory_release { 512u32 } else { 768u32 }
+        } else if self.aggressive_memory_release {
+            256u32
+        } else {
+            384u32
+        };
         let Some(decoded) = Self::decode_artwork_pixels_cpu(bytes, max_dim) else {
             return false;
         };
         self.upload_decoded_artwork(key, decoded, hero_res)
+    }
+
+    /// Draws a classic Apple Cover Flow 2.5D tilted album sleeve with subtle side shading
+    /// and a glossy inverted mirror reflection fading cleanly into the dark floor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_cover_flow_sleeve(
+        &self,
+        art_url: Option<&str>,
+        rect: RectF,
+        tilt_skew_y: f32,
+        scale_x: f32,
+        dim_alpha: f32,
+        reflection_alpha: f32,
+        is_center: bool,
+    ) {
+        if rect.w <= 2.0 || rect.h <= 2.0 {
+            return;
+        }
+        let cx = rect.center_x();
+        let cy = rect.center_y();
+        let sx = scale_x.clamp(0.35, 1.25);
+        let sk = tilt_skew_y.clamp(-0.42, 0.42);
+        let sleeve_xf = Matrix3x2 {
+            M11: sx,
+            M12: sk,
+            M21: 0.0,
+            M22: 1.0,
+            M31: cx * (1.0 - sx),
+            M32: -cx * sk,
+        };
+        let radius = if is_center { 12.0 } else { 9.0 };
+
+        // 1. Glossy inverted mirror reflection beneath the sleeve (exact parallel tilt with bottom edge)
+        if reflection_alpha > 0.02 {
+            let refl_h = (rect.h * 0.46).max(24.0);
+            let floor_y = rect.bottom() + 2.0;
+            // Flip vertically around `floor_y` while preserving identical `+sk` vertical shear so
+            // the reflected top edge stays parallel and 4 DIP below the tilted sleeve bottom edge.
+            let refl_xf = Matrix3x2 {
+                M11: sx,
+                M12: sk,
+                M21: 0.0,
+                M22: -1.0,
+                M31: cx * (1.0 - sx),
+                M32: floor_y * 2.0 - cx * sk,
+            };
+            self.set_transform(&refl_xf);
+            let refl_clip = RectF::new(
+                rect.x - 2.0,
+                rect.bottom() - refl_h,
+                rect.w + 4.0,
+                refl_h + 2.0,
+            );
+            self.push_clip(refl_clip);
+            let drew_ref = art_url
+                .filter(|u| !u.is_empty())
+                .is_some_and(|u| self.draw_rounded_artwork(u, is_center, rect, radius, reflection_alpha * 0.42));
+            if !drew_ref {
+                self.fill_rounded_rect(
+                    rect,
+                    radius,
+                    Theme::BG_ELEVATED.with_alpha(reflection_alpha * 0.35),
+                );
+            }
+            self.pop_clip();
+            self.set_transform(&sleeve_xf);
+            let fade_r = RectF::new(rect.x - 4.0, floor_y, rect.w + 8.0, refl_h + 10.0);
+            self.fill_linear_gradient_rect(
+                fade_r,
+                0.0,
+                fade_r.x,
+                fade_r.y,
+                fade_r.x,
+                fade_r.bottom(),
+                Color::rgba(14, 14, 18, 0.30),
+                Color::rgba(14, 14, 18, 1.0),
+            );
+        }
+
+        // 2. Main 2.5D Album Sleeve
+        self.set_transform(&sleeve_xf);
+        let shadow_off = if is_center { 12.0 } else { 6.0 };
+        self.fill_rounded_rect(
+            RectF::new(rect.x + 2.0, rect.y + shadow_off, rect.w - 4.0, rect.h),
+            radius,
+            Color::rgba(0, 0, 0, if is_center { 0.52 } else { 0.36 }),
+        );
+        let drew = art_url
+            .filter(|u| !u.is_empty())
+            .is_some_and(|u| self.draw_rounded_artwork(u, is_center, rect, radius, 1.0));
+        if !drew {
+            self.fill_rounded_rect(rect, radius, Theme::BG_ELEVATED);
+            self.draw_icon(
+                SfIcon::Albums,
+                rect.inset(rect.w * 0.32, rect.h * 0.32),
+                Theme::TEXT_MUTED,
+            );
+        }
+        if dim_alpha > 0.01 {
+            self.fill_rounded_rect(rect, radius, Color::rgba(6, 6, 10, dim_alpha.clamp(0.0, 0.85)));
+        }
+        self.stroke_rounded_rect(
+            rect,
+            radius,
+            if is_center {
+                Color::rgba(255, 255, 255, 0.28)
+            } else {
+                Color::rgba(255, 255, 255, 0.12)
+            },
+            if is_center { 1.3 } else { 1.0 },
+        );
+        let _ = cy;
+        self.reset_transform();
     }
 
     pub fn draw_rounded_artwork(
@@ -3399,16 +4528,22 @@ impl D2DRenderer {
         let final_opacity = (opacity * fade_mul).clamp(0.0, 1.0);
 
         unsafe {
-            let sx = rect.w / (art.width as f32).max(1.0);
-            let sy = rect.h / (art.height as f32).max(1.0);
+            // Uniform aspect-preserving center-crop cover fill (prevents stretching 1:1 covers into 16:9 heroes!)
+            let fw = (art.width as f32).max(1.0);
+            let fh = (art.height as f32).max(1.0);
+            let scale = (rect.w / fw).max(rect.h / fh);
+            let draw_w = fw * scale;
+            let draw_h = fh * scale;
+            let tx = rect.x + (rect.w - draw_w) * 0.5;
+            let ty = rect.y + (rect.h - draw_h) * 0.5;
             art.brush.SetOpacity(final_opacity);
             art.brush.SetTransform(&Matrix3x2 {
-                M11: sx,
+                M11: scale,
                 M12: 0.0,
                 M21: 0.0,
-                M22: sy,
-                M31: rect.x,
-                M32: rect.y,
+                M22: scale,
+                M31: tx,
+                M32: ty,
             });
 
             if radius >= rect.w * 0.49 && (rect.w - rect.h).abs() < 2.0 {
@@ -3430,8 +4565,135 @@ impl D2DRenderer {
         true
     }
 
-    /// Real-time audio-reactive vertical equalizer bars for playing track covers (4 bars)
-    /// and left sidebar `可视化` icon (6 bars). Settles cleanly when silent/paused!
+    /// Uploads (on frame advance) and aspect-fill renders a decoded `MotionFrameSnapshot`
+    /// inside a rounded rectangle with `LINEAR` interpolation and zero `PushLayer`.
+    pub fn draw_motion_artwork(
+        &mut self,
+        frame: &crate::motion_art::MotionFrameSnapshot,
+        rect: RectF,
+        radius: f32,
+        opacity: f32,
+    ) -> bool {
+        let a = opacity.clamp(0.0, 1.0);
+        if a <= 0.005 || rect.w <= 1.0 || rect.h <= 1.0 || frame.width == 0 || frame.height == 0 {
+            return false;
+        }
+        let need_bytes = (frame.width as usize)
+            .saturating_mul(frame.height as usize)
+            .saturating_mul(4);
+        if frame.bgra.len() < need_bytes {
+            return false;
+        }
+
+        let need_recreate = self
+            .motion_textures
+            .get(&frame.key)
+            .map(|(_, _, w, h, _)| *w != frame.width || *h != frame.height)
+            .unwrap_or(true);
+
+        if need_recreate {
+            if self.motion_textures.len() >= 4 {
+                if let Some(evict_k) = self
+                    .motion_textures
+                    .keys()
+                    .find(|k| *k != &frame.key)
+                    .cloned()
+                {
+                    self.motion_textures.remove(&evict_k);
+                }
+            }
+            unsafe {
+                let props = D2D1_BITMAP_PROPERTIES1 {
+                    pixelFormat: D2D1_PIXEL_FORMAT {
+                        format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                        alphaMode: D2D1_ALPHA_MODE_IGNORE,
+                    },
+                    dpiX: 96.0,
+                    dpiY: 96.0,
+                    bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
+                    colorContext: std::mem::ManuallyDrop::new(None),
+                };
+                let Ok(bmp) = self.dc.CreateBitmap(
+                    D2D_SIZE_U {
+                        width: frame.width,
+                        height: frame.height,
+                    },
+                    Some(frame.bgra.as_ptr() as *const c_void),
+                    frame.width * 4,
+                    &props,
+                ) else {
+                    return false;
+                };
+                let b_props = D2D1_BITMAP_BRUSH_PROPERTIES1 {
+                    extendModeX: D2D1_EXTEND_MODE_CLAMP,
+                    extendModeY: D2D1_EXTEND_MODE_CLAMP,
+                    interpolationMode: D2D1_INTERPOLATION_MODE_LINEAR,
+                };
+                let Ok(bbrush) = self.dc.CreateBitmapBrush(&bmp, Some(&b_props), None) else {
+                    return false;
+                };
+                self.motion_textures.insert(
+                    frame.key.clone(),
+                    (bmp, bbrush, frame.width, frame.height, frame.frame_seq),
+                );
+                self.gpu_staging_dirty = true;
+            }
+        } else if let Some((bmp, _, _, _, cached_seq)) = self.motion_textures.get_mut(&frame.key) {
+            if *cached_seq != frame.frame_seq {
+                unsafe {
+                    let dst_u = D2D_RECT_U {
+                        left: 0,
+                        top: 0,
+                        right: frame.width,
+                        bottom: frame.height,
+                    };
+                    let _ = bmp.CopyFromMemory(
+                        Some(&dst_u),
+                        frame.bgra.as_ptr() as *const c_void,
+                        frame.width * 4,
+                    );
+                }
+                *cached_seq = frame.frame_seq;
+            }
+        }
+
+        let Some((_, bbrush, w, h, _)) = self.motion_textures.get(&frame.key) else {
+            return false;
+        };
+        let fw = (*w as f32).max(1.0);
+        let fh = (*h as f32).max(1.0);
+        let scale = (rect.w / fw).max(rect.h / fh);
+        let draw_w = fw * scale;
+        let draw_h = fh * scale;
+        let tx = rect.x + (rect.w - draw_w) * 0.5;
+        let ty = rect.y + (rect.h - draw_h) * 0.5;
+
+        unsafe {
+            bbrush.SetOpacity(a);
+            bbrush.SetTransform(&Matrix3x2 {
+                M11: scale,
+                M12: 0.0,
+                M21: 0.0,
+                M22: scale,
+                M31: tx,
+                M32: ty,
+            });
+            if radius <= 0.5 {
+                self.dc.FillRectangle(&to_d2d_rect(rect), bbrush);
+            } else {
+                let rr = D2D1_ROUNDED_RECT {
+                    rect: to_d2d_rect(rect),
+                    radiusX: radius,
+                    radiusY: radius,
+                };
+                self.dc.FillRoundedRectangle(&rr, bbrush);
+            }
+        }
+        true
+    }
+
+    /// Real-time audio-reactive vertical equalizer bars (unified 5-bar symmetric style)
+    /// for playing track covers and left sidebar `可视化` icon. Settles cleanly when silent/paused!
     pub fn draw_live_equalizer_bars(
         &self,
         rect: RectF,
@@ -3446,8 +4708,8 @@ impl D2DRenderer {
         let cx = rect.center_x();
         let cy = rect.center_y();
         let s = rect.w.min(rect.h) * 0.5;
-        let sw = (s * if n <= 4 { 0.28 } else { 0.19 }).clamp(1.5, 2.7);
-        let span = s * if n <= 4 { 1.32 } else { 1.48 };
+        let sw = (s * if n <= 4 { 0.28 } else { 0.21 }).clamp(1.5, 2.7);
+        let span = s * if n <= 4 { 1.32 } else { 1.38 };
         let x0 = cx - span * 0.5;
         let step = if n > 1 { span / ((n - 1) as f32) } else { 0.0 };
 
@@ -3533,14 +4795,14 @@ impl D2DRenderer {
                 }
             }
             SfIcon::Visualizer => {
-                // Apple Music / Audio waveform bars glyph
-                let bars = [0.35f32, 0.78, 1.0, 0.58, 0.85, 0.42];
-                let span = s * 1.44;
+                // Unified 5-bar symmetric Apple Music waveform glyph
+                let bars = [0.38f32, 0.76, 1.0, 0.72, 0.42];
+                let span = s * 1.38;
                 let x0 = cx - span * 0.5;
                 for (i, &h_mul) in bars.iter().enumerate() {
-                    let bx = x0 + (i as f32 / 5.0) * span;
+                    let bx = x0 + (i as f32 / 4.0) * span;
                     let hh = s * 0.78 * h_mul;
-                    self.draw_line(bx, cy - hh, bx, cy + hh, color, sw * 1.08);
+                    self.draw_line(bx, cy - hh, bx, cy + hh, color, sw * 1.15);
                 }
             }
             SfIcon::Clock => {
@@ -3914,20 +5176,27 @@ impl D2DRenderer {
     // GPU-Uploaded Dynamic Waterfall Bitmap (Spek Spectrogram)
     // ========================================================================
 
+    #[allow(clippy::too_many_arguments)]
     pub fn update_and_draw_waterfall(
         &mut self,
         plot_rect: RectF,
         bins_db: &[f32],
+        low24_bins_db: Option<&[f32]>,
+        nyquist_hz: f32,
+        display_max_hz: f32,
         advance_col: bool,
         dt_sec: f32,
     ) {
         let w = (plot_rect.w.round() as u32).clamp(120, 960);
         let h = 256u32;
+        let nyq = nyquist_hz.max(8_000.0);
+        let disp_max = display_max_hz.clamp(8_000.0, nyq);
 
         if self.waterfall_bmp.is_none() || self.waterfall_w != w || self.waterfall_h != h {
             self.waterfall_w = w;
             self.waterfall_h = h;
             self.waterfall_scroll_acc = 0.0;
+            self.waterfall_display_max_hz = disp_max;
             self.waterfall_pixels = vec![0u8; (w * h * 4) as usize];
             // Initialize dark background `#06070C`
             for px in self.waterfall_pixels.chunks_exact_mut(4) {
@@ -3952,9 +5221,54 @@ impl D2DRenderer {
                     .CreateBitmap(D2D_SIZE_U { width: w, height: h }, None, 0, &props)
                     .ok();
             }
+        } else if (self.waterfall_display_max_hz - disp_max).abs() > 120.0 {
+            // Smoothly remap existing waterfall rows when frequency axis auto-expands (e.g. 24k -> 48k -> 96k)
+            let old_max = self.waterfall_display_max_hz.max(8_000.0);
+            let stride = (w * 4) as usize;
+            let mut remapped = vec![0u8; (w * h * 4) as usize];
+            for px in remapped.chunks_exact_mut(4) {
+                px[0] = 12;
+                px[1] = 7;
+                px[2] = 6;
+                px[3] = 255;
+            }
+            if disp_max > old_max {
+                let ratio = (old_max / disp_max).clamp(0.05, 1.0);
+                for new_row in 0..(h as usize) {
+                    // row = 255 is 0 Hz, row = 0 is disp_max Hz
+                    let freq_norm_new = 1.0 - (new_row as f32) / ((h - 1) as f32);
+                    if freq_norm_new <= ratio {
+                        let freq_norm_old = (freq_norm_new / ratio).clamp(0.0, 1.0);
+                        let old_row =
+                            (((1.0 - freq_norm_old) * ((h - 1) as f32)).round() as usize)
+                                .min((h - 1) as usize);
+                        let src0 = old_row * stride;
+                        let dst0 = new_row * stride;
+                        remapped[dst0..dst0 + stride]
+                            .copy_from_slice(&self.waterfall_pixels[src0..src0 + stride]);
+                    }
+                }
+            }
+            self.waterfall_pixels = remapped;
+            self.waterfall_display_max_hz = disp_max;
+            if let Some(ref bmp) = self.waterfall_bmp {
+                unsafe {
+                    let dst = D2D_RECT_U {
+                        left: 0,
+                        top: 0,
+                        right: w,
+                        bottom: h,
+                    };
+                    let _ = bmp.CopyFromMemory(
+                        Some(&dst),
+                        self.waterfall_pixels.as_ptr() as *const c_void,
+                        w * 4,
+                    );
+                }
+            }
         }
 
-        if advance_col && bins_db.len() == 256 {
+        if advance_col && !bins_db.is_empty() {
             // Frame-rate independent scroll speed (~92 px/sec across 60/90/120/144/165/240 Hz!)
             self.waterfall_scroll_acc += dt_sec.clamp(0.001, 0.05) * 92.0;
             let shift_cols = (self.waterfall_scroll_acc.floor() as usize).min(6).min(w as usize - 1);
@@ -3962,13 +5276,31 @@ impl D2DRenderer {
                 self.waterfall_scroll_acc -= shift_cols as f32;
                 let stride = (w * 4) as usize;
                 let shift_bytes = shift_cols * 4;
+                let use_low24 = disp_max <= 24_050.0
+                    && low24_bins_db.is_some_and(|l| l.len() >= 64);
+                let low_cap_hz = nyq.min(24_000.0);
                 for row in 0..(h as usize) {
                     let r0 = row * stride;
                     self.waterfall_pixels
                         .copy_within((r0 + shift_bytes)..(r0 + stride), r0);
-                    // row = 0 is Nyquist (top = bin 255), row = 255 is 0 Hz (bottom = bin 0)
-                    let bin = 255 - row;
-                    let db = bins_db[bin];
+                    // row = 0 is disp_max Hz (top), row = 255 is 0 Hz (bottom)
+                    let freq_hz = (1.0 - (row as f32) / ((h - 1) as f32)) * disp_max;
+                    let db = if use_low24 {
+                        let low = low24_bins_db.unwrap();
+                        let pos = ((freq_hz / low_cap_hz.max(1.0)) * ((low.len() - 1) as f32))
+                            .clamp(0.0, (low.len() - 1) as f32);
+                        let i0 = pos.floor() as usize;
+                        let i1 = (i0 + 1).min(low.len() - 1);
+                        let frac = pos - (i0 as f32);
+                        low[i0] + (low[i1] - low[i0]) * frac
+                    } else {
+                        let pos = ((freq_hz / nyq) * ((bins_db.len() - 1) as f32))
+                            .clamp(0.0, (bins_db.len() - 1) as f32);
+                        let i0 = pos.floor() as usize;
+                        let i1 = (i0 + 1).min(bins_db.len() - 1);
+                        let frac = pos - (i0 as f32);
+                        bins_db[i0] + (bins_db[i1] - bins_db[i0]) * frac
+                    };
                     let (r, g, b) = spek_thermal_rgb(db);
                     for c in (w as usize - shift_cols)..(w as usize) {
                         let p = r0 + c * 4;

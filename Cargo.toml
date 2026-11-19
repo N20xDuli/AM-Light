@@ -1,6 +1,6 @@
 [package]
 name = "am-light"
-version = "0.2.0"
+version = "0.2.4"
 description = "Apple Music desktop client with native Direct2D UI, synced lyrics, and audio visualizer"
 authors = ["N20xDuli"]
 license = "MIT"
