@@ -937,7 +937,7 @@ mod tests {
 
         let mut acc_piano = ForensicAccumulator::new(44_100);
         acc_piano.observe_pcm_samples(&stereo_pcm_16);
-        assert_eq!(acc_piano.detected_bit_grid_label(), "16-bit 整数无损网格");
+        assert_eq!(acc_piano.detected_bit_grid_label(), "16-bit PCM");
         for _ in 0..8 {
             acc_piano.process_fft_window(&piano_intro);
         }
@@ -1084,7 +1084,7 @@ mod tests {
             };
             assert_eq!(
                 format_inspector_detected_header(true, 100, avail_1185),
-                "实测音质 · WASAPI 实时鉴定 (置信度 100%)"
+                "实测 · 置信度 100%"
             );
 
             for family_name in ["Segoe UI Variable Display", "Microsoft YaHei UI"] {
@@ -3516,5 +3516,281 @@ lo48.m3u8\n";
         // Emphasized glow profile must stay legible (never saturated to 1.0 white blowout)
         let (body_mid, peak_mid, _) = eval_frontier_glow_profile(0.5, 0.0, 0.0, false, true, 1.0);
         assert!(body_mid <= 0.65 && peak_mid <= 0.80, "glow must stay readable: body={body_mid}, peak={peak_mid}");
+    }
+
+    #[test]
+    fn test_v025_cjk_glow_legibility_end_hold_toggle_aurora_and_liquid_glass() {
+        use am_light_lib::app_ui::{AppSettings, AppUi, UiAction};
+        use am_light_lib::d2d_renderer::D2DRenderer;
+        use am_light_lib::lyrics::{cjk_glow_density_scale, eval_frontier_glow_profile_ex};
+        use am_light_lib::lyrics_view::LyricsViewState;
+
+        // 1. CJK (Chinese Hanzi & Japanese Kanji/Kana) glow density compensation keeps dense strokes sharp
+        let s_latin = cjk_glow_density_scale("Attention");
+        let s_kanji = cjk_glow_density_scale("響鬱愛");
+        let s_kana = cjk_glow_density_scale("ありがとう");
+        assert!((s_latin - 1.0).abs() < 1e-4, "Latin scale must remain 1.0, got {s_latin}");
+        assert!(
+            s_kanji < 0.52 && s_kanji >= 0.42,
+            "Chinese/Kanji stroke-density scale must tame inner glow blowout: {s_kanji}"
+        );
+        assert!(
+            s_kana < 0.65 && s_kana > s_kanji,
+            "Japanese Kana scale must be moderate between Kanji and Latin: {s_kana}"
+        );
+
+        // 2. End-of-word hold glow ramp toggle (`lyrics_end_hold_glow`)
+        let (on_early, on_peak0, _) =
+            eval_frontier_glow_profile_ex(1.0, 0.02, 0.0, true, true, 0.85, true);
+        let (on_late, on_peak1, _) =
+            eval_frontier_glow_profile_ex(1.0, 0.45, 0.0, true, true, 0.85, true);
+        assert!(
+            on_late > on_early + 0.08 && (on_late - on_peak1).abs() < 0.02,
+            "end_hold_glow=true must smoothly intensify body glow toward peak: early={on_early}, late={on_late}, p={on_peak0}/{on_peak1}"
+        );
+
+        let (off_early, off_peak0, _) =
+            eval_frontier_glow_profile_ex(1.0, 0.02, 0.0, true, true, 0.85, false);
+        let (off_late, off_peak1, _) =
+            eval_frontier_glow_profile_ex(1.0, 0.45, 0.0, true, true, 0.85, false);
+        assert!(
+            off_late <= off_early + 1e-4 && off_late < on_late - 0.20,
+            "end_hold_glow=false must NOT surge whole-word brightness during end-hold: off={off_early}->{off_late}, on_late={on_late}, peaks={off_peak0}->{off_peak1}"
+        );
+
+        // Toggle persistence & legacy default=true
+        let legacy: AppSettings = serde_json::from_str(r#"{"storefront":"jp"}"#).expect("legacy");
+        assert!(legacy.lyrics_end_hold_glow, "legacy settings default lyrics_end_hold_glow=true");
+        let mut ui = AppUi::new(0);
+        let init_eh = ui.settings.lyrics_end_hold_glow;
+        ui.execute_action(UiAction::ToggleLyricsEndHoldGlow);
+        assert_eq!(ui.settings.lyrics_end_hold_glow, !init_eh);
+        ui.execute_action(UiAction::ToggleLyricsEndHoldGlow);
+        assert_eq!(ui.settings.lyrics_end_hold_glow, init_eh);
+
+        // 3. Reduce-motion / reduce-transparency must NOT freeze Lyrics flowing aurora (`mesh_phase`)
+        let mut lv = LyricsViewState::default();
+        let p0 = lv.mesh_phase;
+        lv.step(None, false, "trk:1", 10.0, true, 0.35, None, 720.0, 0.05, true, true);
+        assert!(
+            lv.mesh_phase > p0 + 0.01,
+            "Lyrics flowing aurora phase must advance even when reduce_motion=true: {} -> {}",
+            p0,
+            lv.mesh_phase
+        );
+
+        // 4. Redesigned Liquid Glass vibrancy ColorMatrix preserves neutral gray & boosts chromatic saturation
+        let m = D2DRenderer::build_glass_vibrancy_matrix(1.42, 1.05, 0.022);
+        // Apply row-vector [R, G, B, 1, 1] * M to neutral gray (0.5, 0.5, 0.5)
+        let gray_r = 0.5 * (m[0] + m[4] + m[8]) + m[16];
+        let gray_g = 0.5 * (m[1] + m[5] + m[9]) + m[17];
+        let gray_b = 0.5 * (m[2] + m[6] + m[10]) + m[18];
+        assert!(
+            (gray_r - gray_g).abs() < 1e-4 && (gray_g - gray_b).abs() < 1e-4,
+            "vibrancy matrix must preserve neutral gray balance: ({gray_r}, {gray_g}, {gray_b})"
+        );
+        // Apply to saturated red-orange (0.7, 0.25, 0.2) -> chroma spread (R - B) must grow > 1.35x!
+        let r_out = 0.7 * m[0] + 0.25 * m[4] + 0.2 * m[8] + m[16];
+        let b_out = 0.7 * m[2] + 0.25 * m[6] + 0.2 * m[10] + m[18];
+        assert!(
+            (r_out - b_out) > (0.7 - 0.2) * 1.35,
+            "vibrancy matrix must meaningfully enrich color saturation: spread={}",
+            r_out - b_out
+        );
+    }
+
+    #[test]
+    fn test_v026_radio_limit_inspector_copy_soundstage_bpm_and_search_editing() {
+        use am_light_lib::am_agent::AudioPrefs;
+        use am_light_lib::am_api::{clamp_station_next_tracks_limit, STATION_NEXT_TRACKS_MAX_LIMIT};
+        use am_light_lib::app_ui::{AppUi, PageRoute};
+        use am_light_lib::audio_viz::{LiveVisualizerSnapshot, StreamAudioSpecs, TempoTracker};
+        use am_light_lib::theme::RectF;
+        use am_light_lib::visualizers::{
+            format_expected_quality_lines, VisualizerState, VizHitAction, VizHitZone, VizStyle,
+        };
+
+        // 1. Radio station next-tracks API limit strictly clamped to <= 10 (fixes HTTP 400 Invalid Parameter Value)
+        assert_eq!(STATION_NEXT_TRACKS_MAX_LIMIT, 10);
+        assert_eq!(clamp_station_next_tracks_limit(15), 10);
+        assert_eq!(clamp_station_next_tracks_limit(25), 10);
+        assert_eq!(clamp_station_next_tracks_limit(10), 10);
+        assert_eq!(clamp_station_next_tracks_limit(0), 1);
+
+        // 2. Restrained 3-line Audio Inspector copy (`Playing \n 高解析度无损 \n 24-bit / 192 kHz · ALAC  @5440 kbps`)
+        let hires_spec = StreamAudioSpecs {
+            codec: "ALAC".to_string(),
+            codec_label: "ALAC (Apple Lossless)".to_string(),
+            tier_label: "Hi-Res 无损".to_string(),
+            sample_rate_hz: 192_000,
+            bit_depth: Some(24),
+            channels: "2.0 立体声".to_string(),
+            bitrate_kbps: 5440,
+            peak_bitrate_kbps: 6200,
+            uncompressed_pcm_kbps: Some(9216),
+            compression_ratio_pct: Some(59.0),
+            atmos_fallback_reason: None,
+            hires_catalog_trait: true,
+            available_variants: Vec::new(),
+        };
+        let prefs = AudioPrefs::default();
+        let snap = LiveVisualizerSnapshot::default();
+        let (l1, l2, l3) = format_expected_quality_lines(
+            "Playing",
+            Some(&hires_spec),
+            None,
+            &prefs,
+            &snap,
+        );
+        assert_eq!(l1, "Playing");
+        assert_eq!(l2, "高解析度无损");
+        assert_eq!(l3, "24-bit / 192 kHz · ALAC  @5440 kbps");
+
+        // 3. Soundstage defaults to blue monochrome (`soundstage_multicolor == false`) & toggles via click
+        let viz_def = VisualizerState::default();
+        assert!(
+            !viz_def.soundstage_multicolor,
+            "Soundstage must default to monochrome blue dots"
+        );
+        let mut ui = AppUi::new(0);
+        ui.route = PageRoute::Visualizer;
+        ui.viz_state.style = VizStyle::AudioInspector;
+        assert!(!ui.viz_state.soundstage_multicolor);
+        ui.viz_state.hit_zones.push(VizHitZone {
+            rect: RectF::new(20.0, 420.0, 400.0, 220.0),
+            action: VizHitAction::ToggleSoundstageColorMode,
+        });
+        let _ = ui.on_mouse_down(150.0, 500.0);
+        assert!(ui.on_mouse_up(150.0, 500.0));
+        assert!(
+            ui.viz_state.soundstage_multicolor,
+            "First click on Soundstage must switch to 5-band colors"
+        );
+        let _ = ui.on_mouse_down(150.0, 500.0);
+        assert!(ui.on_mouse_up(150.0, 500.0));
+        assert!(
+            !ui.viz_state.soundstage_multicolor,
+            "Second click on Soundstage must switch back to blue monochrome"
+        );
+
+        // 4. Upgraded SuperFlux + Hybrid Tempogram BPM accuracy on realistic pop backbeats,
+        //    192 kHz Hi-Res sample rate, and quiet -28 dBFS audio with vocal vibrato!
+        let synth_backbeat = |sr: u32, target_bpm: f32, gain: f32, add_vibrato: bool| -> f32 {
+            let mut tracker = TempoTracker::new(sr);
+            let beat_period = 60.0 / (target_bpm as f64);
+            let total_frames = (11.0 * sr as f64) as usize;
+            let mut pcm: Vec<[f32; 2]> = Vec::with_capacity(total_frames);
+            for n in 0..total_frames {
+                let t = (n as f64) / (sr as f64);
+                let beat_pos = t / beat_period;
+                let beat_idx = beat_pos.floor() as u64;
+                let within_beat = (beat_pos - beat_pos.floor()) * beat_period;
+
+                // Realistic Pop/Rock backbeat: Kick ONLY on beats 0 & 2, Snare ONLY on beats 1 & 3!
+                let kick = if beat_idx % 2 == 0 {
+                    let k_env = (-within_beat * 24.0).exp() as f32;
+                    let k_freq = 56.0 + 95.0 * (-within_beat * 50.0).exp();
+                    (2.0 * std::f64::consts::PI * k_freq * within_beat).sin() as f32 * k_env * 0.65
+                } else {
+                    0.0
+                };
+                let snare = if beat_idx % 2 == 1 {
+                    let s_env = (-within_beat * 22.0).exp() as f32;
+                    let noise = (((n as u64)
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1)
+                        >> 33) as f32
+                        / (u32::MAX as f32 / 2.0))
+                        - 1.0;
+                    let body = (2.0 * std::f64::consts::PI * 220.0 * within_beat).sin() as f32;
+                    (noise * 0.62 + body * 0.38) * s_env * 0.52
+                } else {
+                    0.0
+                };
+                // 8th-note light hi-hat
+                let eighth = ((beat_pos * 2.0).fract()) * (beat_period * 0.5);
+                let hat = (2.0 * std::f64::consts::PI * 7200.0 * t).sin() as f32
+                    * (-eighth * 70.0).exp() as f32
+                    * 0.10;
+                // Genuine continuous FM vocal/pad vibrato interference (440 ± 18 Hz @ 5.8 Hz)
+                let pad = if add_vibrato {
+                    let phase = 2.0 * std::f64::consts::PI * 440.0 * t
+                        + (18.0 / 5.8) * (2.0 * std::f64::consts::PI * 5.8 * t).sin();
+                    (phase.sin() as f32) * 0.18
+                } else {
+                    0.0
+                };
+                let s = ((kick + snare + hat + pad) * gain).clamp(-0.98, 0.98);
+                pcm.push([s, s]);
+            }
+            let chunk_sz = (sr as usize / 100).max(441);
+            for ch in pcm.chunks(chunk_sz) {
+                tracker.observe_stereo_pcm(ch);
+            }
+            tracker.locked_bpm
+        };
+
+        for &(sr, target, gain, vib, desc) in &[
+            (48_000u32, 92.0f32, 0.90f32, false, "48k pop backbeat 92 BPM"),
+            (48_000, 118.0, 0.90, true, "48k pop backbeat + vibrato 118 BPM"),
+            (48_000, 142.0, 0.90, true, "48k rock/jpop backbeat 142 BPM"),
+            (48_000, 172.0, 0.90, false, "48k anime/dnb fast backbeat 172 BPM"),
+            (192_000, 128.0, 0.90, true, "192k Hi-Res decimated 128 BPM"),
+            (48_000, 108.0, 0.04, true, "quiet -28 dBFS AGC + vibrato 108 BPM"),
+        ] {
+            let est = synth_backbeat(sr, target, gain, vib);
+            let err = (est - target).abs();
+            assert!(
+                err <= 1.8,
+                "TempoTracker v0.2.6 failed on {desc}: expected {target} BPM, got {est:.2} BPM (err={err:.2})"
+            );
+        }
+
+        // 5. Search box full text editing (`Ctrl+A`, `Ctrl+C`, `Ctrl+X`, `Ctrl+V`, arrows, Home/End, Delete, Shift+Select)
+        let mut sui = AppUi::new(0);
+        sui.search_focused = true;
+        for ch in "周杰伦 Jay".chars() {
+            assert!(sui.on_char_input(ch));
+        }
+        assert_eq!(sui.search_query, "周杰伦 Jay");
+        assert_eq!(sui.search_cursor, sui.search_query.len());
+
+        // Ctrl+A selects all, Ctrl+C copies full query
+        let (ok_a, clip_a) = sui.on_search_key_down(b'A' as u16, true, false);
+        assert!(ok_a && clip_a.is_none());
+        assert_eq!(sui.search_selection_range(), Some((0, sui.search_query.len())));
+        let (ok_c, clip_c) = sui.on_search_key_down(b'C' as u16, true, false);
+        assert!(ok_c && clip_c.as_deref() == Some("周杰伦 Jay"));
+
+        // Typing while all-selected replaces entire string cleanly
+        assert!(sui.on_char_input('晴'));
+        assert!(sui.on_char_input('天'));
+        assert_eq!(sui.search_query, "晴天");
+        assert_eq!(sui.search_selection_range(), None);
+
+        // Shift+Left selects last CJK character "天", Ctrl+X cuts it
+        let (ok_sl, _) = sui.on_search_key_down(0x25 /* VK_LEFT */, false, true);
+        assert!(ok_sl);
+        assert_eq!(sui.search_selected_text().as_deref(), Some("天"));
+        let (ok_x, clip_x) = sui.on_search_key_down(b'X' as u16, true, false);
+        assert!(ok_x && clip_x.as_deref() == Some("天"));
+        assert_eq!(sui.search_query, "晴");
+
+        // Paste inserts at cursor; Home + Delete removes first character
+        assert!(sui.on_paste_text("天 稻香"));
+        assert_eq!(sui.search_query, "晴天 稻香");
+        let (ok_home, _) = sui.on_search_key_down(0x24 /* VK_HOME */, false, false);
+        assert!(ok_home && sui.search_cursor == 0);
+        let (ok_del, _) = sui.on_search_key_down(0x2E /* VK_DELETE */, false, false);
+        assert!(ok_del);
+        assert_eq!(sui.search_query, "天 稻香");
+
+        // End + Ctrl+A + Backspace clears cleanly
+        let (ok_end, _) = sui.on_search_key_down(0x23 /* VK_END */, false, false);
+        assert!(ok_end && sui.search_cursor == sui.search_query.len());
+        let _ = sui.on_search_key_down(b'A' as u16, true, false);
+        assert!(sui.on_char_input('\u{08}'));
+        assert_eq!(sui.search_query, "");
+        assert_eq!(sui.search_cursor, 0);
     }
 }

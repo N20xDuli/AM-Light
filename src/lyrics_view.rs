@@ -2,9 +2,9 @@
 
 use crate::d2d_renderer::{D2DRenderer, GlassBtnVariant, LyricsLineBmpKey, SfIcon, TextAlign};
 use crate::lyrics::{
-    eval_frontier_glow_profile, eval_frontier_lift_weight, eval_frontier_scale_delta,
-    eval_frontier_wave_shear, should_use_frontier_lift, LyricCharUnit, LyricsAnimator,
-    LyricsSourcePref, NonEmphasisLyricsEffect, ParsedLyrics, Spring1D,
+    cjk_glow_density_scale, eval_frontier_glow_profile_ex, eval_frontier_lift_weight,
+    eval_frontier_scale_delta, eval_frontier_wave_shear, should_use_frontier_lift, LyricCharUnit,
+    LyricsAnimator, LyricsSourcePref, NonEmphasisLyricsEffect, ParsedLyrics, Spring1D,
 };
 use crate::motion_art::MotionFrameSnapshot;
 use crate::smtc::SmtcState;
@@ -303,9 +303,8 @@ impl LyricsViewState {
         } else {
             0.08
         };
-        if !reduce_motion {
-            self.mesh_phase = (self.mesh_phase + dt * speed) % 1000.0;
-        }
+        // Always advance flowing aurora phase so「减弱动态效果」/「降低透明度」never freeze the lyrics aurora!
+        self.mesh_phase = (self.mesh_phase + dt * speed) % 1000.0;
 
         if let Some(pal) = target_palette {
             let k = (dt * 2.4).clamp(0.01, 0.25);
@@ -375,6 +374,7 @@ impl LyricsViewState {
         non_emph_fx: NonEmphasisLyricsEffect,
         auto_emphasis: bool,
         frontier_wave: bool,
+        end_hold_glow: bool,
         sheet_alpha: f32,
         motion_frame: Option<&MotionFrameSnapshot>,
     ) {
@@ -468,10 +468,10 @@ impl LyricsViewState {
         let btn_h = Theme::TOP_BAR_H;
         let btn_r = Theme::TOP_BAR_RADIUS;
 
-        // Top-Left Close Chevron Circle
+        // Top-Left Close Chevron Circle (live refracting floating Liquid Glass!)
         let close_btn = RectF::new(win_rect.x + 20.0, top_y, btn_h, btn_h);
         let close_hov = close_btn.contains(hovered_pt.0, hovered_pt.1);
-        r.draw_liquid_glass_button(
+        r.draw_liquid_glass_floating_button(
             close_btn,
             btn_r,
             GlassBtnVariant::Regular,
@@ -507,7 +507,7 @@ impl LyricsViewState {
         ] {
             let wb = RectF::new(wx, top_y, btn_h, btn_h);
             let whov = wb.contains(hovered_pt.0, hovered_pt.1);
-            r.draw_liquid_glass_button(
+            r.draw_liquid_glass_floating_button(
                 wb,
                 btn_r,
                 if is_cls && whov {
@@ -942,6 +942,7 @@ impl LyricsViewState {
                     non_emph_fx,
                     auto_emphasis,
                     frontier_wave,
+                    end_hold_glow,
                     lyrics_col_alpha,
                 );
             } else if lyrics_loading {
@@ -1244,6 +1245,7 @@ impl LyricsViewState {
         non_emph_fx: NonEmphasisLyricsEffect,
         auto_emphasis: bool,
         frontier_wave: bool,
+        end_hold_glow: bool,
         col_alpha: f32,
     ) {
         r.set_lyrics_subpixel_text_mode(true);
@@ -1413,7 +1415,7 @@ impl LyricsViewState {
                     if let Some(pad_dip) =
                         r.begin_active_lyrics_glow_slot(slot, vocal_max_w, cl.total_h)
                     {
-                        let (peak, has_glow) = Self::bake_active_line_glyph_emission(
+                        let (peak, has_glow, cjk_frac) = Self::bake_active_line_glyph_emission(
                             r,
                             &cl.main_layout,
                             font_sz,
@@ -1430,12 +1432,20 @@ impl LyricsViewState {
                             non_emph_fx,
                             auto_emphasis,
                             frontier_wave,
+                            end_hold_glow,
                         );
                         if has_glow && peak > 0.005 {
-                            let inner_sigma = 3.6f32;
-                            let inner_alpha = (0.24 + peak * 0.26) * active_w * col_alpha * edge_fade;
-                            let outer_sigma = 8.8 + peak * 6.0;
-                            let outer_alpha = (0.20 + peak * 0.34) * active_w * col_alpha * edge_fade;
+                            // CJK ideographs pack ~3× denser strokes than Latin letters: keep the tight
+                            // inner halo whisper-soft & slightly wider so inner counters stay razor-sharp,
+                            // while preserving a lush atmospheric outer bloom!
+                            let cf = cjk_frac.clamp(0.0, 1.0);
+                            let vis_mul = active_w * col_alpha * edge_fade;
+                            let inner_sigma = 3.8 + 1.3 * cf;
+                            let inner_alpha =
+                                ((0.18 - 0.09 * cf) + peak * (0.18 - 0.08 * cf)) * vis_mul;
+                            let outer_sigma = (9.5 + 2.4 * cf) + peak * 5.8;
+                            let outer_alpha =
+                                ((0.18 - 0.04 * cf) + peak * (0.24 - 0.06 * cf)) * vis_mul;
                             r.finish_and_bake_active_lyrics_glow_slot(
                                 slot,
                                 inner_sigma,
@@ -1820,22 +1830,25 @@ impl LyricsViewState {
         non_emph_fx: NonEmphasisLyricsEffect,
         auto_emphasis: bool,
         frontier_wave: bool,
-    ) -> (f32, bool) {
+        end_hold_glow: bool,
+    ) -> (f32, bool, f32) {
         if char_units.is_empty() {
             if non_emph_fx.glow() {
                 r.draw_text_layout_subpixel(
                     layout,
                     local_x,
                     local_y,
-                    Color::rgba(255, 255, 255, 0.36 * active_w),
+                    Color::rgba(255, 255, 255, 0.28 * active_w),
                 );
-                return (0.25 * active_w, true);
+                return (0.22 * active_w, true, 0.5);
             }
-            return (0.0, false);
+            return (0.0, false, 0.0);
         }
 
         let mut peak_emphasis = 0.0f32;
         let mut has_any_glow = false;
+        let mut cjk_glow_weight = 0.0f32;
+        let mut total_glow_units = 0usize;
 
         for (c_idx, cu) in char_units.iter().enumerate() {
             if cu.utf16_len == 0 {
@@ -1874,19 +1887,27 @@ impl LyricsViewState {
             };
 
             let dur_factor = (((cu.word_dur_sec - 0.28) / 1.40).clamp(0.32, 1.0)) as f32;
-            let (body_a, peak_a, _tail_decay) = eval_frontier_glow_profile(
+            let (raw_body_a, raw_peak_a, _tail_decay) = eval_frontier_glow_profile_ex(
                 prog,
                 hold_after_end_sec,
                 decay_sec,
                 is_holding,
                 is_emph,
                 dur_factor,
+                end_hold_glow,
             );
+            let cjk_scale = cjk_glow_density_scale(&cu.ch_str);
+            let body_a = raw_body_a * cjk_scale;
+            let peak_a = raw_peak_a * cjk_scale;
             if body_a <= 0.01 && peak_a <= 0.015 {
                 continue;
             }
+            if cjk_scale < 0.85 {
+                cjk_glow_weight += 1.0;
+            }
+            total_glow_units += 1;
             peak_emphasis = peak_emphasis.max(
-                peak_a * if is_emph {
+                raw_peak_a * if is_emph {
                     0.35 + 0.65 * dur_factor
                 } else {
                     0.45
@@ -2054,7 +2075,12 @@ impl LyricsViewState {
             }
         }
         r.reset_transform();
-        (peak_emphasis, has_any_glow)
+        let cjk_frac = if total_glow_units == 0 {
+            0.0
+        } else {
+            (cjk_glow_weight / (total_glow_units as f32)).clamp(0.0, 1.0)
+        };
+        (peak_emphasis, has_any_glow, cjk_frac)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2431,7 +2457,7 @@ impl LyricsViewState {
             pill,
             18.0,
             16.0,
-            Color::rgba(36, 36, 44, 0.56),
+            Color::rgba(22, 24, 30, 0.32),
             Theme::GLASS_RIM_LIGHT,
             glass_off,
         );

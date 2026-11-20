@@ -4139,32 +4139,65 @@ pub async fn play_container_by_api(
             }
             // Play Apple Music stations natively through AMPLibraryAgent without ever launching
             // the official Apple Music desktop GUI (`musics://`).
+            // Note: Apple Music `POST /v1/me/stations/next-tracks/{id}` enforces `limit <= 10`;
+            // fetching 2 deduplicated batches of 10 yields a smooth ~18-20 song radio queue!
             let mut station_tracks: Vec<AgentTrackInput> = Vec::new();
-            if let Ok(next_json) = crate::am_api::fetch_station_next_tracks(
-                &clean_id,
-                user_token.clone(),
-                Some(sf.clone()),
-                15,
-            )
-            .await
-            {
+            let mut seen_ids = std::collections::HashSet::new();
+            for batch in 0..2 {
+                let Ok(next_json) = crate::am_api::fetch_station_next_tracks(
+                    &clean_id,
+                    user_token.clone(),
+                    Some(sf.clone()),
+                    crate::am_api::STATION_NEXT_TRACKS_MAX_LIMIT,
+                )
+                .await
+                else {
+                    break;
+                };
+                let mut batch_added = 0usize;
                 if let Some(arr) = next_json.get("data").and_then(Value::as_array) {
-                    station_tracks = arr
-                        .iter()
-                        .filter_map(|t| parse_track_from_am_json(t, None, None))
-                        .collect();
+                    for t in arr {
+                        if let Some(parsed) = parse_track_from_am_json(t, None, None) {
+                            let dedup_key = parsed.effective_adam_id();
+                            if seen_ids.insert(dedup_key) {
+                                station_tracks.push(parsed);
+                                batch_added += 1;
+                            }
+                        }
+                    }
+                }
+                if batch_added == 0 || (batch == 0 && station_tracks.len() < 4) {
+                    break;
                 }
             }
 
             if station_tracks.is_empty() {
-                // Fallback for catalog/live stations: inspect station metadata & related playable episodes/songs
-                let st_path = format!(
-                    "v1/catalog/{sf}/stations/{clean_id}?include=next-tracks&extend=audioTraits&l=zh-Hans-CN"
-                );
-                if let Ok(st_json) =
-                    crate::am_api::fetch_am_api(st_path, user_token.clone(), None, Some(sf.clone()))
-                        .await
-                {
+                // Fallback for live broadcast stations (`format == "stream"`, e.g. Apple Music 1 / Hits / Chill)
+                // or catalog stations: resolve metadata (with storefront fallback if `cn` lacks live catalog)
+                // and pull its official curated playlist / show tracks natively inside AM Light!
+                let mut st_json_opt: Option<Value> = None;
+                let mut resolved_sf = sf.clone();
+                for cand_sf in [sf.as_str(), "jp", "us"] {
+                    let st_path = format!(
+                        "v1/catalog/{cand_sf}/stations/{clean_id}?include=next-tracks&extend=audioTraits&l=zh-Hans-CN"
+                    );
+                    if let Ok(j) = crate::am_api::fetch_am_api(
+                        st_path,
+                        user_token.clone(),
+                        None,
+                        Some(cand_sf.to_string()),
+                    )
+                    .await
+                    {
+                        if j.pointer("/data/0").is_some() {
+                            st_json_opt = Some(j);
+                            resolved_sf = cand_sf.to_string();
+                            break;
+                        }
+                    }
+                }
+
+                if let Some(st_json) = st_json_opt {
                     let root = st_json.pointer("/data/0");
                     let st_name = root
                         .and_then(|r| r.pointer("/attributes/name"))
@@ -4193,51 +4226,80 @@ pub async fn play_container_by_api(
                             .collect();
                     }
 
-                    // For live broadcast radio (e.g. Apple Music 1 / Hits / Country), pull its
-                    // official curated playlist tracks natively so it still plays inside AM Light!
                     if station_tracks.is_empty() && !st_name.is_empty() {
-                        let enc: String =
-                            url::form_urlencoded::byte_serialize(st_name.as_bytes()).collect();
-                        let search_p = format!(
-                            "v1/catalog/{sf}/search?term={enc}&types=playlists,songs&limit=6&l=zh-Hans-CN"
-                        );
-                        if let Ok(sj) = crate::am_api::fetch_am_api(
-                            search_p,
-                            user_token.clone(),
-                            None,
-                            Some(sf.clone()),
-                        )
-                        .await
-                        {
-                            if let Some(pl_id) = sj
-                                .pointer("/results/playlists/data/0/id")
-                                .and_then(Value::as_str)
+                        // Build search terms from exact station name + concise fallback keyword for live channels
+                        let mut terms = vec![st_name.clone()];
+                        let lower = st_name.to_ascii_lowercase();
+                        if lower.contains("chill") {
+                            terms.push("Apple Music Chill".to_string());
+                            terms.push("Chill".to_string());
+                        } else if lower.contains("club") {
+                            terms.push("Dance".to_string());
+                        } else if lower.contains("country") {
+                            terms.push("Country".to_string());
+                        } else if lower.contains("holiday") || st_name.contains("节日") {
+                            terms.push("Holiday Hits".to_string());
+                        } else if lower.contains("música") || lower.contains("musica") {
+                            terms.push("Latin".to_string());
+                        } else if lower.contains("hits") {
+                            terms.push("Today's Hits".to_string());
+                        }
+
+                        'search_terms: for term in terms {
+                            let enc: String =
+                                url::form_urlencoded::byte_serialize(term.as_bytes()).collect();
+                            let search_p = format!(
+                                "v1/catalog/{resolved_sf}/search?term={enc}&types=playlists,songs&limit=8&l=zh-Hans-CN"
+                            );
+                            let Ok(sj) = crate::am_api::fetch_am_api(
+                                search_p,
+                                user_token.clone(),
+                                None,
+                                Some(resolved_sf.clone()),
+                            )
+                            .await
+                            else {
+                                continue;
+                            };
+
+                            if let Some(pls) = sj
+                                .pointer("/results/playlists/data")
+                                .and_then(Value::as_array)
                             {
-                                let pl_p = format!(
-                                    "v1/catalog/{sf}/playlists/{pl_id}?include=tracks&extend=audioTraits&l=zh-Hans-CN"
-                                );
-                                if let Ok(pj) = crate::am_api::fetch_am_api(
-                                    pl_p,
-                                    user_token.clone(),
-                                    None,
-                                    Some(sf.clone()),
-                                )
-                                .await
-                                {
-                                    if let Some(arr) = pj
-                                        .pointer("/data/0/relationships/tracks/data")
-                                        .and_then(Value::as_array)
+                                for pl in pls.iter().take(5) {
+                                    let Some(pl_id) = pl.get("id").and_then(Value::as_str) else {
+                                        continue;
+                                    };
+                                    let pl_p = format!(
+                                        "v1/catalog/{resolved_sf}/playlists/{pl_id}?include=tracks&extend=audioTraits&l=zh-Hans-CN"
+                                    );
+                                    if let Ok(pj) = crate::am_api::fetch_am_api(
+                                        pl_p,
+                                        user_token.clone(),
+                                        None,
+                                        Some(resolved_sf.clone()),
+                                    )
+                                    .await
                                     {
-                                        station_tracks = arr
-                                            .iter()
-                                            .filter_map(|t| {
-                                                parse_track_from_am_json(
-                                                    t,
-                                                    Some(&st_name),
-                                                    st_art.as_deref(),
-                                                )
-                                            })
-                                            .collect();
+                                        if let Some(arr) = pj
+                                            .pointer("/data/0/relationships/tracks/data")
+                                            .and_then(Value::as_array)
+                                        {
+                                            let parsed: Vec<AgentTrackInput> = arr
+                                                .iter()
+                                                .filter_map(|t| {
+                                                    parse_track_from_am_json(
+                                                        t,
+                                                        Some(&st_name),
+                                                        st_art.as_deref(),
+                                                    )
+                                                })
+                                                .collect();
+                                            if !parsed.is_empty() {
+                                                station_tracks = parsed;
+                                                break 'search_terms;
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -4256,6 +4318,9 @@ pub async fn play_container_by_api(
                                             )
                                         })
                                         .collect();
+                                    if !station_tracks.is_empty() {
+                                        break 'search_terms;
+                                    }
                                 }
                             }
                         }

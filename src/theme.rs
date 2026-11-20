@@ -135,11 +135,11 @@ impl Theme {
     pub const SIDEBAR_SELECTED: Color = Color::rgba(255, 255, 255, 0.095);
 
     /// Floating MiniPlayer & Floating Toolbar Liquid Glass tint (`liquid-glass.md › Regular`)
-    /// High-transmittance crystal optical glaze — avoids muddy gray opacity!
-    pub const GLASS_REGULAR_FILL: Color = Color::rgba(24, 26, 34, 0.38);
+    /// Ultra-clear Apple Tahoe crystal optical glaze — allows vibrant refracted covers to shine through!
+    pub const GLASS_REGULAR_FILL: Color = Color::rgba(20, 22, 28, 0.30);
     pub const GLASS_OPAQUE_FALLBACK: Color = Color::rgb(34, 34, 40);
     /// Specular 1px top/outer glass highlight rim
-    pub const GLASS_RIM_LIGHT: Color = Color::rgba(255, 255, 255, 0.30);
+    pub const GLASS_RIM_LIGHT: Color = Color::rgba(255, 255, 255, 0.38);
     pub const GLASS_RIM_SUBTLE: Color = Color::rgba(255, 255, 255, 0.12);
     /// Floating button circle (`<`, `Shuffle`, `+`, `•••`)
     pub const GLASS_BTN_FILL: Color = Color::rgba(34, 36, 46, 0.44);

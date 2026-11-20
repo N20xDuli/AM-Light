@@ -204,7 +204,7 @@ impl Default for LiveVisualizerSnapshot {
             inst_spectrum_low24_db: vec![-110.0; 256],
             peak_envelope_low24_db: vec![-110.0; 256],
             tier_code: "waiting".to_string(),
-            verdict_title: "等待音频输出...".to_string(),
+            verdict_title: "等待音频".to_string(),
             estimated_bitrate: "-".to_string(),
             confidence_pct: 0,
             forensic_notes: "开始播放后将实时采样输出信号，分析有效频谱上限、MDCT 子带连续度与量化位深特征。".to_string(),
@@ -575,12 +575,12 @@ impl ForensicAccumulator {
 
     pub fn detected_bit_grid_label(&self) -> String {
         if self.grid_total < 200 {
-            return "采样积累中...".to_string();
+            return "采样中".to_string();
         }
         match self.integer_grid_tier() {
-            Some(16) => "16-bit 整数无损网格".to_string(),
-            Some(24) => "24-bit 高精度整数网格".to_string(),
-            _ => "24/32-bit 浮点高精度".to_string(),
+            Some(16) => "16-bit PCM".to_string(),
+            Some(24) => "24-bit PCM".to_string(),
+            _ => "24/32-bit Float".to_string(),
         }
     }
 
@@ -682,10 +682,10 @@ impl ForensicAccumulator {
         if self.analyzed_frames < 4 {
             return (
                 "analyzing".to_string(),
-                "正在采集高频瞬态包络...".to_string(),
-                "采集中...".to_string(),
+                "分析中...".to_string(),
+                "--".to_string(),
                 ((self.analyzed_frames * 15) as u8).min(45),
-                "播放包含鼓点镲片或弦乐的段落（约 2–5 秒即可锁定有效频谱截止上限）。".to_string(),
+                "等待音频瞬态包络".to_string(),
                 0.0,
                 0.0,
                 false,
@@ -700,15 +700,11 @@ impl ForensicAccumulator {
         let holes = self.mdct_hole_ema;
 
         if nyquist > 26_000.0 && cutoff_hz >= 25_200.0 && holes < 26.0 {
-            let notes = format!(
-                "实测有效频宽延伸至 {:.1} kHz（突破 24 kHz 界限），高频连续无 MDCT 空洞（{:.1}%），符合 Hi-Res 无损特征。",
-                cutoff_hz / 1000.0,
-                holes
-            );
+            let notes = format!("有效频宽 {:.1} kHz · 空洞 {:.1}%", cutoff_hz / 1000.0, holes);
             return (
                 "hires_lossless".to_string(),
-                "Hi-Res 真无损音频 (24-bit / >48kHz)".to_string(),
-                "2,200 – 4,800+ kbps".to_string(),
+                "高解析度无损".to_string(),
+                "~2,200–4,800+ kbps".to_string(),
                 conf,
                 notes,
                 cutoff_hz,
@@ -726,20 +722,20 @@ impl ForensicAccumulator {
         if cutoff_hz >= cd_lossless_floor && holes < 28.0 {
             if cutoff_hz >= 23_150.0 {
                 let extra = if self.sample_rate <= 48_000 {
-                    "（当前声卡混音率为 48kHz，物理观测上限 24.0kHz）"
+                    " · 48k 上限"
                 } else {
                     ""
                 };
                 let notes = format!(
-                    "实测频谱平滑延伸至 {:.2} kHz，高频连续无编码空洞（{:.1}%），符合 ≥48kHz 无损特征。{}",
+                    "有效频宽 {:.1} kHz · 空洞 {:.1}%{}",
                     cutoff_hz / 1000.0,
                     holes,
                     extra
                 );
                 return (
                     "lossless_48k".to_string(),
-                    "真无损音频 (ALAC / FLAC ≥48kHz)".to_string(),
-                    "1,150 – 2,300 kbps".to_string(),
+                    "无损音频".to_string(),
+                    "~1,150–2,300 kbps".to_string(),
                     conf,
                     notes,
                     cutoff_hz,
@@ -747,15 +743,11 @@ impl ForensicAccumulator {
                     has_brickwall,
                 );
             } else {
-                let notes = format!(
-                    "实测频谱完整覆盖至 {:.2} kHz（吻合 44.1kHz CD 无损 22.05kHz 奈奎斯特上限），空洞率 {:.1}%。",
-                    cutoff_hz / 1000.0,
-                    holes
-                );
+                let notes = format!("有效频宽 {:.1} kHz · 空洞 {:.1}%", cutoff_hz / 1000.0, holes);
                 return (
                     "lossless_cd".to_string(),
-                    "CD 级真无损音频 (44.1kHz)".to_string(),
-                    "800 – 1,411 kbps".to_string(),
+                    "CD 无损".to_string(),
+                    "~800–1,411 kbps".to_string(),
                     conf,
                     notes,
                     cutoff_hz,
@@ -781,19 +773,14 @@ impl ForensicAccumulator {
             if !likely_20k_lossy_shelf {
                 if let Some(bits) = int_grid {
                     let est_br = if bits >= 24 {
-                        "1,100 – 2,300 kbps".to_string()
+                        "~1,100–2,300 kbps".to_string()
                     } else {
-                        "700 – 1,411 kbps".to_string()
+                        "~700–1,411 kbps".to_string()
                     };
-                    let notes = format!(
-                        "已检出 {bits}-bit 整数无损网格与 {:.1}% MDCT 空洞；当前钢琴/人声等声学段落呈自然谐波衰减（{:.2} kHz 缓降 {:.1} dB，无有损低通砖墙），待宽频打击乐进入后锁定全频上限。",
-                        holes,
-                        cutoff_hz / 1000.0,
-                        cliff_drop_db
-                    );
+                    let notes = format!("{bits}-bit PCM · 声学自然滚降");
                     return (
                         "lossless_acoustic".to_string(),
-                        format!("无损 PCM 音频 ({bits}-bit 声学段落)"),
+                        "无损 PCM".to_string(),
                         est_br,
                         conf.clamp(56, 82),
                         notes,
@@ -802,16 +789,11 @@ impl ForensicAccumulator {
                         false,
                     );
                 } else {
-                    let notes = format!(
-                        "当前段落高频呈自然谐波衰减（至 {:.2} kHz 缓降 {:.1} dB，未见编码器低通砖墙或 MDCT 空洞 {:.1}%），待鼓点镲片等宽频瞬态进入后完成定级。",
-                        cutoff_hz / 1000.0,
-                        cliff_drop_db,
-                        holes
-                    );
+                    let notes = format!("自然滚降 {:.1} kHz · 待宽频瞬态", cutoff_hz / 1000.0);
                     return (
                         "narrowband_analyzing".to_string(),
-                        "窄带声学段落 · 待宽频瞬态确认".to_string(),
-                        "待宽频段确认".to_string(),
+                        "声学段落".to_string(),
+                        "分析中".to_string(),
                         conf.min(58),
                         notes,
                         cutoff_hz,
@@ -823,23 +805,11 @@ impl ForensicAccumulator {
         }
 
         if cutoff_hz >= 19_650.0 {
-            let notes = if cutoff_hz < 21_750.0 {
-                format!(
-                    "在 {:.2} kHz 处检出高频滚降切线（落差 {:.1} dB），典型 AAC 256kbps / MP3 320kbps 特征。",
-                    cutoff_hz / 1000.0,
-                    cliff_drop_db
-                )
-            } else {
-                format!(
-                    "频宽达 {:.2} kHz，但 13–19 kHz 存在 MDCT 子带空洞（{:.1}%），典型高码率有损特征。",
-                    cutoff_hz / 1000.0,
-                    holes
-                )
-            };
+            let notes = format!("高频截断 {:.1} kHz · 落差 {:.1} dB", cutoff_hz / 1000.0, cliff_drop_db);
             return (
                 "lossy_high".to_string(),
-                "高码率有损音频 (AAC 256k / MP3 320k)".to_string(),
-                "256 – 320 kbps".to_string(),
+                "高码率有损".to_string(),
+                "~256–320 kbps".to_string(),
                 conf,
                 notes,
                 cutoff_hz,
@@ -849,15 +819,11 @@ impl ForensicAccumulator {
         }
 
         if cutoff_hz >= 18_300.0 {
-            let notes = format!(
-                "在 {:.2} kHz 检出低通截断（陡降 {:.1} dB），符合 192–256 kbps 有损流特征。",
-                cutoff_hz / 1000.0,
-                cliff_drop_db
-            );
+            let notes = format!("高频截断 {:.1} kHz · 落差 {:.1} dB", cutoff_hz / 1000.0, cliff_drop_db);
             return (
                 "lossy_mid".to_string(),
-                "中高码率有损 (AAC 192k / MP3 224k)".to_string(),
-                "192 – 256 kbps".to_string(),
+                "中等有损".to_string(),
+                "~192–256 kbps".to_string(),
                 conf,
                 notes,
                 cutoff_hz,
@@ -867,15 +833,11 @@ impl ForensicAccumulator {
         }
 
         if cutoff_hz >= 16_600.0 {
-            let notes = format!(
-                "在 {:.2} kHz 处出现砖墙截断（陡降 {:.1} dB），属于 128–192 kbps 标准有损音频。",
-                cutoff_hz / 1000.0,
-                cliff_drop_db
-            );
+            let notes = format!("砖墙截断 {:.1} kHz · 落差 {:.1} dB", cutoff_hz / 1000.0, cliff_drop_db);
             return (
                 "lossy_mid".to_string(),
-                "中等码率有损 (128 – 192 kbps)".to_string(),
-                "128 – 192 kbps".to_string(),
+                "标准有损".to_string(),
+                "~128–192 kbps".to_string(),
                 conf,
                 notes,
                 cutoff_hz,
@@ -884,15 +846,11 @@ impl ForensicAccumulator {
             );
         }
 
-        let notes = format!(
-            "高频能量在 {:.2} kHz 提前截断（陡降 {:.1} dB），属于 ≤128 kbps 有损或转码音频。",
-            cutoff_hz / 1000.0,
-            cliff_drop_db
-        );
+        let notes = format!("砖墙截断 {:.1} kHz · 落差 {:.1} dB", cutoff_hz / 1000.0, cliff_drop_db);
         (
             "lossy_low".to_string(),
-            "低码率有损音频 (≤128 kbps)".to_string(),
-            "64 – 128 kbps".to_string(),
+            "低码率有损".to_string(),
+            "≤128 kbps".to_string(),
             conf,
             notes,
             cutoff_hz,
@@ -1507,29 +1465,39 @@ impl Default for SharedForensicSummary {
     }
 }
 
-/// Studio-grade real-time Tempo & Beat Phase Tracker:
-/// 1. Sample-clocked 1024-pt STFT (512/1024 hop -> ~90 Hz exact hop clock, immune to UI FPS jitter)
-/// 2. 6-Band Log-Compressed Spectral Flux Onset Envelope + adaptive local threshold
-/// 3. Normalized Autocorrelation + 4-Harmonic Resonant Comb-Filter Bank (66..196 BPM @ 0.5 BPM step)
-///    with perceptual tempo prior, octave/half-time disambiguation, and parabolic peak refinement
-/// 4. Phase-Locked Loop (PLL) beat phase oscillator (`0.0..1.0`) for crisp osu!-style emblem bounce!
+/// Studio-grade real-time Tempo & Beat Phase Tracker (`v0.2.6` SuperFlux + Hybrid Tempogram):
+/// 1. Continuous boxcar anti-aliased decimator (exact `100.0 Hz` hop rate across `44.1..384 kHz`!)
+/// 2. 2048-pt Hann STFT (`~23.4 Hz` resolution) + volume-independent RMS AGC
+/// 3. 36-Band Log-Spaced Böck SuperFlux Onset Envelope (vibrato suppression + balanced Kick/Snare weighting)
+/// 4. 8.2s Rolling Window Hybrid Unbiased Autocorrelation Comb × Complex Fourier Tempogram (`60..196 BPM`)
+/// 5. Decayed Bayesian Tempo Belief Histogram + Direct Onset-Grid Hit-Fraction Octave Disambiguation
+/// 6. Fourier-Phase-Guided PLL Beat Oscillator (`0.0..1.0`) for crisp osu!-style emblem bounce!
 pub struct TempoTracker {
     sample_rate: u32,
-    hop_samples: usize,
+    decim: usize,
+    decim_acc: f32,
+    decim_cnt: usize,
+    hop_eff_samples: usize,
     hop_hz: f32,
-    pcm_ring: [f32; 1024],
+    pcm_ring: [f32; 2048],
     pcm_write: usize,
-    samples_since_hop: usize,
-    hann_1024: Vec<f32>,
+    eff_samples_since_hop: usize,
+    hann_2048: Vec<f32>,
     fft_re: Vec<f32>,
     fft_im: Vec<f32>,
-    prev_log_bands: [f32; 6],
-    local_flux_mean: f32,
+    band_bounds: [(usize, usize, f32, bool); Self::NUM_BANDS],
+    prev_log: [[f32; Self::NUM_BANDS]; 4],
+    agc_rms: f32,
+    flux_window: VecDeque<f32>,
     local_onset_peak: f32,
     onset_hist: VecDeque<f32>,
+    tempo_belief: [f32; Self::NUM_CANDS],
     hops_since_eval: usize,
+    eval_count: u32,
     candidate_streak_bpm: f32,
     candidate_streak_cnt: u8,
+    fourier_phase_anchor: f32,
+    has_fourier_phase: bool,
     pub locked_bpm: f32,
     pub confidence: f32,
     pub beat_phase: f32,
@@ -1538,33 +1506,76 @@ pub struct TempoTracker {
 }
 
 impl TempoTracker {
-    const HIST_CAP: usize = 512;
+    const HIST_CAP: usize = 820; // 8.2 seconds @ exact 100 Hz
+    const NUM_BANDS: usize = 36;
+    const MIN_BPM: f32 = 60.0;
+    const BPM_STEP: f32 = 0.5;
+    const NUM_CANDS: usize = 273; // 60.0 ..= 196.0 BPM @ 0.5 BPM step
 
     pub fn new(sample_rate: u32) -> Self {
         let sr = sample_rate.clamp(8_000, 384_000);
-        let hop_samples = ((sr as f32 / 92.0).round() as usize).clamp(256, 4096);
-        let hop_hz = (sr as f32) / (hop_samples as f32);
-        let mut hann = vec![0.0f32; 1024];
+        let decim = ((sr as f32 / 48_000.0).round() as usize).clamp(1, 8);
+        let eff_sr = (sr as f32) / (decim as f32);
+        let hop_eff_samples = ((eff_sr / 100.0).round() as usize).clamp(128, 1024);
+        let hop_hz = eff_sr / (hop_eff_samples as f32);
+
+        let mut hann = vec![0.0f32; 2048];
         for (i, w) in hann.iter_mut().enumerate() {
-            *w = 0.5 * (1.0 - (2.0 * PI * (i as f32) / 1023.0).cos());
+            *w = 0.5 * (1.0 - (2.0 * PI * (i as f32) / 2047.0).cos());
         }
+
+        // Build 36 log-spaced perceptual bands (36 Hz .. 11.5 kHz) with balanced Kick + Snare weights
+        let bin_hz = eff_sr / 2048.0;
+        let f_min = 36.0f32;
+        let f_max = 11_500.0f32.min(eff_sr * 0.45);
+        let ratio = (f_max / f_min).powf(1.0 / (Self::NUM_BANDS as f32));
+        let mut band_bounds = [(1usize, 2usize, 1.0f32, false); Self::NUM_BANDS];
+        for b in 0..Self::NUM_BANDS {
+            let f0 = f_min * ratio.powi(b as i32);
+            let f1 = f0 * ratio;
+            let fc = (f0 * f1).sqrt();
+            let k0 = ((f0 / bin_hz).floor() as usize).clamp(1, 1022);
+            let k1 = ((f1 / bin_hz).ceil() as usize).clamp(k0 + 1, 1023);
+            let (weight, is_perc) = if fc < 130.0 {
+                (1.45, true) // Sub-kick & kick fundamental
+            } else if fc < 235.0 {
+                (1.22, true) // Kick punch / low snare thump
+            } else if fc < 1850.0 {
+                (0.56, false) // Vocals / pads / melody (kept gentle so singing & vibrato never distort beat!)
+            } else if fc < 6200.0 {
+                (1.25, true) // Snare crack & percussive attack (balances kick on 1&3 vs snare on 2&4!)
+            } else {
+                (0.52, false) // Hi-hat shimmer (restrained so 16th hats don't pull double-time!)
+            };
+            band_bounds[b] = (k0, k1, weight, is_perc);
+        }
+
         Self {
             sample_rate: sr,
-            hop_samples,
+            decim,
+            decim_acc: 0.0,
+            decim_cnt: 0,
+            hop_eff_samples,
             hop_hz,
-            pcm_ring: [0.0; 1024],
+            pcm_ring: [0.0; 2048],
             pcm_write: 0,
-            samples_since_hop: 0,
-            hann_1024: hann,
-            fft_re: vec![0.0; 1024],
-            fft_im: vec![0.0; 1024],
-            prev_log_bands: [0.0; 6],
-            local_flux_mean: 0.0,
-            local_onset_peak: 0.08,
+            eff_samples_since_hop: 0,
+            hann_2048: hann,
+            fft_re: vec![0.0; 2048],
+            fft_im: vec![0.0; 2048],
+            band_bounds,
+            prev_log: [[0.0; Self::NUM_BANDS]; 4],
+            agc_rms: 0.08,
+            flux_window: VecDeque::with_capacity(40),
+            local_onset_peak: 0.12,
             onset_hist: VecDeque::with_capacity(Self::HIST_CAP + 4),
+            tempo_belief: [0.0; Self::NUM_CANDS],
             hops_since_eval: 0,
+            eval_count: 0,
             candidate_streak_bpm: 120.0,
             candidate_streak_cnt: 0,
+            fourier_phase_anchor: 0.0,
+            has_fourier_phase: false,
             locked_bpm: 120.0,
             confidence: 0.0,
             beat_phase: 0.0,
@@ -1581,97 +1592,155 @@ impl TempoTracker {
     }
 
     pub fn reset(&mut self) {
-        self.pcm_ring = [0.0; 1024];
+        self.decim_acc = 0.0;
+        self.decim_cnt = 0;
+        self.pcm_ring = [0.0; 2048];
         self.pcm_write = 0;
-        self.samples_since_hop = 0;
-        self.prev_log_bands = [0.0; 6];
-        self.local_flux_mean = 0.0;
-        self.local_onset_peak = 0.08;
+        self.eff_samples_since_hop = 0;
+        self.prev_log = [[0.0; Self::NUM_BANDS]; 4];
+        self.agc_rms = 0.08;
+        self.flux_window.clear();
+        self.local_onset_peak = 0.12;
         self.onset_hist.clear();
+        self.tempo_belief = [0.0; Self::NUM_CANDS];
         self.hops_since_eval = 0;
+        self.eval_count = 0;
         self.candidate_streak_cnt = 0;
+        self.has_fourier_phase = false;
         self.confidence = 0.0;
         self.refractory_hops = 0;
     }
 
     pub fn observe_stereo_pcm(&mut self, samples_lr: &[[f32; 2]]) {
-        let decim = (self.hop_samples / 512).max(1);
-        for (idx, &[l, r]) in samples_lr.iter().enumerate() {
-            if idx % decim == 0 {
-                self.pcm_ring[self.pcm_write] = 0.5 * (l + r);
-                self.pcm_write = (self.pcm_write + 1) & 1023;
-            }
-            self.samples_since_hop += 1;
-            if self.samples_since_hop >= self.hop_samples {
-                self.samples_since_hop = 0;
-                self.process_hop();
+        let inv_decim = 1.0 / (self.decim as f32);
+        for &[l, r] in samples_lr {
+            self.decim_acc += 0.5 * (l + r);
+            self.decim_cnt += 1;
+            if self.decim_cnt >= self.decim {
+                let s = self.decim_acc * inv_decim;
+                self.decim_acc = 0.0;
+                self.decim_cnt = 0;
+                self.pcm_ring[self.pcm_write] = s;
+                self.pcm_write = (self.pcm_write + 1) & 2047;
+                self.eff_samples_since_hop += 1;
+                if self.eff_samples_since_hop >= self.hop_eff_samples {
+                    self.eff_samples_since_hop = 0;
+                    self.process_hop();
+                }
             }
         }
     }
 
     fn process_hop(&mut self) {
-        for i in 0..1024 {
-            let s = self.pcm_ring[(self.pcm_write + i) & 1023];
-            self.fft_re[i] = s * self.hann_1024[i];
-            self.fft_im[i] = 0.0;
+        let mut sum_sq = 0.0f32;
+        for i in 0..2048 {
+            let s = self.pcm_ring[(self.pcm_write + i) & 2047];
+            sum_sq += s * s;
+            self.fft_re[i] = s;
         }
-        fft_radix2_in_place(&mut self.fft_re, &mut self.fft_im);
+        let frame_rms = (sum_sq / 2048.0).sqrt();
 
-        let eff_sr = (self.sample_rate as f32) / ((self.hop_samples / 512).max(1) as f32);
-        let bin_hz = eff_sr / 1024.0;
-        let norm = 2.0 / 512.0;
+        let onset = if frame_rms < 1.6e-4 {
+            self.prev_log.rotate_right(1);
+            self.prev_log[0] = [0.0; Self::NUM_BANDS];
+            0.0
+        } else {
+            // Volume-independent online RMS AGC so -34 dBFS quiet tracks and -4 dBFS EDM match identically!
+            let rms_rate = if frame_rms > self.agc_rms { 0.04 } else { 0.012 };
+            self.agc_rms = (self.agc_rms + (frame_rms - self.agc_rms) * rms_rate).max(0.002);
+            let agc_gain = (0.16 / self.agc_rms).clamp(0.25, 45.0);
 
-        const BANDS: [(f32, f32, f32); 6] = [
-            (35.0, 95.0, 1.55),     // Sub-Kick
-            (95.0, 210.0, 1.32),    // Upper-Kick / Bass Punch
-            (210.0, 560.0, 0.92),   // Snare Body / Low-Mid
-            (560.0, 1850.0, 1.05),  // Vocal & Chord Transients
-            (1850.0, 4800.0, 1.18), // Snare Crack / Percussive Presence
-            (4800.0, 12500.0, 0.72), // Hi-Hat / Cymbal Attack
-        ];
-
-        let mut flux = 0.0f32;
-        for (bi, &(f0, f1, w)) in BANDS.iter().enumerate() {
-            let b0 = ((f0 / bin_hz).floor() as usize).clamp(1, 510);
-            let b1 = ((f1 / bin_hz).ceil() as usize).clamp(b0 + 1, 511);
-            let mut energy = 0.0f32;
-            for k in b0..b1 {
-                let m = (self.fft_re[k] * self.fft_re[k] + self.fft_im[k] * self.fft_im[k]).sqrt()
-                    * norm;
-                energy += m;
+            for i in 0..2048 {
+                self.fft_re[i] *= agc_gain * self.hann_2048[i];
+                self.fft_im[i] = 0.0;
             }
-            energy /= (b1 - b0) as f32;
-            let log_e = (1.0 + 36.0 * energy).ln();
-            let diff = (log_e - self.prev_log_bands[bi]).max(0.0);
-            self.prev_log_bands[bi] = log_e;
-            flux += w * diff;
-        }
+            fft_radix2_in_place(&mut self.fft_re, &mut self.fft_im);
 
-        // Adaptive local moving mean subtraction -> clean percussive onset spikes
-        self.local_flux_mean = self.local_flux_mean * 0.90 + flux * 0.10;
-        let onset = (flux - self.local_flux_mean * 1.12).max(0.0);
-        self.local_onset_peak = (self.local_onset_peak * 0.985).max(onset).max(0.04);
+            let norm = 2.0 / 1024.0;
+            let mut cur_log = [0.0f32; Self::NUM_BANDS];
+            let mut perc_flux = 0.0f32;
+            let mut perc_w = 0.0f32;
+            let mut full_flux = 0.0f32;
+            let mut full_w = 0.0f32;
 
+            for b in 0..Self::NUM_BANDS {
+                let (k0, k1, w, is_perc) = self.band_bounds[b];
+                let mut e2 = 0.0f32;
+                for k in k0..k1 {
+                    let re = self.fft_re[k];
+                    let im = self.fft_im[k];
+                    e2 += re * re + im * im;
+                }
+                let rms_mag = (e2 / ((k1 - k0) as f32)).sqrt() * norm;
+                let lg = (1.0 + 90.0 * rms_mag).ln();
+                cur_log[b] = lg;
+
+                // Böck & Widmer 2013 SuperFlux vibrato suppression:
+                // compare against 3-band spectral neighborhood max over prior 4 hops (40 ms window)
+                let nb_lo = b.saturating_sub(1);
+                let nb_hi = (b + 1).min(Self::NUM_BANDS - 1);
+                let mut prev_max = 0.0f32;
+                for lag_f in 0..4 {
+                    for nb in nb_lo..=nb_hi {
+                        prev_max = prev_max.max(self.prev_log[lag_f][nb]);
+                    }
+                }
+                let diff = (lg - prev_max).max(0.0);
+                full_flux += w * diff;
+                full_w += w;
+                if is_perc {
+                    perc_flux += w * diff;
+                    perc_w += w;
+                }
+            }
+            self.prev_log.rotate_right(1);
+            self.prev_log[0] = cur_log;
+
+            let raw_flux = 0.66 * (perc_flux / perc_w.max(1e-4))
+                + 0.34 * (full_flux / full_w.max(1e-4));
+
+            // Causal local moving-average subtraction (~360 ms window)
+            if self.flux_window.len() >= 36 {
+                self.flux_window.pop_front();
+            }
+            self.flux_window.push_back(raw_flux);
+            let win_mean = self.flux_window.iter().copied().sum::<f32>()
+                / (self.flux_window.len().max(1) as f32);
+            (raw_flux - win_mean * 1.04).max(0.0)
+        };
+
+        self.local_onset_peak = (self.local_onset_peak * 0.988).max(onset).max(0.06);
         if self.onset_hist.len() >= Self::HIST_CAP {
             self.onset_hist.pop_front();
         }
         self.onset_hist.push_back(onset);
 
-        // Advance PLL beat oscillator & phase-align to strong real musical onsets
+        // Advance beat-phase PLL oscillator & align smoothly to musical beats
         let hop_dt = 1.0 / self.hop_hz.max(20.0);
-        let prev_phase = self.beat_phase;
         self.beat_phase += hop_dt * (self.locked_bpm / 60.0);
         self.refractory_hops = self.refractory_hops.saturating_sub(1);
 
-        let min_refrac = (self.hop_hz * 0.22) as usize;
-        let strong_hit = onset > self.local_onset_peak * 0.42 && onset > 0.035;
+        let beat_hops = (self.hop_hz * 60.0 / self.locked_bpm.max(55.0)).round() as usize;
+        let min_refrac = ((beat_hops as f32) * 0.56).round().clamp(16.0, 48.0) as usize;
+        let strong_hit = onset > self.local_onset_peak * 0.44 && onset > 0.04;
         if strong_hit {
-            // Wrap phase error into [-0.5, +0.5] around beat boundary 0.0 / 1.0
             let frac = self.beat_phase.rem_euclid(1.0);
             let err = if frac > 0.5 { frac - 1.0 } else { frac };
-            if err.abs() < 0.30 {
-                self.beat_phase -= err * 0.34;
+            if err.abs() < 0.24 {
+                self.beat_phase -= err * 0.26;
             }
+        }
+        if self.has_fourier_phase {
+            // Gentle lock toward the global Fourier beat phase so off-beats never drift the PLL
+            let mut ferr = self.beat_phase.rem_euclid(1.0) - self.fourier_phase_anchor;
+            if ferr > 0.5 {
+                ferr -= 1.0;
+            } else if ferr < -0.5 {
+                ferr += 1.0;
+            }
+            self.beat_phase -= ferr * 0.06;
+            self.fourier_phase_anchor =
+                (self.fourier_phase_anchor + hop_dt * (self.locked_bpm / 60.0)).rem_euclid(1.0);
         }
 
         let wrapped = self.beat_phase >= 1.0;
@@ -1679,50 +1748,69 @@ impl TempoTracker {
             self.beat_phase = self.beat_phase.rem_euclid(1.0);
         }
 
-        let near_downbeat = self.beat_phase < 0.14 || self.beat_phase > 0.88;
-        if self.refractory_hops == 0 && ((wrapped && self.local_onset_peak > 0.045) || (strong_hit && near_downbeat)) {
+        let near_downbeat = self.beat_phase < 0.12 || self.beat_phase > 0.90;
+        if self.refractory_hops == 0
+            && ((wrapped && self.local_onset_peak > 0.065) || (strong_hit && near_downbeat))
+        {
             self.beat_seq = self.beat_seq.wrapping_add(1);
             self.refractory_hops = min_refrac;
             if strong_hit && !wrapped {
                 self.beat_phase = 0.02;
             }
         }
-        let _ = prev_phase;
 
         self.hops_since_eval += 1;
-        if self.hops_since_eval >= 14 && self.onset_hist.len() >= 128 {
+        if self.hops_since_eval >= 24 && self.onset_hist.len() >= 180 {
             self.hops_since_eval = 0;
-            self.evaluate_autocorr_comb_tempo();
+            self.evaluate_hybrid_tempogram();
         }
     }
 
-    fn evaluate_autocorr_comb_tempo(&mut self) {
+    fn evaluate_hybrid_tempogram(&mut self) {
         let m = self.onset_hist.len();
-        if m < 128 {
+        if m < 180 {
             return;
         }
-        let mut x = vec![0.0f32; m];
-        let mut sum = 0.0f32;
+
+        // Recency-tapered onset signal: recent bars count more while preserving full 8.2s stability
+        let mut raw = vec![0.0f32; m];
+        let mut raw_taper = vec![0.0f32; m];
+        let mut raw_sum = 0.0f32;
+        let mut w_mean_num = 0.0f32;
+        let mut w_den = 0.0f32;
+        let inv_m = 1.0 / (m as f32);
         for (i, &v) in self.onset_hist.iter().enumerate() {
-            x[i] = v;
-            sum += v;
+            let w = 0.58 + 0.42 * ((i as f32) * inv_m);
+            raw[i] = v;
+            raw_taper[i] = v * w;
+            raw_sum += v * w;
+            w_mean_num += v * w;
+            w_den += w;
         }
-        let mean = sum / (m as f32);
+        if raw_sum < 1.2 {
+            return;
+        }
+
+        let mean = w_mean_num / w_den.max(1e-6);
+        let mut x = vec![0.0f32; m];
         let mut energy_0 = 0.0f32;
-        for v in &mut x {
-            *v -= mean;
-            energy_0 += (*v) * (*v);
+        for i in 0..m {
+            let w = 0.58 + 0.42 * ((i as f32) * inv_m);
+            let v = (raw[i] - mean) * w;
+            x[i] = v;
+            energy_0 += v * v;
         }
         if energy_0 < 1e-5 {
             return;
         }
 
-        let max_lag = (m - 16).min(((self.hop_hz * 60.0 / 32.0).ceil() as usize).max(64));
-        let min_lag = ((self.hop_hz * 60.0 / 210.0).floor() as usize).clamp(8, max_lag - 4);
+        // 1. Unbiased normalized autocorrelation with >= m/3 overlap guard (eliminates noisy long-lag spikes)
+        let max_lag = ((m * 2) / 3).min(((self.hop_hz * 60.0 / 14.5).ceil() as usize).max(120));
+        let min_lag = ((self.hop_hz * 60.0 / 220.0).floor() as usize).clamp(12, max_lag - 4);
         let mut acf = vec![0.0f32; max_lag + 2];
-        for lag in (min_lag / 2).max(4)..=max_lag {
+        for lag in (min_lag / 2).max(10)..=max_lag {
             let cnt = m - lag;
-            if cnt < 24 {
+            if cnt < (m / 3).max(48) {
                 break;
             }
             let mut acc = 0.0f32;
@@ -1745,125 +1833,309 @@ impl TempoTracker {
 
         let sample_acf = |lag_f: f32| -> f32 {
             let l0 = lag_f.floor() as isize;
-            if l0 < 4 || (l0 as usize + 1) >= acf.len() {
+            if l0 < 10 || (l0 as usize + 1) >= acf.len() {
                 return 0.0;
             }
             let frac = lag_f - (l0 as f32);
             acf[l0 as usize] * (1.0 - frac) + acf[l0 as usize + 1] * frac
         };
 
-        // Sweep 66.0 .. 196.0 BPM at 0.5 BPM resolution (261 candidates)
-        const NUM_CANDS: usize = 261;
-        let mut raw_comb = [0.0f32; NUM_CANDS];
-        let mut weighted = [0.0f32; NUM_CANDS];
+        // 2. Hybrid ACF Comb × Complex Fourier Tempogram over 60.0 ..= 196.0 BPM
+        let mut inst_hybrid = [0.0f32; Self::NUM_CANDS];
+        let mut fourier_phases = [0.0f32; Self::NUM_CANDS];
+        let inv_raw_sum = 1.0 / raw_sum.max(1e-5);
+        let mut peak_inst = 0.0f32;
+        let mut sum_inst = 0.0f32;
 
-        for idx in 0..NUM_CANDS {
-            let bpm = 66.0 + (idx as f32) * 0.5;
+        for idx in 0..Self::NUM_CANDS {
+            let bpm = Self::MIN_BPM + (idx as f32) * Self::BPM_STEP;
             let tau = self.hop_hz * 60.0 / bpm;
 
-            // 4-Harmonic Pulse-Train Comb Filter + Eighth-Note Subdivision Support
+            // 4-Harmonic ACF Comb
             let mut comb_sum = 0.0f32;
             let mut w_sum = 0.0f32;
-            for &(mult, hw) in &[(1.0f32, 1.00f32), (2.0, 0.58), (3.0, 0.36), (4.0, 0.22)] {
+            for &(mult, hw) in &[(1.0f32, 1.00f32), (2.0, 0.72), (3.0, 0.44), (4.0, 0.30)] {
                 let lt = tau * mult;
                 if (lt as usize + 2) < acf.len() {
-                    comb_sum += hw * sample_acf(lt).max(-0.25);
+                    comb_sum += hw * sample_acf(lt).max(-0.20);
                     w_sum += hw;
                 }
             }
             if w_sum <= 0.0 {
                 continue;
             }
-            let mut c_score = (comb_sum / w_sum).max(0.0);
-            // Gentle sub-beat reinforcement without letting B/2 steal B's main beat energy
-            if tau * 0.5 >= 5.0 {
-                c_score += 0.07 * sample_acf(tau * 0.5).max(0.0);
-            }
-            raw_comb[idx] = c_score;
+            let comb_score = (comb_sum / w_sum).max(0.0);
 
-            // Perceptual Log-Gaussian Tempo Prior centered around 124 BPM (Ellis 2007 human tactus prior)
-            let log_ratio = (bpm / 124.0).ln() / 0.35;
-            let prior = (-0.5 * log_ratio * log_ratio).exp();
-            // Gentle continuity lock around already-established tempo
-            let cont = if self.confidence > 0.35 {
-                let d = (bpm - self.locked_bpm).abs();
-                1.0 + 0.14 * (-d * d / 18.0).exp()
-            } else {
-                1.0
-            };
-            weighted[idx] = c_score * (0.58 + 0.42 * prior) * cont;
+            // Fast recurrence Complex Fourier Tempogram (fundamental + 2nd harmonic)
+            let omega = 2.0 * PI / tau;
+            let (s1, c1) = omega.sin_cos();
+            let (s2, c2) = (2.0 * omega).sin_cos();
+            let mut cos_n1 = 1.0f32;
+            let mut sin_n1 = 0.0f32;
+            let mut cos_n2 = 1.0f32;
+            let mut sin_n2 = 0.0f32;
+            let mut re1 = 0.0f32;
+            let mut im1 = 0.0f32;
+            let mut re2 = 0.0f32;
+            let mut im2 = 0.0f32;
+            for &v in &raw_taper {
+                re1 += v * cos_n1;
+                im1 -= v * sin_n1;
+                re2 += v * cos_n2;
+                im2 -= v * sin_n2;
+                let nc1 = cos_n1 * c1 - sin_n1 * s1;
+                sin_n1 = sin_n1 * c1 + cos_n1 * s1;
+                cos_n1 = nc1;
+                let nc2 = cos_n2 * c2 - sin_n2 * s2;
+                sin_n2 = sin_n2 * c2 + cos_n2 * s2;
+                cos_n2 = nc2;
+            }
+            let mag1 = (re1 * re1 + im1 * im1).sqrt() * inv_raw_sum;
+            let mag2 = (re2 * re2 + im2 * im2).sqrt() * inv_raw_sum;
+            let ft_score = (0.74 * mag1 + 0.26 * mag2).clamp(0.0, 1.0);
+
+            // Current phase at tail sample (m - 1) in [0.0, 1.0)
+            let phi0 = (-im1).atan2(re1); // peak onset occurs when omega * t == phi0
+            let tail_phase = ((((m as f32) * omega - phi0) / (2.0 * PI))).rem_euclid(1.0);
+            fourier_phases[idx] = tail_phase;
+
+            let h_score = comb_score * (0.35 + 0.65 * ft_score);
+            inst_hybrid[idx] = h_score;
+            if h_score > peak_inst {
+                peak_inst = h_score;
+            }
+            sum_inst += h_score;
         }
 
-        let mut best_i = 0usize;
-        let mut best_val = 0.0f32;
-        for (i, &v) in weighted.iter().enumerate() {
-            if v > best_val {
-                best_val = v;
-                best_i = i;
-            }
-        }
-        if best_val < 0.08 {
+        if peak_inst < 0.045 {
             return;
         }
 
+        // 3. Accumulate decayed Bayesian Tempo Belief distribution (prevents brief drum fills or vocal intros from jerking BPM)
+        self.eval_count = self.eval_count.saturating_add(1);
+        let mean_inst = sum_inst / (Self::NUM_CANDS as f32);
+        let snr = ((peak_inst / (mean_inst + 1e-5)) - 1.25).clamp(0.0, 4.5) / 4.5;
+        let decay = if m < 320 { 0.72 } else { 0.85 };
+        let gain = 0.25 + 0.75 * snr;
+        let mut max_belief = 0.0f32;
+        for i in 0..Self::NUM_CANDS {
+            self.tempo_belief[i] = self.tempo_belief[i] * decay + inst_hybrid[i] * gain;
+            if self.tempo_belief[i] > max_belief {
+                max_belief = self.tempo_belief[i];
+            }
+        }
+        if max_belief < 1e-4 {
+            return;
+        }
+
+        // 4. Score belief distribution with gentle Ellis perceptual tactus prior centered around 120 BPM
+        let mut weighted = [0.0f32; Self::NUM_CANDS];
+        let mut best_i = 0usize;
+        let mut best_val = 0.0f32;
+        for i in 0..Self::NUM_CANDS {
+            let bpm = Self::MIN_BPM + (i as f32) * Self::BPM_STEP;
+            let lr = (bpm / 120.0).ln() / 0.42;
+            let prior = (-0.5 * lr * lr).exp();
+            let wv = self.tempo_belief[i] * (0.62 + 0.38 * prior);
+            weighted[i] = wv;
+            if wv > best_val {
+                best_val = wv;
+                best_i = i;
+            }
+        }
+
         // Parabolic peak interpolation for sub-0.1 BPM accuracy
-        let mut refined_bpm = 66.0 + (best_i as f32) * 0.5;
-        if best_i > 0 && best_i + 1 < NUM_CANDS {
+        let mut refined_bpm = Self::MIN_BPM + (best_i as f32) * Self::BPM_STEP;
+        if best_i > 0 && best_i + 1 < Self::NUM_CANDS {
             let y0 = weighted[best_i - 1];
             let y1 = weighted[best_i];
             let y2 = weighted[best_i + 1];
             let denom = y0 - 2.0 * y1 + y2;
             if denom.abs() > 1e-6 {
                 let delta = (0.5 * (y0 - y2) / denom).clamp(-0.5, 0.5);
-                refined_bpm += delta * 0.5;
+                refined_bpm += delta * Self::BPM_STEP;
             }
         }
 
-        // Explicit Octave / Half-Time Backbeat Disambiguation:
-        // In 4/4 backbeat grooves (e.g. 140-175 BPM), 2-beat lag (70-87.5 BPM) aligns Kick+Snare pairs.
-        // If the 1-beat lag (`refined_bpm * 2`) also has strong autocorrelation, promote to true tactus!
-        let raw_at_bpm = |b: f32| -> f32 {
-            let f_idx = (b - 66.0) * 2.0;
-            if f_idx < 0.0 || f_idx >= (NUM_CANDS - 1) as f32 {
+        let belief_at = |b: f32| -> f32 {
+            let f_idx = (b - Self::MIN_BPM) / Self::BPM_STEP;
+            if f_idx < 0.0 || f_idx >= (Self::NUM_CANDS - 1) as f32 {
                 return 0.0;
             }
             let i0 = f_idx.floor() as usize;
             let fr = f_idx - (i0 as f32);
-            raw_comb[i0] * (1.0 - fr) + raw_comb[i0 + 1] * fr
+            self.tempo_belief[i0] * (1.0 - fr) + self.tempo_belief[i0 + 1] * fr
         };
-        let cur_raw = raw_at_bpm(refined_bpm).max(1e-4);
-        if refined_bpm < 88.0 && refined_bpm * 2.0 <= 186.0 {
-            let dbl_bpm = refined_bpm * 2.0;
-            let dbl = raw_at_bpm(dbl_bpm);
-            let dbl_acf = sample_acf(self.hop_hz * 60.0 / dbl_bpm);
-            if dbl >= cur_raw * 0.70 || dbl_acf >= 0.42 {
-                refined_bpm = dbl_bpm;
+
+        // Direct Onset-Grid Hit-Fraction Evaluator: measures what fraction of predicted beats
+        // at candidate BPM actually coincide with real percussive onsets (within ±30 ms)!
+        let grid_hit_fraction = |b: f32| -> f32 {
+            let f_idx = ((b - Self::MIN_BPM) / Self::BPM_STEP).round() as isize;
+            if f_idx < 0 || (f_idx as usize) >= Self::NUM_CANDS {
+                return 0.0;
             }
-        } else if refined_bpm > 168.0 && refined_bpm * 0.5 >= 78.0 {
-            let hlf = raw_at_bpm(refined_bpm * 0.5);
-            if hlf >= cur_raw * 0.88 {
-                refined_bpm *= 0.5;
+            let tau = self.hop_hz * 60.0 / b;
+            let tail_ph = fourier_phases[f_idx as usize];
+            let start = m.saturating_sub(500);
+            let mut peak_local = 0.0f32;
+            for &v in &raw[start..m] {
+                if v > peak_local {
+                    peak_local = v;
+                }
+            }
+            let hit_thresh = (peak_local * 0.16).max(0.03);
+            let mut ticks = 0usize;
+            let mut hits = 0usize;
+            let mut pos = (m as f32) - tail_ph * tau;
+            while pos >= (start as f32) {
+                let ci = pos.round() as isize;
+                let lo = (ci - 3).max(start as isize) as usize;
+                let hi = (ci + 3).min((m - 1) as isize) as usize;
+                let mut mx = 0.0f32;
+                for &v in &raw[lo..=hi] {
+                    if v > mx {
+                        mx = v;
+                    }
+                }
+                ticks += 1;
+                if mx >= hit_thresh {
+                    hits += 1;
+                }
+                pos -= tau;
+            }
+            if ticks == 0 {
+                0.0
+            } else {
+                (hits as f32) / (ticks as f32)
+            }
+        };
+
+        // 5. Octave / Half-Time / 3:2 Polyrhythm Disambiguation using Belief + Onset-Grid Verification
+        let cur_b = belief_at(refined_bpm).max(1e-5);
+        let cur_hit = grid_hit_fraction(refined_bpm);
+
+        if refined_bpm < 94.0 && refined_bpm * 2.0 <= 188.0 {
+            let dbl = refined_bpm * 2.0;
+            let dbl_b = belief_at(dbl);
+            let dbl_acf = sample_acf(self.hop_hz * 60.0 / dbl);
+            let dbl_hit = grid_hit_fraction(dbl);
+            // Promote half-time lock to true tactus if 2x BPM has strong beat hits on nearly every beat
+            if (dbl_b >= cur_b * 0.62 && dbl_hit >= 0.72 && dbl_hit >= cur_hit * 0.80)
+                || (dbl_acf >= 0.45 && dbl_hit >= 0.82)
+            {
+                refined_bpm = dbl;
+            }
+        } else if refined_bpm > 158.0 && refined_bpm * 0.5 >= 72.0 {
+            let hlf = refined_bpm * 0.5;
+            let hlf_b = belief_at(hlf);
+            let hlf_hit = grid_hit_fraction(hlf);
+            // Fold down false double-time lock if half the fast ticks are empty or half-time strongly dominates
+            if (hlf_b >= cur_b * 0.82 && cur_hit < 0.74 && hlf_hit >= cur_hit + 0.12)
+                || hlf_b >= cur_b * 1.15
+            {
+                refined_bpm = hlf;
             }
         }
 
-        // Smooth steady-state tempo lock (prevents wild jitter while locking rapidly onto new songs)
+        // Guard against 3:2 / 2:3 triplet harmonic slips
+        for &mult in &[0.666_667f32, 1.5f32] {
+            let alt = refined_bpm * mult;
+            if (72.0..=178.0).contains(&alt) {
+                let alt_b = belief_at(alt);
+                let alt_hit = grid_hit_fraction(alt);
+                if alt_b > belief_at(refined_bpm) * 1.18 && alt_hit >= cur_hit + 0.10 {
+                    refined_bpm = alt;
+                    break;
+                }
+            }
+        }
+
+        // Fine 0.1 BPM Fourier+ACF peak refinement within ±1.4 BPM around winning tempo
+        let mut fine_best_bpm = refined_bpm;
+        let mut fine_best_score = -1.0f32;
+        let mut fine_best_phase = fourier_phases[(((refined_bpm - Self::MIN_BPM) / Self::BPM_STEP)
+            .round() as usize)
+            .min(Self::NUM_CANDS - 1)];
+        for step in -14i32..=14 {
+            let b = (refined_bpm + (step as f32) * 0.1).clamp(Self::MIN_BPM, 196.0);
+            let tau = self.hop_hz * 60.0 / b;
+            let omega = 2.0 * PI / tau;
+            let (s1, c1) = omega.sin_cos();
+            let (s2, c2) = (2.0 * omega).sin_cos();
+            let mut cos_n1 = 1.0f32;
+            let mut sin_n1 = 0.0f32;
+            let mut cos_n2 = 1.0f32;
+            let mut sin_n2 = 0.0f32;
+            let mut re1 = 0.0f32;
+            let mut im1 = 0.0f32;
+            let mut re2 = 0.0f32;
+            let mut im2 = 0.0f32;
+            for &v in &raw_taper {
+                re1 += v * cos_n1;
+                im1 -= v * sin_n1;
+                re2 += v * cos_n2;
+                im2 -= v * sin_n2;
+                let nc1 = cos_n1 * c1 - sin_n1 * s1;
+                sin_n1 = sin_n1 * c1 + cos_n1 * s1;
+                cos_n1 = nc1;
+                let nc2 = cos_n2 * c2 - sin_n2 * s2;
+                sin_n2 = sin_n2 * c2 + cos_n2 * s2;
+                cos_n2 = nc2;
+            }
+            let mag1 = (re1 * re1 + im1 * im1).sqrt() * inv_raw_sum;
+            let mag2 = (re2 * re2 + im2 * im2).sqrt() * inv_raw_sum;
+            let ft = (0.74 * mag1 + 0.26 * mag2).clamp(0.0, 1.0);
+            let mut cs = 0.0f32;
+            let mut ws = 0.0f32;
+            for &(mult, hw) in &[(1.0f32, 1.00f32), (2.0, 0.72), (3.0, 0.44), (4.0, 0.30)] {
+                let lt = tau * mult;
+                if (lt as usize + 2) < acf.len() {
+                    cs += hw * sample_acf(lt).max(-0.20);
+                    ws += hw;
+                }
+            }
+            let sc = if ws > 0.0 { (cs / ws).max(0.0) } else { 0.0 } * (0.35 + 0.65 * ft);
+            if sc > fine_best_score {
+                fine_best_score = sc;
+                fine_best_bpm = b;
+                let phi0 = (-im1).atan2(re1);
+                fine_best_phase = ((((m as f32) * omega - phi0) / (2.0 * PI))).rem_euclid(1.0);
+            }
+        }
+        if fine_best_score > 0.04 {
+            refined_bpm = fine_best_bpm;
+        }
+
+        // Update Fourier beat phase anchor for the final winning BPM
+        self.fourier_phase_anchor = fine_best_phase;
+        self.has_fourier_phase = snr > 0.18;
+
+        // 6. Stable Tempo Lock with Warmup Protection (never hard-locks on brief song intro!)
+        let conf_sample = (snr * 0.75 + (peak_inst * 1.6).min(0.45)).clamp(0.15, 1.0);
         let diff = (refined_bpm - self.locked_bpm).abs();
-        if self.confidence < 0.20 {
-            self.locked_bpm = refined_bpm;
-            self.confidence = (best_val * 1.4).clamp(0.25, 1.0);
-        } else if diff <= 3.8 {
-            self.locked_bpm = self.locked_bpm * 0.68 + refined_bpm * 0.32;
-            self.confidence = (self.confidence * 0.8 + best_val * 0.45).clamp(0.25, 1.0);
+        if m < 240 || self.confidence < 0.22 {
+            // Warmup phase (< 2.4s): converge briskly while keeping confidence modest
+            if self.eval_count <= 2 || self.confidence < 0.22 {
+                self.locked_bpm = refined_bpm;
+            } else {
+                self.locked_bpm = self.locked_bpm * 0.55 + refined_bpm * 0.45;
+            }
+            self.confidence = (conf_sample * 0.65).clamp(0.18, 0.48);
+            self.candidate_streak_cnt = 0;
+        } else if diff <= 2.6 {
+            self.locked_bpm = self.locked_bpm * 0.78 + refined_bpm * 0.22;
+            self.confidence = (self.confidence * 0.78 + conf_sample * 0.28).clamp(0.28, 1.0);
             self.candidate_streak_cnt = 0;
         } else {
-            if (refined_bpm - self.candidate_streak_bpm).abs() <= 2.8 {
+            if (refined_bpm - self.candidate_streak_bpm).abs() <= 2.4 {
                 self.candidate_streak_cnt = self.candidate_streak_cnt.saturating_add(1);
             } else {
                 self.candidate_streak_bpm = refined_bpm;
                 self.candidate_streak_cnt = 1;
             }
-            if self.candidate_streak_cnt >= 3 {
+            if self.candidate_streak_cnt >= 2 {
                 self.locked_bpm = refined_bpm;
+                self.confidence = (conf_sample * 0.85).clamp(0.30, 1.0);
                 self.candidate_streak_cnt = 0;
             }
         }
@@ -1981,6 +2253,7 @@ static LATEST_VIZ: Lazy<RwLock<AudioVizFrame>> =
 
 static VIZ_SUBSCRIBED: AtomicBool = AtomicBool::new(false);
 static INSPECTOR_RESET: AtomicBool = AtomicBool::new(false);
+static TEMPO_RESET: AtomicBool = AtomicBool::new(false);
 static INSPECTOR_PAUSED: AtomicBool = AtomicBool::new(false);
 static AUTO_RESET_SILENCE: AtomicBool = AtomicBool::new(true);
 static FORCE_REBIND_CAPTURE: AtomicBool = AtomicBool::new(false);
@@ -2013,6 +2286,14 @@ pub fn set_viz_target_override(device_id: Option<String>) {
 
 pub fn trigger_inspector_reset() {
     INSPECTOR_RESET.store(true, Ordering::Release);
+    TEMPO_RESET.store(true, Ordering::Release);
+    notify_worker_wake();
+}
+
+/// Resets the real-time BPM & beat phase tracker independently of the forensic envelope
+/// whenever the active track changes so previous songs never bleed into a new song's BPM!
+pub fn trigger_tempo_reset() {
+    TEMPO_RESET.store(true, Ordering::Release);
     notify_worker_wake();
 }
 
@@ -3572,6 +3853,9 @@ mod win {
 
                     if INSPECTOR_RESET.swap(false, Ordering::AcqRel) {
                         accum.reset();
+                        tempo.reset();
+                    }
+                    if TEMPO_RESET.swap(false, Ordering::AcqRel) {
                         tempo.reset();
                     }
 

@@ -147,20 +147,60 @@ pub fn eval_frontier_scale_delta(local_u: f32, prog: f32, max_delta: f32, is_rtl
     max_delta * bump * entry_env.min(exit_env)
 }
 
+/// Stroke-density glow attenuation factor for CJK (Chinese Hanzi / Japanese Kanji & Kana / Hangul)
+/// vs. Latin scripts: dense ideographs pack ~3× more bright ink area inside a cell than thin Latin
+/// glyphs, so scaling emission keeps CJK halos refined & readable without washing out inner strokes.
+#[inline]
+pub fn cjk_glow_density_scale(s: &str) -> f32 {
+    let mut sum = 0.0f32;
+    let mut cnt = 0usize;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        let u = ch as u32;
+        let w = if (0x3400..=0x4DBF).contains(&u)
+            || (0x4E00..=0x9FFF).contains(&u)
+            || (0xF900..=0xFAFF).contains(&u)
+            || (0x20000..=0x2FA1F).contains(&u)
+        {
+            0.46
+        } else if (0x3040..=0x30FF).contains(&u)
+            || (0x31F0..=0x31FF).contains(&u)
+            || (0xAC00..=0xD7AF).contains(&u)
+            || (0xFF65..=0xFF9F).contains(&u)
+        {
+            0.58
+        } else {
+            1.0
+        };
+        sum += w;
+        cnt += 1;
+    }
+    if cnt == 0 {
+        1.0
+    } else {
+        (sum / (cnt as f32)).clamp(0.42, 1.0)
+    }
+}
+
 /// Computes `(body_alpha, frontier_peak_alpha, tail_decay)` for a glowing unit:
 /// - During sweep (`prog < 0.996`), swept body glow is weakened (`body_base`) while the highlight
 ///   frontier peaks sharply (`peak_base`).
-/// - After the unit finishes sweeping and rests at word end (`is_holding_at_word_end`), body glow
-///   gradually rises toward `frontier_peak_alpha`.
+/// - When `end_hold_glow == true` and the unit rests at word end (`is_holding_at_word_end`),
+///   body glow gradually rises toward `frontier_peak_alpha`.
+/// - When `end_hold_glow == false`, the whole word does NOT surge brighter when resting at word end;
+///   it remains subdued at `body_base` while the frontier peak gently relaxes.
 /// - Once moving past the word hold window, `decay_sec` smoothly attenuates glow to `0.0`.
 #[inline]
-pub fn eval_frontier_glow_profile(
+pub fn eval_frontier_glow_profile_ex(
     prog: f32,
     hold_after_end_sec: f32,
     decay_sec: f32,
     is_holding_at_word_end: bool,
     is_emphasized: bool,
     dur_factor: f32,
+    end_hold_glow: bool,
 ) -> (f32, f32, f32) {
     if prog <= 0.002 {
         return (0.0, 0.0, 0.0);
@@ -177,15 +217,23 @@ pub fn eval_frontier_glow_profile(
         0.24
     };
     // Target body glow reached seamlessly by the time the frontier arrives at word end (~78% of frontier peak)
-    let body_at_end = (peak_base * 0.78).max(body_base);
+    let body_at_end = if end_hold_glow {
+        (peak_base * 0.78).max(body_base)
+    } else {
+        body_base
+    };
 
     if prog < 0.996 {
         let entry = (prog / 0.08).clamp(0.0, 1.0);
         let bell = 0.86 + 0.14 * (prog * std::f32::consts::PI).sin().max(0.0);
         let env = entry * bell;
-        let ramp_t = ((prog - 0.25) / 0.75).clamp(0.0, 1.0);
-        let ramp = ramp_t * ramp_t * (3.0 - 2.0 * ramp_t);
-        let swept_body = body_base + (body_at_end - body_base) * ramp;
+        let swept_body = if end_hold_glow {
+            let ramp_t = ((prog - 0.25) / 0.75).clamp(0.0, 1.0);
+            let ramp = ramp_t * ramp_t * (3.0 - 2.0 * ramp_t);
+            body_base + (body_at_end - body_base) * ramp
+        } else {
+            body_base
+        };
         return (
             (swept_body * env).clamp(0.0, 1.0),
             (peak_base * env).clamp(0.0, 1.0),
@@ -193,7 +241,25 @@ pub fn eval_frontier_glow_profile(
         );
     }
 
-    // Gentle, organic final rise from `body_at_end` (~80% peak) up to `peak_base` when resting at word end
+    if !end_hold_glow {
+        let relax_t = (hold_after_end_sec.max(0.0) / 0.32).clamp(0.0, 1.0);
+        let relax = relax_t * relax_t * (3.0 - 2.0 * relax_t);
+        let held_body = body_base * (1.0 - 0.20 * relax);
+        let held_peak = peak_base + (held_body - peak_base) * relax;
+        if is_holding_at_word_end {
+            return (held_body.clamp(0.0, 1.0), held_peak.clamp(0.0, 1.0), 1.0);
+        } else {
+            let after = (1.0 - decay_sec.max(0.0) / 0.34).clamp(0.0, 1.0);
+            let tail_decay = after * after;
+            return (
+                (held_body * tail_decay).clamp(0.0, 1.0),
+                (held_peak * tail_decay).clamp(0.0, 1.0),
+                tail_decay,
+            );
+        }
+    }
+
+    // Gentle, organic final rise from `body_at_end` (~78% peak) up to `peak_base` when resting at word end
     let rise_t = (hold_after_end_sec.max(0.0) / 0.42).clamp(0.0, 1.0);
     let rise = rise_t * rise_t * (3.0 - 2.0 * rise_t);
     let body_held = body_at_end + (peak_base - body_at_end) * rise;
@@ -208,6 +274,26 @@ pub fn eval_frontier_glow_profile(
             tail_decay,
         )
     }
+}
+
+#[inline]
+pub fn eval_frontier_glow_profile(
+    prog: f32,
+    hold_after_end_sec: f32,
+    decay_sec: f32,
+    is_holding_at_word_end: bool,
+    is_emphasized: bool,
+    dur_factor: f32,
+) -> (f32, f32, f32) {
+    eval_frontier_glow_profile_ex(
+        prog,
+        hold_after_end_sec,
+        decay_sec,
+        is_holding_at_word_end,
+        is_emphasized,
+        dur_factor,
+        true,
+    )
 }
 
 impl LyricCharUnit {

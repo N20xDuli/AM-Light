@@ -67,6 +67,7 @@ pub enum VizHitAction {
     CycleOutputDevice,
     CycleXpSubPreset,
     ToggleReactorSubStyle,
+    ToggleSoundstageColorMode,
 }
 
 #[derive(Clone, Debug)]
@@ -117,6 +118,9 @@ struct PhosphorDot {
     band: u8,
     life: f32,
 }
+
+/// Default monochrome Soundstage phosphor color (clean electric studio blue)
+pub const SOUNDSTAGE_MONO_BLUE: Color = Color::rgb(56, 178, 255);
 
 /// 5 frequency-band Soundstage palette from Bass (Low) to Treble (High)
 pub const SOUNDSTAGE_BAND_COLORS: [Color; 5] = [
@@ -207,6 +211,9 @@ pub struct VisualizerState {
     rods: Vec<ReactorRod>,
     matrix_pillars: Vec<MatrixPillar>,
     soundstage_phosphor: VecDeque<PhosphorDot>,
+    /// `false` (default) = clean studio blue monochrome dots; `true` = 5 frequency-band colors.
+    /// Click anywhere on the Soundstage panel to toggle!
+    pub soundstage_multicolor: bool,
     soundstage_gain: f32,
     soundstage_rms_ema: f32,
     adaptive_max_hz: f32,
@@ -309,6 +316,7 @@ impl Default for VisualizerState {
             rods,
             matrix_pillars,
             soundstage_phosphor: VecDeque::with_capacity(1664),
+            soundstage_multicolor: false, // Default = Blue monochrome; click soundstage to toggle 5-color
             soundstage_gain: 1.85,
             soundstage_rms_ema: 0.18,
             adaptive_max_hz: 24_000.0,
@@ -334,7 +342,7 @@ impl Default for VisualizerState {
 pub const INSPECTOR_HEADER_FONT_SIZE: f32 = 11.2;
 
 pub fn inspector_detected_header_avail_w(det_card_w: f32) -> f32 {
-    (det_card_w - 166.0 - 12.0 - 6.0).max(56.0)
+    (det_card_w - 146.0 - 14.0 - 6.0).max(56.0)
 }
 
 pub fn format_inspector_detected_header(
@@ -343,18 +351,134 @@ pub fn format_inspector_detected_header(
     avail_width_dip: f32,
 ) -> String {
     if !active_signal {
-        return "实测音质 · 静音待命".to_string();
+        return "静音待命".to_string();
     }
-    if avail_width_dip >= 246.0 {
-        format!("实测音质 · WASAPI 实时鉴定 (置信度 {confidence_pct}%)")
-    } else if avail_width_dip >= 216.0 {
-        format!("实测音质 · WASAPI 鉴定 (置信度 {confidence_pct}%)")
-    } else if avail_width_dip >= 166.0 {
-        format!("实测音质 · 鉴定 (置信度 {confidence_pct}%)")
-    } else if avail_width_dip >= 94.0 {
-        format!("实测音质 · {confidence_pct}%")
+    if avail_width_dip >= 120.0 {
+        format!("实测 · 置信度 {confidence_pct}%")
     } else {
-        format!("实测 {confidence_pct}%")
+        format!("实测 · {confidence_pct}%")
+    }
+}
+
+/// Formats the restrained 3-line Apple-style copy for the "应有音质" card:
+/// Line 1: `Playing` / `Paused` / `Idle`
+/// Line 2: `高解析度无损` / `无损` / `杜比全景声` / `高质量 AAC`
+/// Line 3: `24-bit / 192 kHz · ALAC  @5440 kbps`
+pub fn format_expected_quality_lines(
+    playback_status: &str,
+    expected_specs: Option<&StreamAudioSpecs>,
+    expected_badge: Option<&str>,
+    prefs: &AudioPrefs,
+    snap: &LiveVisualizerSnapshot,
+) -> (String, String, String) {
+    let status_line = match playback_status {
+        "Playing" => "Playing",
+        "Paused" => "Paused",
+        _ => {
+            if snap.active_signal {
+                "Playing"
+            } else {
+                "Idle"
+            }
+        }
+    }
+    .to_string();
+
+    if let Some(sp) = expected_specs {
+        let is_alac = sp.codec.eq_ignore_ascii_case("ALAC");
+        let is_atmos = sp.codec.contains("EC-3")
+            || sp.codec.contains("AC-4")
+            || sp.tier_label.contains("全景声");
+        let is_hires_eff = is_alac
+            && (sp.sample_rate_hz > 48_000
+                || (sp.hires_catalog_trait
+                    && prefs.lossless_enabled
+                    && prefs.streaming_audio_quality >= 20));
+
+        let tier_line = if is_atmos {
+            "杜比全景声"
+        } else if is_hires_eff {
+            "高解析度无损"
+        } else if is_alac {
+            "无损"
+        } else if sp.codec.contains("40.5") {
+            "高效 AAC"
+        } else {
+            "高质量 AAC"
+        }
+        .to_string();
+
+        let codec_short = if is_alac {
+            "ALAC"
+        } else if is_atmos {
+            "Atmos"
+        } else if sp.codec.contains("40.5") {
+            "HE-AAC"
+        } else {
+            "AAC"
+        };
+
+        let eff_sr_hz = if sp.hires_catalog_trait
+            && sp.sample_rate_hz <= 48_000
+            && prefs.lossless_enabled
+            && prefs.streaming_audio_quality >= 20
+            && is_alac
+            && snap.cutoff_hz > 25_000.0
+            && snap.sample_rate > 48_000
+        {
+            snap.sample_rate.min(192_000)
+        } else {
+            sp.sample_rate_hz
+        };
+
+        let sr_khz = (eff_sr_hz as f32) / 1000.0;
+        let sr_str = if sp.hires_catalog_trait
+            && eff_sr_hz <= 48_000
+            && prefs.lossless_enabled
+            && prefs.streaming_audio_quality >= 20
+            && is_alac
+        {
+            "96–192 kHz".to_string()
+        } else if (sr_khz - sr_khz.round()).abs() < 0.05 {
+            format!("{:.0} kHz", sr_khz)
+        } else {
+            format!("{:.1} kHz", sr_khz)
+        };
+
+        let bd_prefix = sp
+            .bit_depth
+            .map(|b| format!("{b}-bit / "))
+            .unwrap_or_default();
+
+        let eff_kbps = if eff_sr_hz > sp.sample_rate_hz && is_alac {
+            let bd = sp.bit_depth.unwrap_or(24) as u32;
+            ((eff_sr_hz * bd * 2) / 1000) * 58 / 100
+        } else {
+            sp.bitrate_kbps
+        };
+
+        let spec_line = if eff_kbps > 0 {
+            format!("{bd_prefix}{sr_str} · {codec_short}  @{eff_kbps} kbps")
+        } else {
+            format!("{bd_prefix}{sr_str} · {codec_short}")
+        };
+
+        (status_line, tier_line, spec_line)
+    } else {
+        let (tier_line, fallback_spec) = if prefs.dolby_atmos_setting == 20 {
+            ("杜比全景声", "48 kHz · Atmos")
+        } else if !prefs.lossless_enabled {
+            ("高质量 AAC", "44.1 kHz · AAC  @256 kbps")
+        } else if prefs.streaming_audio_quality >= 20 {
+            ("高解析度无损", "24-bit / 192 kHz · ALAC")
+        } else {
+            ("无损", "24-bit / 48 kHz · ALAC")
+        };
+        let spec_line = expected_badge
+            .filter(|b| !b.trim().is_empty())
+            .map(|b| format!("{b} · {fallback_spec}"))
+            .unwrap_or_else(|| fallback_spec.to_string());
+        (status_line, tier_line.to_string(), spec_line)
     }
 }
 
@@ -995,6 +1119,7 @@ impl VisualizerState {
                     r,
                     body,
                     snap,
+                    smtc,
                     expected_specs,
                     expected_badge,
                     prefs,
@@ -1033,6 +1158,7 @@ impl VisualizerState {
         r: &mut D2DRenderer,
         body: RectF,
         snap: &LiveVisualizerSnapshot,
+        smtc: &SmtcState,
         expected_specs: Option<&StreamAudioSpecs>,
         expected_badge: Option<&str>,
         prefs: &AudioPrefs,
@@ -1043,121 +1169,60 @@ impl VisualizerState {
         reduce_transparency: bool,
     ) {
         let gap = 12.0;
-        let top_cards_h = 128.0f32.min(body.h * 0.30).max(108.0);
+        let top_cards_h = 124.0f32.min(body.h * 0.29).max(106.0);
         let half_w = (body.w - gap) * 0.5;
 
-        // --- Card A: Expected Stream Audio Quality (应有音质) ---
+        // --- Card A: Expected Stream Audio Quality (restrained 3-line hierarchy) ---
         let exp_card = RectF::new(body.x, body.y, half_w, top_cards_h);
         r.fill_rounded_rect(exp_card, 12.0, Theme::BG_ELEVATED);
         r.stroke_rounded_rect(exp_card, 12.0, Theme::SEPARATOR, 1.0);
 
+        let pb_status = if smtc.active {
+            smtc.status.as_str()
+        } else {
+            ""
+        };
+        let (exp_status, exp_tier, exp_spec) = format_expected_quality_lines(
+            pb_status,
+            expected_specs,
+            expected_badge,
+            prefs,
+            snap,
+        );
+
+        let status_col = if exp_status == "Playing" {
+            Theme::SIGNAL_GREEN
+        } else {
+            Theme::TEXT_MUTED
+        };
         r.draw_text(
-            "应有音质 · 源流规格",
-            RectF::new(exp_card.x + 14.0, exp_card.y + 10.0, exp_card.w - 28.0, 18.0),
-            12.0,
+            &exp_status,
+            RectF::new(exp_card.x + 14.0, exp_card.y + 10.0, exp_card.w - 28.0, 16.0),
+            11.5,
             600,
-            Theme::TEXT_MUTED,
+            status_col,
             TextAlign::Left,
             true,
             false,
         );
-
-        let (exp_headline, exp_sub, exp_detail) = if let Some(sp) = expected_specs {
-            let bd_str = sp
-                .bit_depth
-                .map(|b| format!("{b}-bit / "))
-                .unwrap_or_default();
-            let sr_khz = (sp.sample_rate_hz as f32) / 1000.0;
-            let sr_str = if sp.hires_catalog_trait
-                && sp.sample_rate_hz <= 48_000
-                && prefs.lossless_enabled
-                && prefs.streaming_audio_quality >= 20
-                && sp.codec.eq_ignore_ascii_case("ALAC")
-            {
-                if snap.cutoff_hz > 25_000.0 && snap.sample_rate > 48_000 {
-                    let dev_khz = (snap.sample_rate as f32) / 1000.0;
-                    format!("最高 {:.0} kHz (Hi-Res 母带)", dev_khz.min(192.0))
-                } else {
-                    "96–192 kHz (Hi-Res 母带)".to_string()
-                }
-            } else if (sr_khz - sr_khz.round()).abs() < 0.05 {
-                format!("{:.0} kHz", sr_khz)
-            } else {
-                format!("{:.1} kHz", sr_khz)
-            };
-            let detail_line = if sp.hires_catalog_trait
-                && sp.sample_rate_hz <= 48_000
-                && prefs.lossless_enabled
-                && prefs.streaming_audio_quality >= 20
-            {
-                format!(
-                    "Hi-Res 端到端协商 · 终端 {:.1} kHz/{}-bit",
-                    snap.sample_rate as f32 / 1000.0,
-                    snap.bit_depth
-                )
-            } else {
-                format!(
-                    "目标码率 {} kbps (峰值 {} kbps)",
-                    sp.bitrate_kbps, sp.peak_bitrate_kbps
-                )
-            };
-            (
-                format!("{} · {}", sp.tier_label, sp.codec_label),
-                format!("{bd_str}{sr_str} · {}", sp.channels),
-                detail_line,
-            )
-        } else {
-            let cfg_tier = if prefs.dolby_atmos_setting == 20 {
-                "杜比全景声 (优先)"
-            } else if !prefs.lossless_enabled {
-                "高质量 AAC (256 kbps)"
-            } else if prefs.streaming_audio_quality >= 20 {
-                "Hi-Res 无损 (最高 24-bit / 192 kHz)"
-            } else {
-                "无损 ALAC (最高 24-bit / 48 kHz)"
-            };
-            let badge = expected_badge.unwrap_or("待播放曲目获取源流清单");
-            (
-                cfg_tier.to_string(),
-                format!("曲目标记：{badge}"),
-                format!(
-                    "终端输出：{} ({:.1} kHz / {}-bit)",
-                    snap.device_name,
-                    snap.sample_rate as f32 / 1000.0,
-                    snap.bit_depth
-                ),
-            )
-        };
-
         r.draw_text(
-            &exp_headline,
-            RectF::new(exp_card.x + 14.0, exp_card.y + 32.0, exp_card.w - 28.0, 24.0),
-            15.5,
+            &exp_tier,
+            RectF::new(exp_card.x + 14.0, exp_card.y + 30.0, exp_card.w - 28.0, 26.0),
+            17.5,
             700,
             Theme::TEXT_PRIMARY,
             TextAlign::Left,
             true,
             false,
         );
-        r.draw_text(
-            &exp_sub,
-            RectF::new(exp_card.x + 14.0, exp_card.y + 57.0, exp_card.w - 28.0, 18.0),
-            12.5,
+        r.draw_mono_text(
+            &exp_spec,
+            RectF::new(exp_card.x + 14.0, exp_card.y + 59.0, exp_card.w - 28.0, 18.0),
+            12.2,
             500,
             Theme::SIGNAL_CYAN,
             TextAlign::Left,
             true,
-            false,
-        );
-        r.draw_text(
-            &exp_detail,
-            RectF::new(exp_card.x + 14.0, exp_card.y + 76.0, exp_card.w - 28.0, 16.0),
-            11.5,
-            400,
-            Theme::TEXT_SECONDARY,
-            TextAlign::Left,
-            true,
-            false,
         );
 
         // Quick Tier Pills at bottom of Expected Card (spatial/Atmos hidden by default unless enabled!)
@@ -1187,7 +1252,7 @@ impl VisualizerState {
                     && prefs.dolby_atmos_setting != 20
                     && prefs.streaming_audio_quality == q
             };
-            let pr = RectF::new(pill_x, pill_y, 54.0, 21.0);
+            let pr = RectF::new(pill_x, pill_y, 52.0, 21.0);
             let is_hov = pr.contains(hovered_pt.0, hovered_pt.1);
             r.draw_liquid_glass_button(
                 pr,
@@ -1220,11 +1285,11 @@ impl VisualizerState {
                 rect: pr,
                 action: VizHitAction::SwitchQualityTier(q, loss, atm),
             });
-            pill_x += 59.0;
+            pill_x += 57.0;
         }
 
         if devices.len() > 1 {
-            let dev_btn = RectF::new(exp_card.right() - 98.0, pill_y, 84.0, 21.0);
+            let dev_btn = RectF::new(exp_card.right() - 80.0, pill_y, 66.0, 21.0);
             if dev_btn.x > pill_x + 4.0 {
                 let dev_hov = dev_btn.contains(hovered_pt.0, hovered_pt.1);
                 r.draw_liquid_glass_button(
@@ -1237,7 +1302,7 @@ impl VisualizerState {
                     reduce_transparency,
                 );
                 r.draw_text(
-                    "切换输出设备",
+                    "切换设备",
                     dev_btn,
                     10.8,
                     500,
@@ -1257,7 +1322,7 @@ impl VisualizerState {
             }
         }
 
-        // --- Card B: Actual Detected System Audio Quality (实测音质) ---
+        // --- Card B: Actual Detected System Audio Quality (restrained studio layout) ---
         let det_card = RectF::new(exp_card.right() + gap, body.y, half_w, top_cards_h);
         r.fill_rounded_rect(det_card, 12.0, Theme::BG_ELEVATED);
         let verdict_accent = if snap.tier_code == "hires_lossless" {
@@ -1273,17 +1338,17 @@ impl VisualizerState {
         };
         r.stroke_rounded_rect(det_card, 12.0, verdict_accent.with_alpha(0.32), 1.0);
 
-        // Action buttons: 自动清零 / 冻结 / 清空重测 (sized cleanly so full header fits at 1185 DIP without ellipsis)
-        let rst_btn = RectF::new(det_card.right() - 66.0, det_card.y + 8.0, 54.0, 22.0);
-        let frz_btn = RectF::new(rst_btn.x - 42.0, det_card.y + 8.0, 38.0, 22.0);
-        let auto_btn = RectF::new(frz_btn.x - 58.0, det_card.y + 8.0, 54.0, 22.0);
+        // Compact action buttons: 自动清零 / 冻结 / 重测
+        let rst_btn = RectF::new(det_card.right() - 48.0, det_card.y + 8.0, 36.0, 21.0);
+        let frz_btn = RectF::new(rst_btn.x - 42.0, det_card.y + 8.0, 38.0, 21.0);
+        let auto_btn = RectF::new(frz_btn.x - 56.0, det_card.y + 8.0, 52.0, 21.0);
 
         let hdr_avail_w = inspector_detected_header_avail_w(det_card.w);
         let status_hdr =
             format_inspector_detected_header(snap.active_signal, snap.confidence_pct, hdr_avail_w);
         r.draw_text(
             &status_hdr,
-            RectF::new(det_card.x + 12.0, det_card.y + 10.0, hdr_avail_w, 18.0),
+            RectF::new(det_card.x + 14.0, det_card.y + 10.0, hdr_avail_w, 16.0),
             INSPECTOR_HEADER_FONT_SIZE,
             600,
             verdict_accent,
@@ -1297,7 +1362,7 @@ impl VisualizerState {
                 if snap.auto_reset_silence {
                     "自动清零"
                 } else {
-                    "保持包络"
+                    "保持"
                 },
                 snap.auto_reset_silence,
                 VizHitAction::InspectorToggleAutoReset,
@@ -1308,12 +1373,12 @@ impl VisualizerState {
                 snap.paused,
                 VizHitAction::InspectorTogglePause,
             ),
-            (rst_btn, "清空重测", false, VizHitAction::InspectorReset),
+            (rst_btn, "重测", false, VizHitAction::InspectorReset),
         ] {
             let bhov = br.contains(hovered_pt.0, hovered_pt.1);
             r.draw_liquid_glass_button(
                 br,
-                11.0,
+                10.5,
                 if active_tint {
                     GlassBtnVariant::Tinted(Theme::SIGNAL_CYAN.with_alpha(0.65))
                 } else {
@@ -1342,8 +1407,8 @@ impl VisualizerState {
 
         r.draw_text(
             &snap.verdict_title,
-            RectF::new(det_card.x + 14.0, det_card.y + 32.0, det_card.w - 28.0, 24.0),
-            15.5,
+            RectF::new(det_card.x + 14.0, det_card.y + 30.0, det_card.w - 28.0, 26.0),
+            17.5,
             700,
             Theme::TEXT_PRIMARY,
             TextAlign::Left,
@@ -1352,44 +1417,43 @@ impl VisualizerState {
         );
 
         let cut_str = if snap.cutoff_hz > 1000.0 {
-            format!("{:.2} kHz", snap.cutoff_hz / 1000.0)
+            format!("{:.1} kHz", snap.cutoff_hz / 1000.0)
         } else {
-            "-".to_string()
+            "--".to_string()
         };
-        let det_metrics = format!(
-            "截止上限 {cut_str} (落差 {:.1}dB) · MDCT 空洞 {:.1}% · {}",
-            snap.brickwall_drop_db, snap.mdct_hole_pct, snap.detected_bit_grid
-        );
-        r.draw_text(
-            &det_metrics,
-            RectF::new(det_card.x + 14.0, det_card.y + 57.0, det_card.w - 28.0, 18.0),
+        let det_spec = if snap.active_signal || snap.paused {
+            format!(
+                "{cut_str} · {} · {}",
+                snap.detected_bit_grid, snap.estimated_bitrate
+            )
+        } else {
+            format!("{:.1} kHz / {}-bit", snap.sample_rate as f32 / 1000.0, snap.bit_depth)
+        };
+        r.draw_mono_text(
+            &det_spec,
+            RectF::new(det_card.x + 14.0, det_card.y + 59.0, det_card.w - 28.0, 18.0),
             12.2,
             500,
             verdict_accent,
             TextAlign::Left,
             true,
-            false,
         );
 
-        let apps_str = if let Some(top_app) = snap.active_apps.first() {
+        let det_foot = if snap.active_signal || snap.paused {
             format!(
-                "估算码率 {} · 活跃发声：{} ({:.1} dB) · 电平 {:.1} dBFS",
-                snap.estimated_bitrate, top_app.exe_name, top_app.peak_db, snap.rms_db
+                "落差 {:.1} dB · 空洞 {:.1}% · {:.1} dBFS",
+                snap.brickwall_drop_db, snap.mdct_hole_pct, snap.rms_db
             )
         } else {
-            format!(
-                "估算码率 {} · {}",
-                snap.estimated_bitrate, snap.forensic_notes
-            )
+            snap.device_name.clone()
         };
-        r.draw_text(
-            &apps_str,
-            RectF::new(det_card.x + 14.0, det_card.y + 79.0, det_card.w - 28.0, 38.0),
-            11.3,
+        r.draw_mono_text(
+            &det_foot,
+            RectF::new(det_card.x + 14.0, det_card.bottom() - 26.0, det_card.w - 28.0, 16.0),
+            11.0,
             400,
-            Theme::TEXT_SECONDARY,
+            Theme::TEXT_MUTED,
             TextAlign::Left,
-            false,
             true,
         );
 
@@ -1425,17 +1489,8 @@ impl VisualizerState {
         let nyq_hz = snap.nyquist_hz.max(8_000.0);
         let disp_max_hz = self.adaptive_max_hz.clamp(8_000.0, nyq_hz);
         let disp_khz = disp_max_hz / 1000.0;
-        let mode_tag = if nyq_hz > 25_000.0 {
-            if disp_max_hz > 25_000.0 {
-                "自动扩图"
-            } else {
-                "自适应默认 24k"
-            }
-        } else {
-            "线性频率"
-        };
         r.draw_text(
-            &format!("声谱瀑布图 (0 – {disp_khz:.1} kHz · {mode_tag})"),
+            &format!("声谱瀑布 · 0–{disp_khz:.0} kHz"),
             RectF::new(panel.x + 12.0, panel.y + 6.0, panel.w - 24.0, 18.0),
             11.5,
             600,
@@ -1494,15 +1549,9 @@ impl VisualizerState {
                 Theme::SIGNAL_CYAN
             };
             r.draw_line(plot.x, cy, plot.right(), cy, line_col, 1.5);
-            let tag_rect = RectF::new(plot.x + 6.0, (cy - 18.0).max(plot.y + 2.0), 124.0, 16.0);
+            let tag_rect = RectF::new(plot.x + 6.0, (cy - 18.0).max(plot.y + 2.0), 74.0, 16.0);
             r.fill_rounded_rect(tag_rect, 4.0, Color::rgba(8, 10, 16, 0.84));
-            let tag_lbl = if snap.tier_code == "narrowband_analyzing"
-                || snap.tier_code == "lossless_acoustic"
-            {
-                format!("谐波 {:.2} kHz", snap.cutoff_hz / 1000.0)
-            } else {
-                format!("实测 {:.2} kHz", snap.cutoff_hz / 1000.0)
-            };
+            let tag_lbl = format!("{:.1} kHz", snap.cutoff_hz / 1000.0);
             r.draw_mono_text(
                 &tag_lbl,
                 tag_rect,
@@ -1528,7 +1577,7 @@ impl VisualizerState {
         let disp_max = self.adaptive_max_hz.clamp(8_000.0, nyq);
         let disp_khz = disp_max / 1000.0;
         r.draw_text(
-            &format!("FFT 峰值包络与高频切线 (0 – {disp_khz:.1} kHz)"),
+            &format!("FFT 频谱 · 0–{disp_khz:.0} kHz"),
             RectF::new(panel.x + 12.0, panel.y + 6.0, panel.w - 24.0, 18.0),
             11.5,
             600,
@@ -1644,18 +1693,24 @@ impl VisualizerState {
     }
 
     /// Panel 3 (BL): Stereo Soundstage / Goniometer / Vectorscope (`声场图`)
+    /// Dots default to monochrome studio blue; clicking the panel toggles 5-band colors <-> blue monochrome.
     fn draw_soundstage_panel(
-        &self,
+        &mut self,
         r: &mut D2DRenderer,
         panel: RectF,
         snap: &LiveVisualizerSnapshot,
     ) {
+        self.hit_zones.push(VizHitZone {
+            rect: panel,
+            action: VizHitAction::ToggleSoundstageColorMode,
+        });
+
         r.fill_rounded_rect(panel, 12.0, Color::rgb(8, 9, 14));
         r.stroke_rounded_rect(panel, 12.0, Theme::SEPARATOR, 1.0);
 
         r.draw_text(
-            "立体声声场图 (Goniometer / 相位场)",
-            RectF::new(panel.x + 12.0, panel.y + 6.0, panel.w - 135.0, 18.0),
+            "声场图",
+            RectF::new(panel.x + 12.0, panel.y + 6.0, 64.0, 18.0),
             11.5,
             600,
             Theme::TEXT_SECONDARY,
@@ -1665,15 +1720,15 @@ impl VisualizerState {
         );
         let stage_hdr_metrics = if snap.active_signal || snap.paused {
             format!(
-                "宽度 {:.0}% · 相位 {:+.2}",
+                "{:.0}% · {:+.2}",
                 snap.stereo_width_pct, snap.phase_correlation
             )
         } else {
-            "宽度 -- · 相位 --".to_string()
+            "-- · --".to_string()
         };
         r.draw_mono_text(
             &stage_hdr_metrics,
-            RectF::new(panel.right() - 150.0, panel.y + 6.0, 138.0, 18.0),
+            RectF::new(panel.right() - 120.0, panel.y + 6.0, 108.0, 18.0),
             10.5,
             500,
             if snap.active_signal {
@@ -1756,17 +1811,32 @@ impl VisualizerState {
             true,
         );
 
-        // Compact 5-band frequency color legend (Low -> High) in top-left of Soundstage panel
+        // Compact color mode indicator in top-left of Soundstage panel (click panel to toggle)
         let mut lx = panel.x + 12.0;
         let ly = panel.y + 26.0;
-        for b in 0..5 {
-            let col = SOUNDSTAGE_BAND_COLORS[b];
-            r.fill_circle(lx + 4.0, ly + 6.0, 3.0, col);
-            let lbl = SOUNDSTAGE_BAND_LABELS[b];
-            let lw = if lbl.chars().count() > 1 { 24.0 } else { 15.0 };
+        if self.soundstage_multicolor {
+            for b in 0..5 {
+                let col = SOUNDSTAGE_BAND_COLORS[b];
+                r.fill_circle(lx + 4.0, ly + 6.0, 3.0, col);
+                let lbl = SOUNDSTAGE_BAND_LABELS[b];
+                let lw = if lbl.chars().count() > 1 { 24.0 } else { 15.0 };
+                r.draw_text(
+                    lbl,
+                    RectF::new(lx + 9.0, ly, lw, 12.0),
+                    9.2,
+                    500,
+                    Theme::TEXT_MUTED,
+                    TextAlign::Left,
+                    true,
+                    false,
+                );
+                lx += lw + 12.0;
+            }
+        } else {
+            r.fill_circle(lx + 4.0, ly + 6.0, 3.0, SOUNDSTAGE_MONO_BLUE);
             r.draw_text(
-                lbl,
-                RectF::new(lx + 9.0, ly, lw, 12.0),
+                "单色",
+                RectF::new(lx + 10.0, ly, 34.0, 12.0),
                 9.2,
                 500,
                 Theme::TEXT_MUTED,
@@ -1774,10 +1844,9 @@ impl VisualizerState {
                 true,
                 false,
             );
-            lx += lw + 12.0;
         }
 
-        // Plot 5-band frequency-colored stereo pairs folded cleanly into the upper semicircle
+        // Plot stereo pairs folded cleanly into the upper semicircle (default blue monochrome or 5-band colors)
         if !self.soundstage_phosphor.is_empty()
             || (snap.active_signal && snap.soundstage_lr.len() >= 16)
         {
@@ -1786,20 +1855,24 @@ impl VisualizerState {
                 cy - rad * 0.22,
                 rad * (0.22 + snap.stereo_width_pct * 0.0038),
                 rad * 0.34,
-                Color::rgba(50, 173, 230, 0.10),
-                Color::rgba(50, 173, 230, 0.0),
+                Color::rgba(56, 178, 255, 0.10),
+                Color::rgba(56, 178, 255, 0.0),
             );
 
-            // 1. Fixed-coordinate 5-Band Phosphor Persistence Cloud inside upper semicircle
+            // 1. Fixed-coordinate Phosphor Persistence Cloud inside upper semicircle
             for dot in &self.soundstage_phosphor {
                 let px = cx + dot.sx * rad;
                 let py = cy - dot.sy.max(0.0) * rad;
                 let glow_a = (dot.life.powf(1.48) * 0.48).clamp(0.014, 0.52);
-                let dot_col = soundstage_band_color(dot.band).with_alpha(glow_a);
-                r.fill_circle(px, py, 0.90, dot_col);
+                let base_col = if self.soundstage_multicolor {
+                    soundstage_band_color(dot.band)
+                } else {
+                    SOUNDSTAGE_MONO_BLUE
+                };
+                r.fill_circle(px, py, 0.90, base_col.with_alpha(glow_a));
             }
 
-            // 2. Live-frame 5-band excitations (adaptive RMS AGC normalized)
+            // 2. Live-frame excitations (adaptive RMS AGC normalized)
             if snap.active_signal && !snap.soundstage_band_pts.is_empty() {
                 let gain = self.soundstage_gain;
                 let n = snap.soundstage_band_pts.len().max(1) as f32;
@@ -1808,7 +1881,11 @@ impl VisualizerState {
                     let px = cx + sx * rad;
                     let py = cy - sy * rad;
                     let fresh = (i as f32) / n;
-                    let bcol = soundstage_band_color(bf.round() as u8);
+                    let bcol = if self.soundstage_multicolor {
+                        soundstage_band_color(bf.round() as u8)
+                    } else {
+                        SOUNDSTAGE_MONO_BLUE.lerp(Color::rgb(168, 232, 255), fresh * 0.35)
+                    };
                     if i % 9 == 0 && (sx.abs() + sy.abs()) > 0.28 {
                         r.fill_circle(px, py, 1.9, bcol.with_alpha(0.13 * fresh));
                     }
@@ -1816,7 +1893,7 @@ impl VisualizerState {
                 }
             }
         } else {
-            r.fill_circle(cx, cy - 2.0, 1.8, Theme::SIGNAL_CYAN.with_alpha(0.58));
+            r.fill_circle(cx, cy - 2.0, 1.8, SOUNDSTAGE_MONO_BLUE.with_alpha(0.58));
         }
 
         // Bottom Symmetric Left (`L`) & Right (`R`) Stereo Channel Level Bars!
@@ -1889,7 +1966,7 @@ impl VisualizerState {
         r.stroke_rounded_rect(panel, 12.0, Theme::SEPARATOR, 1.0);
 
         r.draw_text(
-            "32段对数频谱与双声道示波器",
+            "频谱与示波",
             RectF::new(panel.x + 12.0, panel.y + 6.0, panel.w - 150.0, 18.0),
             11.5,
             600,
@@ -1900,7 +1977,7 @@ impl VisualizerState {
         );
         r.draw_mono_text(
             &format!(
-                "Peak {:.1} / DR {:.1} dB",
+                "Peak {:.1} · DR {:.1} dB",
                 snap.peak_db_l.max(snap.peak_db_r),
                 snap.dynamic_range_db
             ),

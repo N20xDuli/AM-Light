@@ -12,7 +12,7 @@ const AM_LIGHT_EXE_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/payl
 const AMP_PROXY_DLL_BYTES: &[u8] = include_bytes!("../../c_proxy/amp_proxy.dll");
 
 const APP_NAME: &str = "AM Light";
-const APP_VERSION: &str = "0.2.4";
+const APP_VERSION: &str = "0.2.6";
 const APP_PUBLISHER: &str = "AM Light";
 const UNINSTALL_KEY_SUB: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\AMLight";
 

@@ -589,6 +589,15 @@ async fn send_amp_post(
     Ok((status, body))
 }
 
+/// Apple Music `POST /v1/me/stations/next-tracks/{station_id}` strictly enforces `limit <= 10`
+/// (any larger value returns HTTP 400 `Invalid Parameter Value`).
+pub const STATION_NEXT_TRACKS_MAX_LIMIT: usize = 10;
+
+#[inline]
+pub fn clamp_station_next_tracks_limit(limit: usize) -> usize {
+    limit.clamp(1, STATION_NEXT_TRACKS_MAX_LIMIT)
+}
+
 /// Fetches the next playable track queue for an Apple Music radio/personal/mood station via
 /// `POST /v1/me/stations/next-tracks/{station_id}` so stations play natively via `AMPLibraryAgent`
 /// without launching the official Apple Music desktop GUI.
@@ -606,7 +615,7 @@ pub async fn fetch_station_next_tracks(
         .as_deref()
         .map(normalize_user_token)
         .unwrap_or_default();
-    let lim = limit.clamp(1, 25);
+    let lim = clamp_station_next_tracks_limit(limit);
     let url = format!(
         "{AMP_API_BASE}v1/me/stations/next-tracks/{clean_id}?limit={lim}&extend=audioTraits&l=zh-Hans-CN"
     );
@@ -2181,6 +2190,227 @@ pub async fn fetch_home_editorial_shelves(
     confirm_home_shelves_motion_artwork(&mut shelves, sf, utok.as_deref()).await;
 
     Ok(shelves)
+}
+
+/// Fetches authentic Apple Music Radio shelves directly via `amp-api.music.apple.com`
+/// (avoiding `music.apple.com/{sf}/radio` GeoIP redirects to `/cn/new`):
+/// 1. User's personal, mood, artist & recently played stations (`v1/me/recent/radio-stations` + `v1/me/recommendations`)
+/// 2. Official Apple Music Live Radio channels (`filter[featured]=apple-music-live-radio`)
+/// 3. Official Station Genres & their track-based stations (`v1/catalog/{sf}/station-genres`)
+pub async fn fetch_official_radio_shelves(
+    storefront: &str,
+    user_token: Option<String>,
+) -> Result<Vec<EditorialShelf>, String> {
+    let sf = if storefront.trim().is_empty() {
+        "cn"
+    } else {
+        storefront.trim()
+    };
+    let utok = user_token
+        .as_deref()
+        .map(normalize_user_token)
+        .filter(|s| !s.is_empty());
+
+    let mut shelves: Vec<EditorialShelf> = Vec::new();
+
+    // 1. Personal / Recent / Recommended Stations (all format="tracks" -> instant lossless playback!)
+    if utok.is_some() {
+        let sf_r = sf.to_string();
+        let ut_r = utok.clone();
+        let recent_handle = tokio::spawn(async move {
+            fetch_am_api(
+                "v1/me/recent/radio-stations?limit=12&l=zh-Hans-CN".to_string(),
+                ut_r,
+                None,
+                Some(sf_r),
+            )
+            .await
+        });
+        let rec_res = fetch_am_api(
+            "v1/me/recommendations?limit=15&l=zh-Hans-CN".to_string(),
+            utok.clone(),
+            None,
+            Some(sf.to_string()),
+        )
+        .await;
+        let recent_res = recent_handle
+            .await
+            .unwrap_or_else(|e| Err(format!("task join error: {e}")));
+
+        let mut seen = HashSet::new();
+        let mut personal_items: Vec<EditorialItem> = Vec::new();
+        if let Ok(rj) = recent_res {
+            if let Some(arr) = rj.get("data").and_then(Value::as_array) {
+                for v in arr {
+                    if let Some(mut it) = parse_amp_resource_to_editorial_item(v, sf, 600) {
+                        it.motion_video_url = None;
+                        it.motion_tall_video_url = None;
+                        it.badge = if v.pointer("/attributes/isLive").and_then(Value::as_bool).unwrap_or(false) {
+                            "LIVE".to_string()
+                        } else {
+                            String::new()
+                        };
+                        if seen.insert(it.id.clone()) {
+                            personal_items.push(it);
+                        }
+                    }
+                }
+            }
+        }
+        if let Ok(recj) = rec_res {
+            if let Some(groups) = recj.get("data").and_then(Value::as_array) {
+                for g in groups {
+                    if let Some(arr) = g
+                        .pointer("/relationships/contents/data")
+                        .and_then(Value::as_array)
+                    {
+                        for v in arr {
+                            if v.get("type").and_then(Value::as_str) != Some("stations") {
+                                continue;
+                            }
+                            if let Some(mut it) = parse_amp_resource_to_editorial_item(v, sf, 600) {
+                                it.motion_video_url = None;
+                                it.motion_tall_video_url = None;
+                                it.badge = if v
+                                    .pointer("/attributes/isLive")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false)
+                                {
+                                    "LIVE".to_string()
+                                } else {
+                                    String::new()
+                                };
+                                if seen.insert(it.id.clone()) {
+                                    personal_items.push(it);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !personal_items.is_empty() {
+            shelves.push(EditorialShelf {
+                title: "你的专属与常用电台".to_string(),
+                subtitle: "Personal & Recommended Stations".to_string(),
+                kind: EditorialShelfKind::RadioStationRow,
+                items: personal_items,
+            });
+        }
+    }
+
+    // 2. Official Apple Music Live Radio stations (with storefront fallback if `cn` returns empty)
+    let mut live_items: Vec<EditorialItem> = Vec::new();
+    for live_sf in [sf, "jp", "us"] {
+        let p = format!(
+            "v1/catalog/{live_sf}/stations?filter[featured]=apple-music-live-radio&l=zh-Hans-CN"
+        );
+        if let Ok(lj) = fetch_am_api(p, utok.clone(), None, Some(live_sf.to_string())).await {
+            if let Some(arr) = lj.get("data").and_then(Value::as_array) {
+                for v in arr {
+                    if let Some(mut it) = parse_amp_resource_to_editorial_item(v, live_sf, 600) {
+                        it.motion_video_url = None;
+                        it.motion_tall_video_url = None;
+                        it.badge = "LIVE".to_string();
+                        if it.subtitle.is_empty() || it.subtitle == "广播电台" {
+                            if let Some(tag) = v
+                                .pointer("/attributes/editorialNotes/tagline")
+                                .or_else(|| v.pointer("/attributes/editorialNotes/short"))
+                                .and_then(Value::as_str)
+                            {
+                                let t = tag.trim();
+                                if !t.is_empty() {
+                                    it.subtitle = t.to_string();
+                                }
+                            }
+                        }
+                        live_items.push(it);
+                    }
+                }
+            }
+        }
+        if !live_items.is_empty() {
+            break;
+        }
+    }
+    if !live_items.is_empty() {
+        shelves.push(EditorialShelf {
+            title: "Apple Music 广播电台".to_string(),
+            subtitle: "Featured Live Radio".to_string(),
+            kind: EditorialShelfKind::RadioStationRow,
+            items: live_items,
+        });
+    }
+
+    // 3. Official Station Genres & their track-based algorithmic stations (all support next-tracks!)
+    let mut genres: Vec<(String, String, String)> = Vec::new();
+    for g_sf in [sf, "jp", "us"] {
+        let gp = format!("v1/catalog/{g_sf}/station-genres?limit=8&l=zh-Hans-CN");
+        if let Ok(gj) = fetch_am_api(gp, utok.clone(), None, Some(g_sf.to_string())).await {
+            if let Some(arr) = gj.get("data").and_then(Value::as_array) {
+                for g in arr.iter().take(4) {
+                    let gid = g.get("id").and_then(Value::as_str).unwrap_or("").trim();
+                    let gname = g
+                        .pointer("/attributes/name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .trim();
+                    if !gid.is_empty() && !gname.is_empty() {
+                        genres.push((g_sf.to_string(), gid.to_string(), gname.to_string()));
+                    }
+                }
+            }
+        }
+        if !genres.is_empty() {
+            break;
+        }
+    }
+
+    let mut genre_futs = Vec::new();
+    for (g_sf, gid, gname) in genres {
+        let ut = utok.clone();
+        genre_futs.push(async move {
+            let sp = format!("v1/catalog/{g_sf}/station-genres/{gid}/stations?limit=12&l=zh-Hans-CN");
+            let json = fetch_am_api(sp, ut, None, Some(g_sf.clone())).await.ok()?;
+            let arr = json.get("data").and_then(Value::as_array)?;
+            let mut items = Vec::new();
+            for v in arr {
+                if let Some(mut it) = parse_amp_resource_to_editorial_item(v, &g_sf, 600) {
+                    it.motion_video_url = None;
+                    it.motion_tall_video_url = None;
+                    it.badge.clear();
+                    items.push(it);
+                }
+            }
+            (!items.is_empty()).then(|| EditorialShelf {
+                title: format!("{gname} 电台"),
+                subtitle: "Station Genre".to_string(),
+                kind: EditorialShelfKind::RadioStationRow,
+                items,
+            })
+        });
+    }
+    for sh in futures_join_all_bounded(genre_futs).await {
+        if let Some(s) = sh {
+            shelves.push(s);
+        }
+    }
+
+    if shelves.is_empty() {
+        return Err("未能加载 Apple Music 广播电台栏目".to_string());
+    }
+    Ok(shelves)
+}
+
+async fn futures_join_all_bounded<F, T>(futs: Vec<F>) -> Vec<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    let mut out = Vec::with_capacity(futs.len());
+    for f in futs {
+        out.push(f.await);
+    }
+    out
 }
 
 pub async fn fetch_album_motion_video_url(

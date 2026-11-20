@@ -26,8 +26,8 @@ AM Light 通过对接微软商店版官方 Apple Music 的本地后台播放服�
   https://github.com/N20xDuli/apple-music-windows-drm-fix
 
 ### 第二步：安装与启动 AM Light
-1. 前往 [GitHub Releases](https://github.com/N20xDuli/AM-Light/releases) 下载最新的 Windows 安装包（如 `AM-Light-Setup-v0.2.4-x64.exe`）并运行安装。
-   - 支持静默安装：`AM-Light-Setup-v0.2.4-x64.exe --silent [--dir="C:\Path\To\AM-Light"]`
+1. 前往 [GitHub Releases](https://github.com/N20xDuli/AM-Light/releases) 下载最新的 Windows 安装包（如 `AM-Light-Setup-v0.2.6-x64.exe`）并运行安装。
+   - 支持静默安装：`AM-Light-Setup-v0.2.6-x64.exe --silent [--dir="C:\Path\To\AM-Light"]`
    - 卸载方式：通过系统「已安装的应用」或安装目录下的 `Uninstall-AM-Light.exe` 卸载。
 2. 启动 AM Light，在首页浏览或搜索歌曲，软件会自动连接本地 Apple Music 播放服务（亦可在设置中切换控制原版客户端）。
 
@@ -68,7 +68,7 @@ cargo test --release --bin AM-Light
 # 构建主程序
 cargo build --release
 
-# 打包 Windows 安装器（输出至 dist\AM-Light-Setup-v0.2.4-x64.exe）
+# 打包 Windows 安装器（输出至 dist\AM-Light-Setup-v0.2.6-x64.exe）
 $env:AM_LIGHT_BIN_PATH = "target\release\AM-Light.exe"
 cargo build --release --manifest-path installer\Cargo.toml
 ```

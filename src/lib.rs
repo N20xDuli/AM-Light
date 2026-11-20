@@ -54,7 +54,7 @@ mod win_app {
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         GetKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TME_NONCLIENT,
-        TRACKMOUSEEVENT, VK_CONTROL, VK_ESCAPE, VK_OEM_COMMA,
+        TRACKMOUSEEVENT, VK_CONTROL, VK_ESCAPE, VK_OEM_COMMA, VK_SHIFT,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetCursorPos,
@@ -64,7 +64,7 @@ mod win_app {
         RegisterClassExW, SetCursor, SetTimer, SetWindowLongPtrW,
         SetWindowPos, ShowWindow, TranslateMessage, GWL_EXSTYLE, HTBOTTOM, HTBOTTOMLEFT,
         HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT,
-        IDC_ARROW, IDC_HAND, PM_REMOVE, SM_CXSCREEN, SM_CYSCREEN, SWP_FRAMECHANGED,
+        IDC_ARROW, IDC_HAND, IDC_IBEAM, PM_REMOVE, SM_CXSCREEN, SM_CYSCREEN, SWP_FRAMECHANGED,
         SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNORMAL, WM_ACTIVATE,
         WM_CHAR, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENTERSIZEMOVE, WM_ERASEBKGND,
         WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_LBUTTONDOWN,
@@ -331,16 +331,24 @@ mod win_app {
             WM_SETCURSOR => {
                 let hit = (lparam.0 & 0xFFFF) as u32;
                 if hit == HTCLIENT {
+                    let mut over_text = false;
                     let mut over_btn = false;
                     WIN_CTX.with(|cell| {
                         if let Ok(borrow) = cell.try_borrow() {
                             if let Some(ctx) = borrow.as_ref() {
                                 let (lx, ly) = ctx.ui.mouse_pos;
-                                over_btn = ctx.ui.is_interactive_at(lx, ly);
+                                over_text = ctx.ui.is_text_cursor_at(lx, ly);
+                                over_btn = !over_text && ctx.ui.is_interactive_at(lx, ly);
                             }
                         }
                     });
-                    let cur_id = if over_btn { IDC_HAND } else { IDC_ARROW };
+                    let cur_id = if over_text {
+                        IDC_IBEAM
+                    } else if over_btn {
+                        IDC_HAND
+                    } else {
+                        IDC_ARROW
+                    };
                     if let Ok(cur) = LoadCursorW(None, cur_id) {
                         let _ = SetCursor(Some(cur));
                         return LRESULT(1);
@@ -703,7 +711,9 @@ mod win_app {
             WM_KEYDOWN => {
                 let vk = wparam.0 as u16;
                 let ctrl = (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
+                let shift = (GetKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0;
                 let mut handled = false;
+                let mut clip_to_write: Option<String> = None;
 
                 WIN_CTX.with(|cell| {
                     if let Ok(mut borrow) = cell.try_borrow_mut() {
@@ -719,6 +729,7 @@ mod win_app {
                                     handled = true;
                                 } else if ctx.ui.search_focused {
                                     ctx.ui.search_focused = false;
+                                    ctx.ui.search_sel_anchor = None;
                                     handled = true;
                                 } else if ctx.ui.route == PageRoute::LibAlbums
                                     && ctx.ui.albums_cover_flow
@@ -736,6 +747,9 @@ mod win_app {
                                 handled = ctx.ui.on_cover_flow_key(vk);
                             } else if ctrl && vk == b'F' as u16 {
                                 ctx.ui.execute_action(UiAction::FocusSearch);
+                                if !ctx.ui.search_query.is_empty() {
+                                    ctx.ui.search_select_all();
+                                }
                                 handled = true;
                             } else if ctrl && vk == VK_OEM_COMMA.0 {
                                 ctx.ui.execute_action(UiAction::Navigate(PageRoute::Settings));
@@ -746,6 +760,12 @@ mod win_app {
                                         handled = true;
                                     }
                                 }
+                            } else if ctx.ui.search_focused {
+                                let (k_ok, clip_opt) = ctx.ui.on_search_key_down(vk, ctrl, shift);
+                                if k_ok {
+                                    handled = true;
+                                    clip_to_write = clip_opt;
+                                }
                             }
                             if handled {
                                 ctx.dirty = true;
@@ -753,6 +773,10 @@ mod win_app {
                         }
                     }
                 });
+
+                if let Some(txt) = clip_to_write {
+                    write_clip_quick(&txt);
+                }
 
                 if handled {
                     LRESULT(0)
@@ -764,7 +788,7 @@ mod win_app {
             WM_CHAR => {
                 let cu = wparam.0 as u16;
                 let ctrl = (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
-                if ctrl && cu != 8 && cu != 13 {
+                if ctrl && cu != 13 {
                     return LRESULT(0);
                 }
                 WIN_CTX.with(|cell| {
@@ -884,6 +908,49 @@ mod win_app {
             }
             let _ = CloseClipboard();
             out
+        }
+    }
+
+    fn write_clip_quick(text: &str) {
+        unsafe {
+            use windows::Win32::Foundation::GlobalFree;
+            use windows::Win32::System::DataExchange::{
+                CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+            };
+            use windows::Win32::System::Memory::{
+                GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
+            };
+            use windows::Win32::System::Ole::CF_UNICODETEXT;
+
+            let mut wide: Vec<u16> = text.encode_utf16().collect();
+            wide.push(0);
+            let byte_len = wide.len() * std::mem::size_of::<u16>();
+
+            let mut opened = false;
+            for _ in 0..6 {
+                if OpenClipboard(None).is_ok() {
+                    opened = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(8));
+            }
+            if !opened {
+                return;
+            }
+            let _ = EmptyClipboard();
+            if let Ok(hmem) = GlobalAlloc(GMEM_MOVEABLE, byte_len) {
+                let ptr = GlobalLock(hmem) as *mut u16;
+                if !ptr.is_null() {
+                    std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
+                    let _ = GlobalUnlock(hmem);
+                    if SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(hmem.0))).is_err() {
+                        let _ = GlobalFree(Some(hmem));
+                    }
+                } else {
+                    let _ = GlobalFree(Some(hmem));
+                }
+            }
+            let _ = CloseClipboard();
         }
     }
 

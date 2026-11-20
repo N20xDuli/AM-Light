@@ -226,6 +226,8 @@ pub struct AppSettings {
     pub lyrics_auto_emphasis: bool,
     #[serde(default = "default_true")]
     pub lyrics_frontier_wave: bool,
+    #[serde(default = "default_true")]
+    pub lyrics_end_hold_glow: bool,
     #[serde(default)]
     pub lyrics_blur_downsample: bool,
     #[serde(default = "default_true")]
@@ -261,6 +263,7 @@ impl Default for AppSettings {
             lyrics_non_emphasis_effect: NonEmphasisLyricsEffect::None,
             lyrics_auto_emphasis: true,
             lyrics_frontier_wave: true,
+            lyrics_end_hold_glow: true,
             lyrics_blur_downsample: false,
             motion_artwork_enabled: true,
             live_eq_icon_spectrum: true,
@@ -527,6 +530,7 @@ pub enum ActiveDrag {
     WindowCornerRadius(RectF),
     VizCustomFps(RectF),
     LyricsCustomFps(RectF),
+    SearchTextSelect,
 }
 
 #[derive(Clone, Debug)]
@@ -628,6 +632,7 @@ pub enum UiAction {
     SetLyricsNonEmphasisEffect(NonEmphasisLyricsEffect),
     ToggleLyricsAutoEmphasis,
     ToggleLyricsFrontierWave,
+    ToggleLyricsEndHoldGlow,
     ToggleLyricsBlurDownsample,
     ToggleMotionArtwork,
     ToggleLiveEqIconSpectrum,
@@ -703,6 +708,11 @@ pub struct AppUi {
     // Search & Input
     pub search_focused: bool,
     pub search_query: String,
+    pub search_cursor: usize,
+    pub search_sel_anchor: Option<usize>,
+    pub search_scroll_x: f32,
+    pub search_char_xs: Vec<(usize, f32)>,
+    pub search_last_click_at: Option<Instant>,
     pub search_filter: u8, // 0=All, 1=Songs, 2=Albums, 3=Playlists
     pub last_search_typed: Option<Instant>,
     pub last_dispatched_query: String,
@@ -1173,6 +1183,11 @@ impl AppUi {
             last_hovered_interactive: false,
             search_focused: false,
             search_query: String::new(),
+            search_cursor: 0,
+            search_sel_anchor: None,
+            search_scroll_x: 0.0,
+            search_char_xs: vec![(0, 0.0)],
+            search_last_click_at: None,
             search_filter: 0,
             last_search_typed: None,
             last_dispatched_query: String::new(),
@@ -1678,6 +1693,20 @@ impl AppUi {
         self.hit_regions.iter().any(|hr| {
             !matches!(hr.action, UiAction::SwallowClick) && hr.rect.contains(lx, ly)
         })
+    }
+
+    /// Returns true if `(lx, ly)` hovers the editable text area of the search box (`IDC_IBEAM`).
+    pub fn is_text_cursor_at(&self, lx: f32, ly: f32) -> bool {
+        if self.show_lyrics_overlay {
+            return false;
+        }
+        if !self.search_box_rect.contains(lx, ly) {
+            return false;
+        }
+        if !self.search_query.is_empty() && lx >= self.search_box_rect.right() - 28.0 {
+            return false;
+        }
+        lx >= self.search_box_rect.x + 28.0
     }
 
     #[inline]
@@ -2361,11 +2390,11 @@ impl AppUi {
             &st.artist,
         );
         if !st.title.is_empty() && new_key != self.current_lyrics_key {
-            if !self.current_lyrics_key.is_empty()
-                && track_meta_changed
-                && audio_viz::is_auto_reset_silence()
-            {
-                audio_viz::trigger_inspector_reset();
+            if !self.current_lyrics_key.is_empty() && track_meta_changed {
+                audio_viz::trigger_tempo_reset();
+                if audio_viz::is_auto_reset_silence() {
+                    audio_viz::trigger_inspector_reset();
+                }
             }
             // Preserve currently displayed lyrics smoothly while upgrading key (`meta:` -> `id:` or `i.xxx` -> `storeAdamID`) on the same song
             let saved_same_song_lyrics = if !track_meta_changed
@@ -2856,11 +2885,12 @@ impl AppUi {
         let utok = non_empty_opt(&self.settings.user_token);
         let tx = self.tx.clone();
         let hwnd = self.wake_hwnd;
-        let sf_web = sf.clone();
-        let tx_web = tx.clone();
+        let sf_api = sf.clone();
+        let utok_api = utok.clone();
+        let tx_api = tx.clone();
         self.rt.spawn(async move {
-            if let Ok(rshelves) = am_api::fetch_apple_music_web_shelves(&sf_web, "radio").await {
-                let _ = tx_web.send(AsyncMsg::RadioShelvesLoaded(rshelves));
+            if let Ok(rshelves) = am_api::fetch_official_radio_shelves(&sf_api, utok_api).await {
+                let _ = tx_api.send(AsyncMsg::RadioShelvesLoaded(rshelves));
                 Self::post_ui_wake(hwnd);
             }
         });
@@ -3606,6 +3636,293 @@ impl AppUi {
         }
     }
 
+    fn clamp_search_byte_idx(&self, raw: usize) -> usize {
+        let len = self.search_query.len();
+        let mut idx = raw.min(len);
+        while idx > 0 && !self.search_query.is_char_boundary(idx) {
+            idx -= 1;
+        }
+        idx
+    }
+
+    fn prev_search_char_boundary(&self, cur: usize) -> usize {
+        let c = self.clamp_search_byte_idx(cur);
+        if c == 0 {
+            return 0;
+        }
+        self.search_query[..c]
+            .char_indices()
+            .next_back()
+            .map(|(i, _)| i)
+            .unwrap_or(0)
+    }
+
+    fn next_search_char_boundary(&self, cur: usize) -> usize {
+        let c = self.clamp_search_byte_idx(cur);
+        if c >= self.search_query.len() {
+            return self.search_query.len();
+        }
+        self.search_query[c..]
+            .chars()
+            .next()
+            .map(|ch| c + ch.len_utf8())
+            .unwrap_or(self.search_query.len())
+    }
+
+    fn prev_search_word_boundary(&self, cur: usize) -> usize {
+        let mut idx = self.clamp_search_byte_idx(cur);
+        while idx > 0 {
+            let prev = self.prev_search_char_boundary(idx);
+            let ch = self.search_query[prev..idx].chars().next().unwrap_or(' ');
+            idx = prev;
+            if !ch.is_whitespace() {
+                break;
+            }
+        }
+        while idx > 0 {
+            let prev = self.prev_search_char_boundary(idx);
+            let ch = self.search_query[prev..idx].chars().next().unwrap_or(' ');
+            if ch.is_whitespace() {
+                break;
+            }
+            idx = prev;
+        }
+        idx
+    }
+
+    fn next_search_word_boundary(&self, cur: usize) -> usize {
+        let len = self.search_query.len();
+        let mut idx = self.clamp_search_byte_idx(cur);
+        while idx < len {
+            let next = self.next_search_char_boundary(idx);
+            let ch = self.search_query[idx..next].chars().next().unwrap_or(' ');
+            if ch.is_whitespace() {
+                break;
+            }
+            idx = next;
+        }
+        while idx < len {
+            let next = self.next_search_char_boundary(idx);
+            let ch = self.search_query[idx..next].chars().next().unwrap_or(' ');
+            if !ch.is_whitespace() {
+                break;
+            }
+            idx = next;
+        }
+        idx
+    }
+
+    pub fn search_selection_range(&self) -> Option<(usize, usize)> {
+        let anchor = self.clamp_search_byte_idx(self.search_sel_anchor?);
+        let cursor = self.clamp_search_byte_idx(self.search_cursor);
+        if anchor == cursor {
+            None
+        } else {
+            Some((anchor.min(cursor), anchor.max(cursor)))
+        }
+    }
+
+    pub fn search_selected_text(&self) -> Option<String> {
+        let (a, b) = self.search_selection_range()?;
+        Some(self.search_query[a..b].to_string())
+    }
+
+    pub fn search_select_all(&mut self) {
+        self.search_sel_anchor = Some(0);
+        self.search_cursor = self.search_query.len();
+    }
+
+    fn search_delete_selection(&mut self) -> bool {
+        let Some((a, b)) = self.search_selection_range() else {
+            self.search_sel_anchor = None;
+            return false;
+        };
+        self.search_query.replace_range(a..b, "");
+        self.search_cursor = a;
+        self.search_sel_anchor = None;
+        self.last_search_typed = Some(Instant::now());
+        true
+    }
+
+    fn search_insert_str(&mut self, s: &str) {
+        if s.is_empty() {
+            return;
+        }
+        let _ = self.search_delete_selection();
+        let pos = self.clamp_search_byte_idx(self.search_cursor);
+        self.search_query.insert_str(pos, s);
+        self.search_cursor = pos + s.len();
+        self.search_sel_anchor = None;
+        self.last_search_typed = Some(Instant::now());
+    }
+
+    fn search_hit_test_x(&self, mouse_x: f32) -> usize {
+        if self.search_query.is_empty() {
+            return 0;
+        }
+        let text_left = self.search_box_rect.x + 36.0;
+        let rel_x = (mouse_x - text_left + self.search_scroll_x).max(0.0);
+        if self.search_char_xs.len() >= 2 {
+            let mut best_idx = 0usize;
+            let mut best_dist = f32::MAX;
+            for &(b_idx, cx) in &self.search_char_xs {
+                let d = (cx - rel_x).abs();
+                if d < best_dist {
+                    best_dist = d;
+                    best_idx = b_idx;
+                }
+            }
+            return self.clamp_search_byte_idx(best_idx);
+        }
+        self.search_query.len()
+    }
+
+    fn search_byte_to_x(&self, byte_idx: usize) -> f32 {
+        let target = self.clamp_search_byte_idx(byte_idx);
+        if target == 0 {
+            return 0.0;
+        }
+        if let Some(&(_, x)) = self.search_char_xs.iter().find(|&&(b, _)| b == target) {
+            return x;
+        }
+        self.search_char_xs
+            .iter()
+            .rev()
+            .find(|&&(b, _)| b <= target)
+            .map(|&(_, x)| x)
+            .unwrap_or(0.0)
+    }
+
+    /// Handles navigation, selection, copy/cut/select-all and delete keys inside the search box.
+    /// Returns `(handled, clipboard_text_to_write)`.
+    pub fn on_search_key_down(
+        &mut self,
+        vk: u16,
+        ctrl: bool,
+        shift: bool,
+    ) -> (bool, Option<String>) {
+        if !self.search_focused {
+            return (false, None);
+        }
+        self.search_cursor = self.clamp_search_byte_idx(self.search_cursor);
+        if let Some(a) = self.search_sel_anchor {
+            self.search_sel_anchor = Some(self.clamp_search_byte_idx(a));
+        }
+
+        // Ctrl+A: Select All
+        if ctrl && (vk == b'A' as u16) {
+            self.search_select_all();
+            return (true, None);
+        }
+        // Ctrl+C: Copy selection
+        if ctrl && (vk == b'C' as u16) {
+            let copied = self.search_selected_text();
+            return (true, copied);
+        }
+        // Ctrl+X: Cut selection
+        if ctrl && (vk == b'X' as u16) {
+            let cut = self.search_selected_text();
+            if cut.is_some() {
+                self.search_delete_selection();
+            }
+            return (true, cut);
+        }
+        // Ctrl+Backspace: Delete previous word (or active selection)
+        if ctrl && vk == 0x08 {
+            if !self.search_delete_selection() && self.search_cursor > 0 {
+                let prev = self.prev_search_word_boundary(self.search_cursor);
+                self.search_query.replace_range(prev..self.search_cursor, "");
+                self.search_cursor = prev;
+                self.last_search_typed = Some(Instant::now());
+            }
+            return (true, None);
+        }
+
+        match vk {
+            0x25 /* VK_LEFT */ => {
+                if shift {
+                    if self.search_sel_anchor.is_none() {
+                        self.search_sel_anchor = Some(self.search_cursor);
+                    }
+                    self.search_cursor = if ctrl {
+                        self.prev_search_word_boundary(self.search_cursor)
+                    } else {
+                        self.prev_search_char_boundary(self.search_cursor)
+                    };
+                } else if let Some((a, _)) = self.search_selection_range() {
+                    self.search_cursor = a;
+                    self.search_sel_anchor = None;
+                } else {
+                    self.search_cursor = if ctrl {
+                        self.prev_search_word_boundary(self.search_cursor)
+                    } else {
+                        self.prev_search_char_boundary(self.search_cursor)
+                    };
+                    self.search_sel_anchor = None;
+                }
+                (true, None)
+            }
+            0x27 /* VK_RIGHT */ => {
+                if shift {
+                    if self.search_sel_anchor.is_none() {
+                        self.search_sel_anchor = Some(self.search_cursor);
+                    }
+                    self.search_cursor = if ctrl {
+                        self.next_search_word_boundary(self.search_cursor)
+                    } else {
+                        self.next_search_char_boundary(self.search_cursor)
+                    };
+                } else if let Some((_, b)) = self.search_selection_range() {
+                    self.search_cursor = b;
+                    self.search_sel_anchor = None;
+                } else {
+                    self.search_cursor = if ctrl {
+                        self.next_search_word_boundary(self.search_cursor)
+                    } else {
+                        self.next_search_char_boundary(self.search_cursor)
+                    };
+                    self.search_sel_anchor = None;
+                }
+                (true, None)
+            }
+            0x24 /* VK_HOME */ => {
+                if shift {
+                    if self.search_sel_anchor.is_none() {
+                        self.search_sel_anchor = Some(self.search_cursor);
+                    }
+                } else {
+                    self.search_sel_anchor = None;
+                }
+                self.search_cursor = 0;
+                (true, None)
+            }
+            0x23 /* VK_END */ => {
+                if shift {
+                    if self.search_sel_anchor.is_none() {
+                        self.search_sel_anchor = Some(self.search_cursor);
+                    }
+                } else {
+                    self.search_sel_anchor = None;
+                }
+                self.search_cursor = self.search_query.len();
+                (true, None)
+            }
+            0x2E /* VK_DELETE */ => {
+                if !self.search_delete_selection() && self.search_cursor < self.search_query.len() {
+                    let next = if ctrl {
+                        self.next_search_word_boundary(self.search_cursor)
+                    } else {
+                        self.next_search_char_boundary(self.search_cursor)
+                    };
+                    self.search_query.replace_range(self.search_cursor..next, "");
+                    self.last_search_typed = Some(Instant::now());
+                }
+                (true, None)
+            }
+            _ => (false, None),
+        }
+    }
+
     pub fn on_char_input(&mut self, ch: char) -> bool {
         if !self.search_focused {
             // Global shortcuts when not typing in search box
@@ -3623,8 +3940,15 @@ impl AppUi {
         }
         if ch == '\u{08}' {
             // Backspace
-            self.search_query.pop();
-            self.last_search_typed = Some(Instant::now());
+            if !self.search_delete_selection() {
+                let cur = self.clamp_search_byte_idx(self.search_cursor);
+                if cur > 0 {
+                    let prev = self.prev_search_char_boundary(cur);
+                    self.search_query.replace_range(prev..cur, "");
+                    self.search_cursor = prev;
+                    self.last_search_typed = Some(Instant::now());
+                }
+            }
             return true;
         }
         if ch == '\r' || ch == '\n' {
@@ -3637,11 +3961,13 @@ impl AppUi {
         }
         if ch == '\u{1b}' {
             self.search_focused = false;
+            self.search_sel_anchor = None;
             return true;
         }
         if !ch.is_control() {
-            self.search_query.push(ch);
-            self.last_search_typed = Some(Instant::now());
+            let mut buf = [0u8; 4];
+            let s = ch.encode_utf8(&mut buf);
+            self.search_insert_str(s);
             return true;
         }
         false
@@ -3727,8 +4053,7 @@ impl AppUi {
             return self.apply_pasted_user_token(pasted);
         }
         if self.search_focused {
-            self.search_query.push_str(&clean);
-            self.last_search_typed = Some(Instant::now());
+            self.search_insert_str(&clean);
             return true;
         }
         if self.route == PageRoute::Settings
@@ -3855,9 +4180,33 @@ impl AppUi {
 
         let was_search = self.search_focused;
         let was_tok = self.token_box_focused;
-        self.search_focused = self.search_box_rect.contains(x, y);
+        let in_search = self.search_box_rect.contains(x, y);
+        let in_search_clear = in_search
+            && !self.search_query.is_empty()
+            && x >= self.search_box_rect.right() - 28.0;
+        self.search_focused = in_search;
         self.token_box_focused =
             self.route == PageRoute::Settings && self.token_box_rect.contains(x, y);
+
+        if in_search && !in_search_clear {
+            let now = Instant::now();
+            let is_dbl = self
+                .search_last_click_at
+                .is_some_and(|t| now.duration_since(t) <= std::time::Duration::from_millis(400));
+            if is_dbl && !self.search_query.is_empty() {
+                self.search_select_all();
+                self.search_last_click_at = None;
+            } else {
+                let idx = self.search_hit_test_x(x);
+                self.search_cursor = idx;
+                self.search_sel_anchor = Some(idx);
+                self.active_drag = Some(ActiveDrag::SearchTextSelect);
+                self.search_last_click_at = Some(now);
+            }
+            return true;
+        } else if !in_search {
+            self.search_sel_anchor = None;
+        }
         was_search != self.search_focused || was_tok != self.token_box_focused
     }
 
@@ -3995,6 +4344,13 @@ impl AppUi {
                 self.settings.lyrics_fps_cap = FpsCap::Custom;
                 if commit && self.wake_hwnd != 0 {
                     self.settings.save();
+                }
+            }
+            ActiveDrag::SearchTextSelect => {
+                let idx = self.search_hit_test_x(x);
+                self.search_cursor = idx;
+                if commit && self.search_sel_anchor == Some(self.search_cursor) {
+                    self.search_sel_anchor = None;
                 }
             }
         }
@@ -4165,6 +4521,9 @@ impl AppUi {
             }
             VizHitAction::ToggleReactorSubStyle => {
                 self.viz_state.reactor_sub_style = (self.viz_state.reactor_sub_style + 1) % 2;
+            }
+            VizHitAction::ToggleSoundstageColorMode => {
+                self.viz_state.soundstage_multicolor = !self.viz_state.soundstage_multicolor;
             }
         }
     }
@@ -4339,12 +4698,17 @@ impl AppUi {
             }
             UiAction::FocusSearch => {
                 self.search_focused = true;
+                self.search_cursor = self.search_query.len();
                 if self.route != PageRoute::Search && !self.search_query.is_empty() {
                     self.navigate_to(PageRoute::Search);
                 }
             }
             UiAction::ClearSearch => {
                 self.search_query.clear();
+                self.search_cursor = 0;
+                self.search_sel_anchor = None;
+                self.search_scroll_x = 0.0;
+                self.search_char_xs = vec![(0, 0.0)];
                 self.last_dispatched_query.clear();
                 self.search_focused = true;
             }
@@ -4863,6 +5227,12 @@ impl AppUi {
             }
             UiAction::ToggleLyricsFrontierWave => {
                 self.settings.lyrics_frontier_wave = !self.settings.lyrics_frontier_wave;
+                if self.wake_hwnd != 0 {
+                    self.settings.save();
+                }
+            }
+            UiAction::ToggleLyricsEndHoldGlow => {
+                self.settings.lyrics_end_hold_glow = !self.settings.lyrics_end_hold_glow;
                 if self.wake_hwnd != 0 {
                     self.settings.save();
                 }
@@ -5748,6 +6118,7 @@ impl AppUi {
                 self.settings.lyrics_non_emphasis_effect,
                 self.settings.lyrics_auto_emphasis,
                 self.settings.lyrics_frontier_wave,
+                self.settings.lyrics_end_hold_glow,
                 1.0,
                 lyrics_motion_frame.as_ref(),
             );
@@ -5929,7 +6300,7 @@ impl AppUi {
             } else {
                 false
             };
-            self.draw_ipad_sidebar(r, sb_rect);
+            self.draw_ipad_sidebar(r, sb_rect, !pushed_sb);
             if pushed_sb {
                 r.pop_layer();
             }
@@ -5948,7 +6319,7 @@ impl AppUi {
             });
             let sb_x = -(1.0 - sb_open_t) * Theme::SIDEBAR_WIDTH;
             let sb_rect = RectF::new(sb_x, 0.0, Theme::SIDEBAR_WIDTH, win_h);
-            self.draw_ipad_sidebar(r, sb_rect);
+            self.draw_ipad_sidebar(r, sb_rect, true);
         }
 
         if self.show_queue_popover {
@@ -6037,6 +6408,7 @@ impl AppUi {
                     self.settings.lyrics_non_emphasis_effect,
                     self.settings.lyrics_auto_emphasis,
                     self.settings.lyrics_frontier_wave,
+                    self.settings.lyrics_end_hold_glow,
                     1.0,
                     lyrics_motion_frame.as_ref(),
                 );
@@ -6073,6 +6445,7 @@ impl AppUi {
                     self.settings.lyrics_non_emphasis_effect,
                     self.settings.lyrics_auto_emphasis,
                     self.settings.lyrics_frontier_wave,
+                    self.settings.lyrics_end_hold_glow,
                     ease_alpha,
                     lyrics_motion_frame.as_ref(),
                 );
@@ -6095,14 +6468,63 @@ impl AppUi {
     // ========================================================================
     // iPadOS Apple Music Left Sidebar (`media_1794844113582_e39fc57c.jpg`)
     // ========================================================================
-    fn draw_ipad_sidebar(&mut self, r: &mut D2DRenderer, sb: RectF) {
-        let sb_fill = if self.glass_off() {
-            Theme::SIDEBAR_OPAQUE
+    fn draw_ipad_sidebar(&mut self, r: &mut D2DRenderer, sb: RectF, allow_live_glass: bool) {
+        let is_floating = self.last_win_w < Theme::SIDEBAR_AUTO_COLLAPSE_WIDTH;
+        if !self.glass_off() && allow_live_glass && is_floating {
+            // Narrow-window floating sidebar drawer refracts live album covers underneath!
+            r.draw_liquid_glass(
+                sb,
+                16.0,
+                24.0,
+                Color::rgba(22, 22, 28, 0.42),
+                Theme::GLASS_RIM_LIGHT,
+                false,
+            );
+        } else if !self.glass_off() {
+            // Docked macOS Tahoe / iPadOS 26 tinted translucent glass sidebar with soft ambient artwork hue
+            r.fill_rect(sb, Theme::SIDEBAR_GLASS);
+            r.push_clip(sb);
+            let p0 = self.lyrics_view.smooth_palette[0];
+            let p1 = self.lyrics_view.smooth_palette[1];
+            r.fill_radial_glow(
+                sb.x + sb.w * 0.20,
+                sb.y + sb.h * 0.14,
+                sb.w * 1.15,
+                sb.h * 0.38,
+                p0.with_alpha(0.14),
+                p0.with_alpha(0.0),
+            );
+            r.fill_radial_glow(
+                sb.x + sb.w * 0.85,
+                sb.y + sb.h * 0.82,
+                sb.w * 1.10,
+                sb.h * 0.40,
+                p1.with_alpha(0.11),
+                p1.with_alpha(0.0),
+            );
+            r.fill_linear_gradient_rect(
+                RectF::new(sb.x, sb.y, sb.w, 84.0),
+                0.0,
+                sb.x,
+                sb.y,
+                sb.x,
+                sb.y + 84.0,
+                Color::rgba(255, 255, 255, 0.045),
+                Color::rgba(255, 255, 255, 0.0),
+            );
+            r.pop_clip();
+            r.draw_line(
+                sb.right() - 0.5,
+                sb.y,
+                sb.right() - 0.5,
+                sb.bottom(),
+                Color::rgba(255, 255, 255, 0.13),
+                1.0,
+            );
         } else {
-            Theme::SIDEBAR_GLASS
-        };
-        r.fill_rect(sb, sb_fill);
-        r.draw_line(sb.right(), sb.y, sb.right(), sb.bottom(), Theme::SEPARATOR, 1.0);
+            r.fill_rect(sb, Theme::SIDEBAR_OPAQUE);
+            r.draw_line(sb.right(), sb.y, sb.right(), sb.bottom(), Theme::SEPARATOR, 1.0);
+        }
         self.hit_regions.push(HitRegion {
             rect: sb,
             action: UiAction::SwallowClick,
@@ -6169,7 +6591,7 @@ impl AppUi {
 
         let mut y = top_y + btn_h + 12.0;
 
-        // Search Bar Capsule (`#2B2930` rounded pill, red magnifying glass + `搜索`)
+        // Search Bar Capsule (`#2B2930` rounded pill, red magnifying glass + native centered caret & selection)
         let sbox = RectF::new(x0 + pad_x, y, sb.w - pad_x * 2.0, 36.0);
         self.search_box_rect = sbox;
         r.fill_rounded_rect(sbox, 18.0, Theme::SIDEBAR_PILL);
@@ -6181,31 +6603,83 @@ impl AppUi {
             RectF::new(sbox.x + 12.0, sbox.y + 9.5, 17.0, 17.0),
             Theme::ACCENT_RED,
         );
-        let disp_q = if self.search_query.is_empty() {
-            if self.search_focused {
-                "|"
-            } else {
-                "搜索"
-            }
-        } else if self.search_focused {
-            &format!("{}|", self.search_query)
+
+        let text_vp = RectF::new(sbox.x + 36.0, sbox.y, (sbox.w - 64.0).max(24.0), sbox.h);
+        self.search_cursor = self.clamp_search_byte_idx(self.search_cursor);
+        self.search_char_xs = r.compute_single_line_char_xs(&self.search_query, 14.0, 400);
+        let total_text_w = self.search_char_xs.last().map(|&(_, x)| x).unwrap_or(0.0);
+        let caret_rel_x = self.search_byte_to_x(self.search_cursor);
+
+        // Keep horizontal scroll tracking caret cleanly inside text viewport
+        let max_scroll = (total_text_w - text_vp.w + 6.0).max(0.0);
+        if total_text_w <= text_vp.w - 4.0 {
+            self.search_scroll_x = 0.0;
         } else {
-            &self.search_query
-        };
-        r.draw_text(
-            disp_q,
-            RectF::new(sbox.x + 36.0, sbox.y, sbox.w - 64.0, sbox.h),
-            14.0,
-            400,
-            if self.search_query.is_empty() {
-                Theme::TEXT_SECONDARY
-            } else {
-                Theme::TEXT_PRIMARY
-            },
-            TextAlign::Left,
-            true,
-            false,
-        );
+            if caret_rel_x - self.search_scroll_x > text_vp.w - 6.0 {
+                self.search_scroll_x = caret_rel_x - (text_vp.w - 6.0);
+            } else if caret_rel_x - self.search_scroll_x < 2.0 {
+                self.search_scroll_x = (caret_rel_x - 2.0).max(0.0);
+            }
+            self.search_scroll_x = self.search_scroll_x.clamp(0.0, max_scroll);
+        }
+
+        r.push_clip(text_vp);
+        if self.search_query.is_empty() {
+            r.draw_text(
+                "搜索",
+                text_vp,
+                14.0,
+                400,
+                if self.search_focused {
+                    Theme::TEXT_MUTED
+                } else {
+                    Theme::TEXT_SECONDARY
+                },
+                TextAlign::Left,
+                true,
+                false,
+            );
+        } else {
+            if self.search_focused {
+                if let Some((s0, s1)) = self.search_selection_range() {
+                    let sx0 = text_vp.x + self.search_byte_to_x(s0) - self.search_scroll_x;
+                    let sx1 = text_vp.x + self.search_byte_to_x(s1) - self.search_scroll_x;
+                    let sel_h = 20.0;
+                    let sel_y = sbox.y + (sbox.h - sel_h) * 0.5;
+                    r.fill_rounded_rect(
+                        RectF::new(sx0, sel_y, (sx1 - sx0).max(2.0), sel_h),
+                        4.0,
+                        Theme::ACCENT_RED.with_alpha(0.38),
+                    );
+                }
+            }
+            let draw_w = total_text_w.max(text_vp.w) + 12.0;
+            r.draw_text(
+                &self.search_query,
+                RectF::new(text_vp.x - self.search_scroll_x, text_vp.y, draw_w, text_vp.h),
+                14.0,
+                400,
+                Theme::TEXT_PRIMARY,
+                TextAlign::Left,
+                true,
+                false,
+            );
+        }
+
+        // Crisp vertically centered geometric caret bar (never uses off-baseline ASCII `|`!)
+        if self.search_focused {
+            let caret_h = 17.0f32;
+            let caret_y = sbox.y + (sbox.h - caret_h) * 0.5;
+            let caret_x = (text_vp.x + caret_rel_x - self.search_scroll_x)
+                .clamp(text_vp.x, text_vp.right() - 1.6);
+            r.fill_rounded_rect(
+                RectF::new(caret_x, caret_y, 1.6, caret_h),
+                0.8,
+                Theme::ACCENT_RED,
+            );
+        }
+        r.pop_clip();
+
         self.hit_regions.push(HitRegion {
             rect: sbox,
             action: UiAction::FocusSearch,
@@ -6788,15 +7262,27 @@ impl AppUi {
             } else {
                 false
             };
-            r.draw_liquid_glass_button(
-                sb_btn,
-                br,
-                GlassBtnVariant::Regular,
-                sb_hov,
-                self.mouse_down,
-                self.mouse_pos,
-                self.glass_off(),
-            );
+            if pushed {
+                r.draw_liquid_glass_button(
+                    sb_btn,
+                    br,
+                    GlassBtnVariant::Regular,
+                    sb_hov,
+                    self.mouse_down,
+                    self.mouse_pos,
+                    self.glass_off(),
+                );
+            } else {
+                r.draw_liquid_glass_floating_button(
+                    sb_btn,
+                    br,
+                    GlassBtnVariant::Regular,
+                    sb_hov,
+                    self.mouse_down,
+                    self.mouse_pos,
+                    self.glass_off(),
+                );
+            }
             r.draw_icon(SfIcon::SidebarLeft, sb_btn.inset(8.0, 8.0), Theme::TEXT_PRIMARY);
             if pushed {
                 r.pop_layer();
@@ -6813,7 +7299,7 @@ impl AppUi {
         let back_btn = RectF::new(lx, ty, bh, bh);
         let can_back = !self.nav_history.is_empty();
         let back_hov = can_back && back_btn.contains(self.mouse_pos.0, self.mouse_pos.1);
-        r.draw_liquid_glass_button(
+        r.draw_liquid_glass_floating_button(
             back_btn,
             br,
             if can_back {
@@ -6864,7 +7350,7 @@ impl AppUi {
             (cls_r, SfIcon::WinClose, true, UiAction::WindowClose),
         ] {
             let hov = wr.contains(self.mouse_pos.0, self.mouse_pos.1);
-            r.draw_liquid_glass_button(
+            r.draw_liquid_glass_floating_button(
                 wr,
                 br,
                 if is_close && hov {
@@ -6905,7 +7391,7 @@ impl AppUi {
             ),
         ] {
             let hov = hr.contains(self.mouse_pos.0, self.mouse_pos.1);
-            r.draw_liquid_glass_button(
+            r.draw_liquid_glass_floating_button(
                 hr,
                 br,
                 if is_active {
@@ -6942,18 +7428,21 @@ impl AppUi {
             action: UiAction::SwallowClick,
         });
 
-        // Ambient elevation shadow underneath the floating capsule
-        r.fill_rounded_rect(
-            RectF::new(pill.x + 6.0, pill.y + 6.0, pill.w - 12.0, pill.h),
-            31.0,
-            Color::rgba(0, 0, 0, 0.42),
-        );
+        // When glass is off, draw subtle opaque elevation shadow; when Liquid Glass is ON,
+        // `draw_liquid_glass` draws an exterior-only shadow AFTER capture so covers inside stay 100% bright!
+        if self.glass_off() {
+            r.fill_rounded_rect(
+                RectF::new(pill.x + 4.0, pill.y + 5.0, pill.w - 8.0, pill.h),
+                31.0,
+                Color::rgba(0, 0, 0, 0.40),
+            );
+        }
 
-        // True GPU-blurred Liquid Glass material over live scrolled content!
+        // True GPU two-zone optical Liquid Glass material over live scrolled content!
         r.draw_liquid_glass(
             pill,
             31.0,
-            18.0,
+            20.0,
             Theme::GLASS_REGULAR_FILL,
             Theme::GLASS_RIM_LIGHT,
             self.glass_off(),
@@ -10765,9 +11254,17 @@ impl AppUi {
         ry += 10.0;
         self.draw_toggle_row(
             r,
-            RectF::new(x0 + 18.0, ry, cw - 36.0, 54.0),
+            RectF::new(x0 + 18.0, ry, (cw - 52.0) * 0.5, 54.0),
+            "末尾停留整词渐亮",
+            "高亮进度停在强调字词末尾时，整词发光逐渐增强至前沿亮度",
+            self.settings.lyrics_end_hold_glow,
+            UiAction::ToggleLyricsEndHoldGlow,
+        );
+        self.draw_toggle_row(
+            r,
+            RectF::new(x0 + cw * 0.5 + 8.0, ry, (cw - 52.0) * 0.5, 54.0),
             "未唱歌词轻度降采样节能",
-            "关闭为原生 1× 高清景深模糊；开启后未唱行以 0.75× 渲染进一步降低 GPU 负载",
+            "关闭为原生 1× 高清景深模糊；开启后未唱行 0.75× 渲染节能",
             self.settings.lyrics_blur_downsample,
             UiAction::ToggleLyricsBlurDownsample,
         );
@@ -11171,7 +11668,7 @@ impl AppUi {
             r,
             RectF::new(x0 + 18.0, py, (cw - 52.0) * 0.5, 60.0),
             "减弱动态效果",
-            "收敛弹簧、封面展开与粒子运动，降低动画负载",
+            "收敛弹簧、封面展开与粒子运动（不影响歌词页流光背景）",
             self.settings.reduce_motion,
             UiAction::ToggleReduceMotion,
         );
@@ -11714,11 +12211,18 @@ impl AppUi {
             rect: pop,
             action: UiAction::SwallowClick,
         });
+        if self.glass_off() {
+            r.fill_rounded_rect(
+                RectF::new(pop.x + 2.0, pop.y + 6.0, pop.w - 4.0, pop.h),
+                18.0,
+                Color::rgba(0, 0, 0, 0.38),
+            );
+        }
         r.draw_liquid_glass(
             pop,
             18.0,
-            18.0,
-            Color::rgba(32, 32, 38, 0.86),
+            20.0,
+            Color::rgba(22, 24, 30, 0.44),
             Theme::GLASS_RIM_LIGHT,
             self.glass_off(),
         );
@@ -11806,11 +12310,18 @@ impl AppUi {
             rect: pop,
             action: UiAction::SwallowClick,
         });
+        if self.glass_off() {
+            r.fill_rounded_rect(
+                RectF::new(pop.x + 2.0, pop.y + 6.0, pop.w - 4.0, pop.h),
+                18.0,
+                Color::rgba(0, 0, 0, 0.38),
+            );
+        }
         r.draw_liquid_glass(
             pop,
             18.0,
-            18.0,
-            Color::rgba(32, 32, 38, 0.88),
+            20.0,
+            Color::rgba(22, 24, 30, 0.44),
             Theme::GLASS_RIM_LIGHT,
             self.glass_off(),
         );
