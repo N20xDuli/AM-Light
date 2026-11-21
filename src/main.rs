@@ -2871,7 +2871,9 @@ mod tests {
                 subtitle: "资料库".to_string(),
                 description: "".to_string(),
                 artwork_url: None,
+                motion_video_url: None,
                 tracks: new.clone(),
+                related_albums: Vec::new(),
             },
             1700000000,
         );
@@ -3488,6 +3490,7 @@ lo48.m3u8\n";
             id: "12345".to_string(),
             title_hint: "Test Album".to_string(),
             artwork_url: None,
+            motion_video_url: None,
             card_rect: src_rect,
             card_radius: 12.0,
         });
@@ -3949,6 +3952,253 @@ lo48.m3u8\n";
                 qq_lyr.as_ref().is_some_and(|l| !l.lines.is_empty()),
                 "QQ Music direct songmid lyrics must resolve"
             );
+        });
+    }
+
+    #[test]
+    fn test_v028_motion_viewport_detail_cover_backend_switch_and_track_desync() {
+        use am_light_lib::app_ui::{AppUi, ContainerDetailData, PageRoute, UiAction};
+        use am_light_lib::backends::PlaybackBackend;
+        use am_light_lib::motion_art::MotionArtManager;
+        use am_light_lib::smtc::SmtcState;
+        use am_light_lib::theme::RectF;
+
+        // 1. URL-keyed viewport motion art supports >3 visible cards simultaneously & stops offscreen cards immediately
+        let mgr = MotionArtManager::new();
+        let screen1: Vec<String> = (1..=6)
+            .map(|i| format!("https://mvod.itunes.apple.com/mock_motion_{i}.m3u8"))
+            .collect();
+        mgr.sync_visible_urls(&screen1);
+        let active1 = mgr.active_slot_urls();
+        assert_eq!(active1.len(), 6, "all 6 visible viewport covers must be active");
+
+        // Scroll down: cards 1..=2 leave viewport, cards 3..=6 stay, cards 7..=8 enter
+        let screen2: Vec<String> = (3..=8)
+            .map(|i| format!("https://mvod.itunes.apple.com/mock_motion_{i}.m3u8"))
+            .collect();
+        mgr.sync_visible_urls(&screen2);
+        let active2 = mgr.active_slot_urls();
+        assert_eq!(active2.len(), 6);
+        assert!(
+            !active2.iter().any(|u| u.ends_with("_1.m3u8") || u.ends_with("_2.m3u8")),
+            "scrolled-out covers must stop playing immediately"
+        );
+        assert!(
+            active2.iter().any(|u| u.ends_with("_7.m3u8") && MotionArtManager::slot_key_for_url(u).starts_with("u_")),
+            "newly visible covers must use stable URL-keyed slots"
+        );
+        mgr.sync_visible_urls(&[]);
+        assert!(mgr.active_slot_urls().is_empty(), "leaving Home must stop all Home motion covers");
+
+        // 2. Cover launch animation preserves artwork & motion URL while detail_loading == true (zero black flash!)
+        let mut ui = AppUi::new(0);
+        ui.execute_action(UiAction::OpenContainerFromCard {
+            kind: "albums".to_string(),
+            id: "alb-999".to_string(),
+            title_hint: "Motion Album".to_string(),
+            artwork_url: Some("https://is1-ssl.mzstatic.com/art/600x600bb.jpg".to_string()),
+            motion_video_url: Some("https://mvod.itunes.apple.com/detail_hero.m3u8".to_string()),
+            card_rect: RectF::new(40.0, 200.0, 200.0, 200.0),
+            card_radius: 14.0,
+        });
+        assert!(ui.detail_loading);
+        assert_eq!(ui.pending_detail_id, "alb-999");
+        assert_eq!(ui.pending_detail_title, "Motion Album");
+        assert_eq!(
+            ui.pending_detail_artwork.as_deref(),
+            Some("https://is1-ssl.mzstatic.com/art/600x600bb.jpg")
+        );
+        assert_eq!(
+            ui.pending_detail_motion_url.as_deref(),
+            Some("https://mvod.itunes.apple.com/detail_hero.m3u8")
+        );
+        // Even after cover_launch_anim completes while still loading, pending cover remains intact
+        ui.cover_launch_anim = None;
+        assert!(ui.pending_detail_artwork.is_some());
+
+        // 3. Backend switch after paused Apple Music Native strictly isolates stale AM state
+        ui.settings.playback_backend = PlaybackBackend::AppleMusicNative;
+        ui.smtc = SmtcState {
+            active: true,
+            title: "AM Track".to_string(),
+            artist: "AM Artist".to_string(),
+            status: "Paused".to_string(),
+            position_sec: 42.0,
+            duration_sec: 210.0,
+            backend_mode: "agent".to_string(),
+            adam_id: Some("10001".to_string()),
+            ..Default::default()
+        };
+        ui.switch_playback_backend(PlaybackBackend::NetEase);
+        assert_eq!(ui.settings.playback_backend, PlaybackBackend::NetEase);
+        assert!(ui.smtc.title.is_empty(), "switching backend must clear departed backend metadata");
+        // Stale AM Native snapshot must be rejected while on NetEase
+        ui.on_playback_state_changed(SmtcState {
+            active: true,
+            title: "Stale AM Track".to_string(),
+            status: "Paused".to_string(),
+            backend_mode: "agent".to_string(),
+            ..Default::default()
+        });
+        assert!(ui.smtc.title.is_empty(), "stale AM Native update must never overwrite NetEase state");
+        // Legitimate NetEase update must be accepted immediately
+        ui.on_playback_state_changed(SmtcState {
+            active: true,
+            title: "晴天".to_string(),
+            artist: "周杰伦".to_string(),
+            status: "Playing".to_string(),
+            position_sec: 40.0,
+            duration_sec: 269.0,
+            backend_mode: "netease".to_string(),
+            adam_id: Some("ne:186016".to_string()),
+            position_is_calibrated: true,
+            ..Default::default()
+        });
+        assert_eq!(ui.smtc.title, "晴天");
+        assert_eq!(ui.smtc.status, "Playing");
+
+        // 4. NetEase Next-track command immediately resets playhead to 0:00 and holds buffering (zero 40s lyrics jump!)
+        ui.execute_action(UiAction::NextTrack);
+        assert_eq!(ui.smtc.position_sec, 0.0, "playhead must immediately reset to 0:00 on track switch");
+        assert_eq!(ui.smtc.status, "Paused", "status must pause/buffer while next track audio loads");
+        assert!(ui.playback_loading, "playback_loading must stay true until next track audio starts");
+
+        // 5. Detail page data supports motion_video_url & related_albums for Artist profile pages
+        let artist_det = ContainerDetailData {
+            id: "6452".to_string(),
+            kind: "ne-artist".to_string(),
+            title: "周杰伦".to_string(),
+            subtitle: "网易云音乐 · 50 首热门 · 12 张专辑".to_string(),
+            description: String::new(),
+            artwork_url: None,
+            motion_video_url: None,
+            tracks: Vec::new(),
+            related_albums: Vec::new(),
+        };
+        assert_eq!(artist_det.kind, "ne-artist");
+        assert!(!matches!(ui.route, PageRoute::Settings));
+    }
+
+    #[test]
+    fn test_v028_context_menus_playlist_transfer_matcher_and_immersive_lyrics() {
+        use am_light_lib::am_agent::AgentTrackInput;
+        use am_light_lib::app_ui::{AppUi, ContainerDetailData, ContextMenuTarget, UiAction};
+        use am_light_lib::backends::{match_track_score, normalize_match_text, PlaybackBackend};
+        use am_light_lib::lyrics_view::{eval_immersive_corner_targets, LyricsHitAction};
+        use am_light_lib::netease_api;
+        use am_light_lib::theme::RectF;
+
+        // 1. Cross-platform track matcher accuracy (CJK/Latin/parenthetical/remix penalty)
+        assert_eq!(normalize_match_text("晴天 (Live) [伴奏]"), "晴天");
+        let exact = match_track_score("七里香", "周杰伦", 299.0, "七里香", "周杰伦", 299.5);
+        let remix = match_track_score("七里香", "周杰伦", 299.0, "七里香 (DJ Remix)", "DJ 小明", 240.0);
+        assert!(exact >= 0.95, "exact CJK match must score high: {exact}");
+        assert!(remix < 0.54, "unwanted DJ remix must be rejected: {remix}");
+
+        // 2. Context menu (`•••`) actions on tracks, detail page, and lyrics overlay + Transfer modal
+        let mut ui = AppUi::new(0);
+        let sample_tr = AgentTrackInput {
+            id: "ne:186016".to_string(),
+            catalog_id: None,
+            kind: Some("ne-song".to_string()),
+            name: "晴天".to_string(),
+            artist_name: "周杰伦".to_string(),
+            album_name: "叶惠美".to_string(),
+            duration_sec: 269.0,
+            artwork_url: None,
+            audio_traits: Vec::new(),
+        };
+        ui.execute_action(UiAction::OpenTrackContextMenu {
+            track: sample_tr.clone(),
+            anchor: RectF::new(600.0, 220.0, 28.0, 28.0),
+        });
+        assert!(matches!(
+            ui.context_menu.as_ref().map(|c| &c.target),
+            Some(ContextMenuTarget::Track(_))
+        ));
+        ui.execute_action(UiAction::ToggleContextPlaylistSubmenu);
+        assert!(ui.context_menu.as_ref().is_some_and(|c| c.show_playlist_submenu));
+
+        // PlayNextTrack pushes into play_next_queue on Apple Music Native when a track is playing
+        ui.smtc.title = "Now Playing".to_string();
+        ui.execute_action(UiAction::PlayNextTrack(sample_tr.clone()));
+        assert_eq!(ui.play_next_queue.len(), 1);
+        assert!(ui.context_menu.is_none());
+
+        // Cross-platform Playlist Transfer Modal
+        ui.detail_data = Some(ContainerDetailData {
+            id: "19723756".to_string(),
+            kind: "ne-playlist".to_string(),
+            title: "云音乐飙升榜".to_string(),
+            subtitle: "网易云".to_string(),
+            description: String::new(),
+            artwork_url: None,
+            motion_video_url: None,
+            tracks: vec![sample_tr.clone()],
+            related_albums: Vec::new(),
+        });
+        ui.execute_action(UiAction::OpenPlaylistTransferModal);
+        assert!(ui.transfer_modal.is_some());
+        ui.execute_action(UiAction::SelectTransferTarget(PlaybackBackend::AppleMusicNative));
+        assert_eq!(
+            ui.transfer_modal.as_ref().map(|m| m.target_backend),
+            Some(PlaybackBackend::AppleMusicNative)
+        );
+        ui.execute_action(UiAction::ClosePlaylistTransferModal);
+        assert!(ui.transfer_modal.is_none());
+
+        // 3. Lyrics Immersive Mode toggle & proximity corner reveal math
+        let win = RectF::new(0.0, 0.0, 1280.0, 760.0);
+        assert_eq!(
+            eval_immersive_corner_targets(win, (640.0, 380.0), 0.1, false, false),
+            [1.0, 1.0, 1.0, 1.0],
+            "non-immersive mode must keep all 4 corners visible"
+        );
+        assert_eq!(
+            eval_immersive_corner_targets(win, (640.0, 380.0), 0.1, true, false),
+            [0.0, 0.0, 0.0, 0.0],
+            "immersive mode with pointer in center must hide all 4 corners"
+        );
+        assert_eq!(
+            eval_immersive_corner_targets(win, (30.0, 24.0), 0.2, true, false),
+            [1.0, 0.0, 0.0, 0.0],
+            "moving near top-left must reveal ONLY top-left corner"
+        );
+        assert_eq!(
+            eval_immersive_corner_targets(win, (1240.0, 24.0), 0.2, true, false),
+            [0.0, 1.0, 0.0, 0.0],
+            "moving near top-right must reveal ONLY top-right corner"
+        );
+        assert_eq!(
+            eval_immersive_corner_targets(win, (1180.0, 730.0), 0.2, true, false),
+            [0.0, 0.0, 0.0, 1.0],
+            "moving near bottom-right must reveal ONLY bottom-right capsule"
+        );
+        assert_eq!(
+            eval_immersive_corner_targets(win, (30.0, 24.0), 3.0, true, false),
+            [0.0, 0.0, 0.0, 0.0],
+            "idle cursor (>2.4s) must hide all corners again"
+        );
+
+        ui.handle_lyrics_action(LyricsHitAction::ToggleImmersiveMode);
+        assert!(ui.settings.lyrics_immersive_mode);
+        assert!(ui.lyrics_view.immersive_mode);
+        ui.handle_lyrics_action(LyricsHitAction::OpenMoreMenu(RectF::new(400.0, 460.0, 32.0, 32.0)));
+        assert!(matches!(
+            ui.context_menu.as_ref().map(|c| &c.target),
+            Some(ContextMenuTarget::NowPlaying)
+        ));
+
+        // 4. Live NetEase artist profile + albums resolution check
+        let rt = tokio::runtime::Runtime::new().expect("tokio rt");
+        rt.block_on(async {
+            if let Some((aid, aname)) = netease_api::resolve_artist_by_name("周杰伦", None).await {
+                assert!(!aid.is_empty() && !aname.is_empty());
+                if let Ok(det) = netease_api::fetch_container_detail("ne-artist", &aid, &aname, None).await {
+                    assert!(!det.tracks.is_empty(), "NetEase artist top songs must load");
+                    assert!(!det.related_albums.is_empty(), "NetEase artist albums must load");
+                }
+            }
         });
     }
 }

@@ -48,6 +48,7 @@ pub struct QQDetail {
     pub description: String,
     pub artwork_url: Option<String>,
     pub tracks: Vec<AgentTrackInput>,
+    pub related_albums: Vec<QQCard>,
 }
 
 #[derive(Clone, Debug)]
@@ -980,6 +981,7 @@ pub async fn fetch_container_detail(
             description,
             artwork_url,
             tracks,
+            related_albums: Vec::new(),
         });
     }
 
@@ -1020,7 +1022,7 @@ pub async fn fetch_container_detail(
             .unwrap_or_default()
             .to_string();
         let artwork_url = qq_album_cover(id);
-        let tracks = json
+        let tracks: Vec<AgentTrackInput> = json
             .pointer("/songs/data/songList")
             .and_then(Value::as_array)
             .map(|arr| {
@@ -1040,6 +1042,7 @@ pub async fn fetch_container_detail(
             description,
             artwork_url,
             tracks,
+            related_albums: Vec::new(),
         });
     }
 
@@ -1049,13 +1052,18 @@ pub async fn fetch_container_detail(
                 "module": "musichall.song_list_server",
                 "method": "GetSingerSongList",
                 "param": {"singerMid": id, "begin": 0, "num": 50, "order": 1}
+            },
+            "albums": {
+                "module": "music.musichallAlbum.AlbumListServer",
+                "method": "GetAlbumList",
+                "param": {"singerMid": id, "begin": 0, "num": 24, "order": 0}
             }
         });
         let json = qq_musicu(payload, cookie).await?;
         let artwork_url = Some(format!(
             "https://y.gtimg.cn/music/photo_new/T001R500x500M000{id}.jpg"
         ));
-        let tracks = json
+        let tracks: Vec<AgentTrackInput> = json
             .pointer("/songs/data/songList")
             .and_then(Value::as_array)
             .map(|arr| {
@@ -1067,14 +1075,49 @@ pub async fn fetch_container_detail(
                     .collect()
             })
             .unwrap_or_default();
+        let mut related_albums = Vec::new();
+        if let Some(arr) = json.pointer("/albums/data/albumList").and_then(Value::as_array) {
+            for a in arr.iter().take(24) {
+                let amid = a
+                    .get("albumMid")
+                    .or_else(|| a.get("album_mid"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim();
+                if amid.is_empty() {
+                    continue;
+                }
+                let aname = a
+                    .get("albumName")
+                    .or_else(|| a.get("album_name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("未知专辑")
+                    .to_string();
+                let pdate = a
+                    .get("publishDate")
+                    .and_then(Value::as_str)
+                    .unwrap_or(title_hint)
+                    .to_string();
+                related_albums.push(QQCard {
+                    id: amid.to_string(),
+                    kind: "qq-album".to_string(),
+                    title: aname,
+                    subtitle: pdate,
+                    description: String::new(),
+                    artwork_url: qq_album_cover(amid),
+                    badge: None,
+                });
+            }
+        }
         return Ok(QQDetail {
             id: id.to_string(),
             kind: kind.to_string(),
             title: title_hint.to_string(),
-            subtitle: "QQ 音乐 · 歌手热门曲目".to_string(),
+            subtitle: format!("QQ 音乐 · {} 首热门 · {} 张专辑", tracks.len(), related_albums.len()),
             description: String::new(),
             artwork_url,
             tracks,
+            related_albums,
         });
     }
 
@@ -1124,7 +1167,163 @@ pub async fn fetch_container_detail(
         description,
         artwork_url,
         tracks,
+        related_albums: Vec::new(),
     })
+}
+
+pub async fn resolve_artist_by_name(name: &str, cookie: Option<&str>) -> Option<(String, String)> {
+    let clean = name
+        .split(&['/', ',', '&', '、', '，'][..])
+        .next()
+        .unwrap_or(name)
+        .trim();
+    if clean.is_empty() {
+        return None;
+    }
+    let payload = json!({
+        "search": {
+            "module": "music.search.SearchCgiService",
+            "method": "DoSearchForQQMusicDesktop",
+            "param": {
+                "query": clean,
+                "page_num": 1,
+                "num_per_page": 6,
+                "search_type": 1
+            }
+        }
+    });
+    let json = qq_musicu(payload, cookie).await.ok()?;
+    let arr = json.pointer("/search/data/body/singer/list").and_then(Value::as_array)?;
+    let want = crate::backends::normalize_match_text(clean);
+    let best = arr
+        .iter()
+        .find(|v| {
+            v.get("singerName")
+                .or_else(|| v.get("singer_name"))
+                .and_then(Value::as_str)
+                .is_some_and(|nm| crate::backends::normalize_match_text(nm) == want)
+        })
+        .or_else(|| arr.first())?;
+    let mid = best
+        .get("singerMID")
+        .or_else(|| best.get("singerMid"))
+        .or_else(|| best.get("singer_mid"))
+        .and_then(Value::as_str)?
+        .trim()
+        .to_string();
+    if mid.is_empty() {
+        return None;
+    }
+    let nm = best
+        .get("singerName")
+        .or_else(|| best.get("singer_name"))
+        .and_then(Value::as_str)
+        .unwrap_or(clean)
+        .to_string();
+    Some((mid, nm))
+}
+
+pub async fn resolve_album_by_name(
+    album_name: &str,
+    artist_name: &str,
+    cookie: Option<&str>,
+) -> Option<(String, String)> {
+    let alb = album_name.trim();
+    if alb.is_empty() {
+        return None;
+    }
+    let q = if artist_name.trim().is_empty() {
+        alb.to_string()
+    } else {
+        format!("{alb} {}", artist_name.trim())
+    };
+    let payload = json!({
+        "search": {
+            "module": "music.search.SearchCgiService",
+            "method": "DoSearchForQQMusicDesktop",
+            "param": {
+                "query": q,
+                "page_num": 1,
+                "num_per_page": 6,
+                "search_type": 2
+            }
+        }
+    });
+    let json = qq_musicu(payload, cookie).await.ok()?;
+    let arr = json.pointer("/search/data/body/album/list").and_then(Value::as_array)?;
+    let want = crate::backends::normalize_match_text(alb);
+    let best = arr
+        .iter()
+        .find(|v| {
+            v.get("albumName")
+                .and_then(Value::as_str)
+                .is_some_and(|nm| crate::backends::normalize_match_text(nm) == want)
+        })
+        .or_else(|| arr.first())?;
+    let mid = best.get("albumMID").and_then(Value::as_str)?.trim().to_string();
+    if mid.is_empty() {
+        return None;
+    }
+    let nm = best
+        .get("albumName")
+        .and_then(Value::as_str)
+        .unwrap_or(alb)
+        .to_string();
+    Some((mid, nm))
+}
+
+pub async fn search_best_song_match(
+    title: &str,
+    artist: &str,
+    duration_sec: f64,
+    cookie: Option<&str>,
+) -> Option<AgentTrackInput> {
+    let clean_t = title.trim();
+    if clean_t.is_empty() {
+        return None;
+    }
+    let primary_artist = artist
+        .split(&['/', ',', '&', '、', '，'][..])
+        .next()
+        .unwrap_or(artist)
+        .trim();
+    let q = if primary_artist.is_empty() {
+        clean_t.to_string()
+    } else {
+        format!("{clean_t} {primary_artist}")
+    };
+    let payload = json!({
+        "search": {
+            "module": "music.search.SearchCgiService",
+            "method": "DoSearchForQQMusicDesktop",
+            "param": {
+                "query": q,
+                "page_num": 1,
+                "num_per_page": 8,
+                "search_type": 0
+            }
+        }
+    });
+    let json = qq_musicu(payload, cookie).await.ok()?;
+    let arr = json.pointer("/search/data/body/song/list").and_then(Value::as_array)?;
+    let mut best: Option<(f32, AgentTrackInput)> = None;
+    for node in arr {
+        let Some(tr) = parse_qq_song_modern(node, None) else {
+            continue;
+        };
+        let sc = crate::backends::match_track_score(
+            clean_t,
+            artist,
+            duration_sec,
+            &tr.name,
+            &tr.artist_name,
+            tr.duration_sec,
+        );
+        if sc >= 0.54 && best.as_ref().is_none_or(|(bs, _)| sc > *bs) {
+            best = Some((sc, tr));
+        }
+    }
+    best.map(|(_, tr)| tr)
 }
 
 // ============================================================================

@@ -597,6 +597,296 @@ async fn send_amp_post(
     Ok((status, body))
 }
 
+async fn send_amp_post_json(
+    url: &str,
+    dev_token: &str,
+    user_token: &str,
+    payload: &Value,
+) -> Result<(reqwest::StatusCode, String), String> {
+    let mut req = HTTP_CLIENT
+        .post(url)
+        .header("Authorization", format!("Bearer {dev_token}"))
+        .header("Origin", WEB_ORIGIN)
+        .header("Referer", format!("{WEB_ORIGIN}/"))
+        .header("Content-Type", "application/json")
+        .json(payload);
+    if !user_token.trim().is_empty() {
+        req = req
+            .header("Media-User-Token", user_token.trim())
+            .header("Music-User-Token", user_token.trim());
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("请求 amp-api JSON 写入失败: {e}"))?;
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("读取响应失败: {e}"))?;
+    Ok((status, body))
+}
+
+/// Creates a new cloud library playlist on Apple Music (`POST /v1/me/library/playlists`)
+/// and optionally seeds it with matched catalog song IDs (chunked cleanly for large playlists).
+pub async fn create_library_playlist(
+    name: &str,
+    description: &str,
+    catalog_song_ids: &[String],
+    user_token: Option<String>,
+    storefront_hint: Option<String>,
+) -> Result<String, String> {
+    let normalized_user = user_token
+        .as_deref()
+        .map(normalize_user_token)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            "创建 Apple Music 歌单需要有效的 Media-User-Token，请先在设置中登录 Apple Music 账号"
+                .to_string()
+        })?;
+
+    let clean_ids: Vec<String> = catalog_song_ids
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_'))
+        .collect();
+
+    let first_batch: Vec<Value> = clean_ids
+        .iter()
+        .take(50)
+        .map(|id| {
+            let ty = if id.starts_with("i.") { "library-songs" } else { "songs" };
+            serde_json::json!({ "id": id, "type": ty })
+        })
+        .collect();
+
+    let payload = if first_batch.is_empty() {
+        serde_json::json!({
+            "attributes": {
+                "name": name.trim(),
+                "description": description.trim(),
+            }
+        })
+    } else {
+        serde_json::json!({
+            "attributes": {
+                "name": name.trim(),
+                "description": description.trim(),
+            },
+            "relationships": {
+                "tracks": { "data": first_batch }
+            }
+        })
+    };
+
+    let url = format!("{AMP_API_BASE}v1/me/library/playlists");
+    let dev = get_public_dev_token(false, storefront_hint.as_deref()).await?;
+    let (mut status, mut body) = send_amp_post_json(&url, &dev.token, &normalized_user, &payload).await?;
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        invalidate_dev_token_cache();
+        if let Ok(fresh) = get_public_dev_token(true, storefront_hint.as_deref()).await {
+            let retry = send_amp_post_json(&url, &fresh.token, &normalized_user, &payload).await?;
+            status = retry.0;
+            body = retry.1;
+        }
+    }
+    if !status.is_success() {
+        return Err(format_apple_api_error(status, &body));
+    }
+
+    let playlist_id = serde_json::from_str::<Value>(&body)
+        .ok()
+        .and_then(|j| j.pointer("/data/0/id").and_then(Value::as_str).map(|s| s.to_string()))
+        .unwrap_or_default();
+
+    if !playlist_id.is_empty() && clean_ids.len() > 50 {
+        for chunk in clean_ids[50..].chunks(50) {
+            let _ = add_tracks_to_library_playlist(
+                &playlist_id,
+                chunk,
+                Some(normalized_user.clone()),
+                storefront_hint.clone(),
+            )
+            .await;
+        }
+    }
+
+    Ok(playlist_id)
+}
+
+/// Appends catalog/library tracks to an existing Apple Music cloud library playlist
+/// (`POST /v1/me/library/playlists/{playlist_id}/tracks`).
+pub async fn add_tracks_to_library_playlist(
+    playlist_id: &str,
+    song_ids: &[String],
+    user_token: Option<String>,
+    storefront_hint: Option<String>,
+) -> Result<(), String> {
+    let normalized_user = user_token
+        .as_deref()
+        .map(normalize_user_token)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            "添加到 Apple Music 歌单需要有效的 Media-User-Token，请先在设置中登录绑定 Cookie"
+                .to_string()
+        })?;
+    let pid = playlist_id.trim();
+    if pid.is_empty() {
+        return Err("无效的目标歌单 ID".to_string());
+    }
+    let items: Vec<Value> = song_ids
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|id| {
+            let ty = if id.starts_with("i.") { "library-songs" } else { "songs" };
+            serde_json::json!({ "id": id, "type": ty })
+        })
+        .collect();
+    if items.is_empty() {
+        return Err("没有可添加的有效歌曲 ID".to_string());
+    }
+    let payload = serde_json::json!({ "data": items });
+    let url = format!("{AMP_API_BASE}v1/me/library/playlists/{pid}/tracks");
+    let dev = get_public_dev_token(false, storefront_hint.as_deref()).await?;
+    let (mut status, mut body) = send_amp_post_json(&url, &dev.token, &normalized_user, &payload).await?;
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        invalidate_dev_token_cache();
+        if let Ok(fresh) = get_public_dev_token(true, storefront_hint.as_deref()).await {
+            let retry = send_amp_post_json(&url, &fresh.token, &normalized_user, &payload).await?;
+            status = retry.0;
+            body = retry.1;
+        }
+    }
+    if !status.is_success() {
+        return Err(format_apple_api_error(status, &body));
+    }
+    Ok(())
+}
+
+/// Resolves an Apple Music artist ID & canonical name from an artist display string.
+pub async fn resolve_artist_by_name(
+    artist_name: &str,
+    storefront: &str,
+    user_token: Option<String>,
+) -> Option<(String, String)> {
+    let clean = artist_name
+        .split(&['/', ',', '&', '、', '，'][..])
+        .next()
+        .unwrap_or(artist_name)
+        .trim();
+    if clean.is_empty() {
+        return None;
+    }
+    let sf = if storefront.trim().is_empty() { "cn" } else { storefront.trim() };
+    let enc: String = url::form_urlencoded::byte_serialize(clean.as_bytes()).collect();
+    let path = format!("v1/catalog/{sf}/search?term={enc}&types=artists&limit=5&l=zh-Hans-CN");
+    let json = fetch_am_api(path, user_token, None, Some(sf.to_string())).await.ok()?;
+    let arr = json.pointer("/results/artists/data").and_then(Value::as_array)?;
+    let want_norm = crate::backends::normalize_match_text(clean);
+    let best = arr
+        .iter()
+        .find(|n| {
+            n.pointer("/attributes/name")
+                .and_then(Value::as_str)
+                .is_some_and(|nm| crate::backends::normalize_match_text(nm) == want_norm)
+        })
+        .or_else(|| arr.first())?;
+    let id = best.get("id").and_then(Value::as_str)?.trim().to_string();
+    let name = best
+        .pointer("/attributes/name")
+        .and_then(Value::as_str)
+        .unwrap_or(clean)
+        .to_string();
+    Some((id, name))
+}
+
+/// Resolves an Apple Music album ID & canonical name from album/artist strings.
+pub async fn resolve_album_by_name(
+    album_name: &str,
+    artist_name: &str,
+    storefront: &str,
+    user_token: Option<String>,
+) -> Option<(String, String)> {
+    let alb = album_name.trim();
+    if alb.is_empty() {
+        return None;
+    }
+    let sf = if storefront.trim().is_empty() { "cn" } else { storefront.trim() };
+    let q = if artist_name.trim().is_empty() {
+        alb.to_string()
+    } else {
+        format!("{alb} {}", artist_name.trim())
+    };
+    let enc: String = url::form_urlencoded::byte_serialize(q.as_bytes()).collect();
+    let path = format!("v1/catalog/{sf}/search?term={enc}&types=albums&limit=5&l=zh-Hans-CN");
+    let json = fetch_am_api(path, user_token, None, Some(sf.to_string())).await.ok()?;
+    let arr = json.pointer("/results/albums/data").and_then(Value::as_array)?;
+    let want = crate::backends::normalize_match_text(alb);
+    let best = arr
+        .iter()
+        .find(|n| {
+            n.pointer("/attributes/name")
+                .and_then(Value::as_str)
+                .is_some_and(|nm| crate::backends::normalize_match_text(nm) == want)
+        })
+        .or_else(|| arr.first())?;
+    let id = best.get("id").and_then(Value::as_str)?.trim().to_string();
+    let name = best
+        .pointer("/attributes/name")
+        .and_then(Value::as_str)
+        .unwrap_or(alb)
+        .to_string();
+    Some((id, name))
+}
+
+/// Cross-platform song matcher targeting Apple Music catalog (`v1/catalog/{sf}/search`).
+pub async fn search_best_song_match(
+    title: &str,
+    artist: &str,
+    duration_sec: f64,
+    storefront: &str,
+    user_token: Option<String>,
+) -> Option<crate::am_agent::AgentTrackInput> {
+    let clean_t = title.trim();
+    if clean_t.is_empty() {
+        return None;
+    }
+    let sf = if storefront.trim().is_empty() { "cn" } else { storefront.trim() };
+    let primary_artist = artist
+        .split(&['/', ',', '&', '、', '，'][..])
+        .next()
+        .unwrap_or(artist)
+        .trim();
+    let q = if primary_artist.is_empty() {
+        clean_t.to_string()
+    } else {
+        format!("{clean_t} {primary_artist}")
+    };
+    let enc: String = url::form_urlencoded::byte_serialize(q.as_bytes()).collect();
+    let path = format!("v1/catalog/{sf}/search?term={enc}&types=songs&limit=8&l=zh-Hans-CN");
+    let json = fetch_am_api(path, user_token, None, Some(sf.to_string())).await.ok()?;
+    let arr = json.pointer("/results/songs/data").and_then(Value::as_array)?;
+    let mut best: Option<(f32, crate::am_agent::AgentTrackInput)> = None;
+    for node in arr {
+        let Some(tr) = crate::am_agent::parse_track_from_am_json(node, None, None) else {
+            continue;
+        };
+        let sc = crate::backends::match_track_score(
+            clean_t,
+            artist,
+            duration_sec,
+            &tr.name,
+            &tr.artist_name,
+            tr.duration_sec,
+        );
+        if sc >= 0.54 && best.as_ref().is_none_or(|(bs, _)| sc > *bs) {
+            best = Some((sc, tr));
+        }
+    }
+    best.map(|(_, tr)| tr)
+}
+
 /// Apple Music `POST /v1/me/stations/next-tracks/{station_id}` strictly enforces `limit <= 10`
 /// (any larger value returns HTTP 400 `Invalid Parameter Value`).
 pub const STATION_NEXT_TRACKS_MAX_LIMIT: usize = 10;

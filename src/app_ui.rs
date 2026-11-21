@@ -318,6 +318,8 @@ pub struct AppSettings {
     pub reduce_motion: bool,
     pub reduce_transparency: bool,
     pub lyrics_free_blur: bool,
+    #[serde(default)]
+    pub lyrics_immersive_mode: bool,
     pub hidden_sidebar_keys: Vec<String>,
 }
 
@@ -360,6 +362,7 @@ impl Default for AppSettings {
             reduce_motion: false,
             reduce_transparency: false,
             lyrics_free_blur: false,
+            lyrics_immersive_mode: false,
             hidden_sidebar_keys: Vec::new(),
         }
     }
@@ -517,7 +520,48 @@ pub struct ContainerDetailData {
     pub subtitle: String,
     pub description: String,
     pub artwork_url: Option<String>,
+    pub motion_video_url: Option<String>,
     pub tracks: Vec<AgentTrackInput>,
+    pub related_albums: Vec<MediaCardItem>,
+}
+
+#[derive(Clone, Debug)]
+pub enum ContextMenuTarget {
+    Track(AgentTrackInput),
+    Container {
+        kind: String,
+        id: String,
+        title: String,
+        subtitle: String,
+        artwork_url: Option<String>,
+        tracks: Vec<AgentTrackInput>,
+    },
+    NowPlaying,
+}
+
+#[derive(Clone, Debug)]
+pub struct ContextMenuState {
+    pub anchor: RectF,
+    pub target: ContextMenuTarget,
+    pub show_playlist_submenu: bool,
+    pub from_lyrics: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct PlaylistTransferState {
+    pub source_title: String,
+    pub source_kind: String,
+    pub source_tracks: Vec<AgentTrackInput>,
+    pub target_backend: PlaybackBackend,
+    pub running: bool,
+    pub done: bool,
+    pub matched: usize,
+    pub total: usize,
+    pub current_track_name: String,
+    pub result_msg: Option<String>,
+    pub error_msg: Option<String>,
+    pub created_playlist_id: Option<String>,
+    pub matched_tracks: Vec<AgentTrackInput>,
 }
 
 pub enum AsyncMsg {
@@ -629,6 +673,28 @@ pub enum AsyncMsg {
     },
     QQAccountVerified(qq_api::QQAccountInfo),
     WebAmStatusUpdated(WebAmStatus),
+    ResolvedArtistNav {
+        kind: String,
+        id: String,
+        name: String,
+    },
+    ResolvedAlbumNav {
+        kind: String,
+        id: String,
+        name: String,
+    },
+    PlaylistTransferProgress {
+        matched: usize,
+        total: usize,
+        current_name: String,
+    },
+    PlaylistTransferDone {
+        ok: bool,
+        message: String,
+        target_backend: PlaybackBackend,
+        created_playlist_id: Option<String>,
+        matched_tracks: Vec<AgentTrackInput>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -666,6 +732,7 @@ pub enum UiAction {
         id: String,
         title_hint: String,
         artwork_url: Option<String>,
+        motion_video_url: Option<String>,
         card_rect: RectF,
         card_radius: f32,
     },
@@ -774,9 +841,37 @@ pub enum UiAction {
     ToggleLiveEqIconSpectrum,
     ToggleAggressiveMemoryRelease,
     ToggleLyricsBlurMode,
+    ToggleLyricsImmersiveMode,
     ToggleReduceMotion,
     ToggleReduceTransparency,
     CloseNarrowSidebarOverlay,
+    // Context menus (`•••`), Artist/Album quick nav, Play Next, Add to Playlist, Cross-Platform Transfer
+    OpenTrackContextMenu {
+        track: AgentTrackInput,
+        anchor: RectF,
+    },
+    OpenDetailContextMenu {
+        anchor: RectF,
+    },
+    CloseContextMenu,
+    PlayNextTrack(AgentTrackInput),
+    ToggleContextPlaylistSubmenu,
+    AddTrackToPlaylist {
+        playlist_id: String,
+        playlist_name: String,
+        track: AgentTrackInput,
+    },
+    GoToArtistByName(String),
+    GoToAlbumByName {
+        album_name: String,
+        artist_name: String,
+    },
+    OpenPlaylistTransferModal,
+    ClosePlaylistTransferModal,
+    SelectTransferTarget(PlaybackBackend),
+    StartPlaylistTransfer,
+    PlayTransferMatchedTracks,
+    ImportLocalLyricsFromMenu,
     CheckForUpdates,
     OpenUrl(String),
     // Hidden-by-default spatial audio flavor disclosure
@@ -977,6 +1072,16 @@ pub struct AppUi {
     pub win_max_going_max: bool,
     last_mem_trim_at: Instant,
     pending_route_mem_trim: bool,
+    // Seamless detail-page cover placeholder during async loading (eliminates black-frame disappearance!)
+    pub pending_detail_id: String,
+    pub pending_detail_title: String,
+    pub pending_detail_artwork: Option<String>,
+    pub pending_detail_motion_url: Option<String>,
+    // Unified `•••` Liquid Glass Context Menu + Cross-Platform Playlist Transfer Modal + Play Next Queue
+    pub context_menu: Option<ContextMenuState>,
+    pub transfer_modal: Option<PlaylistTransferState>,
+    pub play_next_queue: std::collections::VecDeque<AgentTrackInput>,
+    pub last_mouse_move_at: Instant,
 }
 
 #[derive(Clone, Debug)]
@@ -1061,7 +1166,9 @@ impl CachedPlaylistDetail {
             subtitle: self.subtitle.clone(),
             description: self.description.clone(),
             artwork_url: self.artwork_url.clone(),
+            motion_video_url: None,
             tracks: self.tracks.clone(),
+            related_albums: Vec::new(),
         }
     }
 }
@@ -1276,6 +1383,7 @@ impl AppUi {
 
         let mut lyrics_view = LyricsViewState::default();
         lyrics_view.music_free_blur = settings.lyrics_free_blur;
+        lyrics_view.immersive_mode = settings.lyrics_immersive_mode;
         lyrics_view.animator.latin_by_word = settings.lyrics_latin_by_word;
 
         let init_sb = if settings.sidebar_collapsed { 0.0 } else { 1.0 };
@@ -1467,6 +1575,14 @@ impl AppUi {
             win_max_going_max: false,
             last_mem_trim_at: now,
             pending_route_mem_trim: false,
+            pending_detail_id: String::new(),
+            pending_detail_title: String::new(),
+            pending_detail_artwork: None,
+            pending_detail_motion_url: None,
+            context_menu: None,
+            transfer_modal: None,
+            play_next_queue: std::collections::VecDeque::new(),
+            last_mouse_move_at: now,
         };
 
         if wake_hwnd != 0 {
@@ -1643,6 +1759,7 @@ impl AppUi {
                         id: item.id,
                         title_hint: item.title,
                         artwork_url: item.artwork_url,
+                        motion_video_url: None,
                         card_rect: hero_r,
                         card_radius: 12.0,
                     });
@@ -1837,6 +1954,11 @@ impl AppUi {
             if self.lyrics_view.has_active_layout_motion() {
                 return true;
             }
+            if self.settings.lyrics_immersive_mode
+                && self.last_mouse_move_at.elapsed().as_secs_f32() < 3.0
+            {
+                return true;
+            }
             if (self.lyrics_view.cover_scale - 0.83).abs() > 0.005 {
                 return true;
             }
@@ -1940,20 +2062,30 @@ impl AppUi {
         let mut changed = false;
 
         // Same-frame (<4ms) direct pull whenever AMPLibraryAgent emits a state/track/duration callback
+        // STRICTLY gated on `PlaybackBackend::AppleMusicNative` so switching backends never leaks AM state!
         let cur_agent_seq = am_agent::state_seq();
         if cur_agent_seq != self.last_agent_seq {
             self.last_agent_seq = cur_agent_seq;
-            let st = am_agent::get_playback_state();
-            self.on_playback_state_changed(st);
-            changed = true;
+            if self.settings.playback_backend == PlaybackBackend::AppleMusicNative {
+                let st = am_agent::get_playback_state();
+                self.on_playback_state_changed(st);
+                changed = true;
+            }
         }
 
-        // Immediate non-blocking snapshot pull on WinRT SMTC rollover / media events (no 420ms poll wait!)
+        // Immediate non-blocking snapshot pull on WinRT SMTC rollover / media events (only for AM Native or ExternalSmtc)
         let cur_smtc_seq = smtc::smtc_event_seq();
         if cur_smtc_seq != self.last_smtc_event_seq {
             self.last_smtc_event_seq = cur_smtc_seq;
-            if self.wake_hwnd != 0
-                && !am_agent::is_agent_active()
+            let allow_smtc_pull = matches!(
+                self.settings.playback_backend,
+                PlaybackBackend::AppleMusicNative | PlaybackBackend::ExternalSmtc
+            );
+            let agent_active_now = self.settings.playback_backend == PlaybackBackend::AppleMusicNative
+                && am_agent::is_agent_active();
+            if allow_smtc_pull
+                && self.wake_hwnd != 0
+                && !agent_active_now
                 && !self
                     .smtc_event_pull_in_flight
                     .swap(true, std::sync::atomic::Ordering::AcqRel)
@@ -2392,6 +2524,69 @@ impl AppUi {
                         self.set_banner(msg, is_err);
                     }
                 }
+                AsyncMsg::ResolvedArtistNav { kind, id, name } => {
+                    self.show_lyrics_overlay = false;
+                    self.context_menu = None;
+                    self.show_more_popover = false;
+                    self.pending_detail_id = id.clone();
+                    self.pending_detail_title = name.clone();
+                    self.pending_detail_artwork = None;
+                    self.pending_detail_motion_url = None;
+                    self.navigate_to(PageRoute::ContainerDetail {
+                        kind,
+                        id,
+                        title_hint: name,
+                    });
+                }
+                AsyncMsg::ResolvedAlbumNav { kind, id, name } => {
+                    self.show_lyrics_overlay = false;
+                    self.context_menu = None;
+                    self.show_more_popover = false;
+                    self.pending_detail_id = id.clone();
+                    self.pending_detail_title = name.clone();
+                    self.pending_detail_artwork = None;
+                    self.pending_detail_motion_url = None;
+                    self.navigate_to(PageRoute::ContainerDetail {
+                        kind,
+                        id,
+                        title_hint: name,
+                    });
+                }
+                AsyncMsg::PlaylistTransferProgress {
+                    matched,
+                    total,
+                    current_name,
+                } => {
+                    if let Some(ref mut tm) = self.transfer_modal {
+                        tm.matched = matched;
+                        tm.total = total;
+                        tm.current_track_name = current_name;
+                    }
+                }
+                AsyncMsg::PlaylistTransferDone {
+                    ok,
+                    message,
+                    target_backend,
+                    created_playlist_id,
+                    matched_tracks,
+                } => {
+                    if let Some(ref mut tm) = self.transfer_modal {
+                        tm.running = false;
+                        tm.done = true;
+                        tm.created_playlist_id = created_playlist_id;
+                        tm.matched_tracks = matched_tracks;
+                        if ok {
+                            tm.result_msg = Some(message.clone());
+                            tm.error_msg = None;
+                        } else {
+                            tm.error_msg = Some(message.clone());
+                        }
+                    }
+                    if ok && target_backend == self.settings.playback_backend {
+                        self.fetch_sidebar_playlists();
+                    }
+                    self.set_banner(message, !ok);
+                }
             }
         }
 
@@ -2481,7 +2676,30 @@ impl AppUi {
     }
 
     pub fn on_playback_state_changed(&mut self, mut st: SmtcState) {
-        let live_agent = am_agent::get_live_agent_playhead_ext();
+        // Strictly reject stale playback updates emitted by a previously active backend after switching!
+        let active_be = self.settings.playback_backend;
+        if !st.backend_mode.is_empty() {
+            let mode_matches = match active_be {
+                PlaybackBackend::AppleMusicNative => {
+                    matches!(st.backend_mode.as_str(), "agent" | "smtc" | "")
+                }
+                PlaybackBackend::AppleMusicWeb => st.backend_mode == "web-am",
+                PlaybackBackend::NetEase => st.backend_mode == "netease",
+                PlaybackBackend::QQMusic => st.backend_mode == "qqmusic",
+                PlaybackBackend::ExternalSmtc => {
+                    matches!(st.backend_mode.as_str(), "smtc" | "")
+                }
+            };
+            if !mode_matches {
+                return;
+            }
+        }
+
+        let live_agent = if active_be == PlaybackBackend::AppleMusicNative {
+            am_agent::get_live_agent_playhead_ext()
+        } else {
+            None
+        };
         if self.playback_loading {
             let elapsed_ms = self
                 .playback_loading_started
@@ -2543,6 +2761,24 @@ impl AppUi {
             }
         }
 
+        // Handle "下一首播放" priority queue on Apple Music Native / Web AM when current track finishes
+        if !self.play_next_queue.is_empty()
+            && matches!(
+                active_be,
+                PlaybackBackend::AppleMusicNative | PlaybackBackend::AppleMusicWeb
+            )
+            && self.smtc.status == "Playing"
+            && st.status != "Playing"
+            && !self.playback_loading
+            && self.smtc.duration_sec > 5.0
+            && (self.smtc.position_sec >= self.smtc.duration_sec - 2.4 || st.position_sec <= 1.2)
+        {
+            if let Some(next_tr) = self.play_next_queue.pop_front() {
+                self.play_tracks_async(vec![next_tr], 0);
+                return;
+            }
+        }
+
         // Repeat queue/track support when natural end of playback is reached
         if self.repeat_on
             && self.smtc.status == "Playing"
@@ -2557,9 +2793,14 @@ impl AppUi {
                     || st.position_sec <= 1.2);
             if near_end {
                 self.last_repeat_trigger = Some(Instant::now());
-                let q = am_agent::get_queue_tracks();
-                if !q.is_empty() && (am_agent::is_agent_active() || am_agent::is_agent_connected()) {
-                    self.play_tracks_async(q, 0);
+                if active_be == PlaybackBackend::AppleMusicNative {
+                    let q = am_agent::get_queue_tracks();
+                    if !q.is_empty() && (am_agent::is_agent_active() || am_agent::is_agent_connected()) {
+                        self.play_tracks_async(q, 0);
+                    } else {
+                        self.control_player("seek", Some(0.0));
+                        self.control_player("play", None);
+                    }
                 } else {
                     self.control_player("seek", Some(0.0));
                     self.control_player("play", None);
@@ -3044,7 +3285,8 @@ impl AppUi {
         self.lyrics_loading = true;
         let sf = self.settings.storefront.clone();
         let utok = non_empty_opt(&self.settings.user_token);
-        let use_agent_lyrics = self.settings.use_builtin_service
+        let use_agent_lyrics = self.settings.playback_backend == PlaybackBackend::AppleMusicNative
+            && self.settings.use_builtin_service
             && (self.playback_loading
                 || am_agent::is_agent_active()
                 || am_agent::is_agent_connected());
@@ -3139,13 +3381,23 @@ impl AppUi {
     // ========================================================================
 
     pub fn active_queue_tracks(&self) -> Vec<AgentTrackInput> {
-        match self.settings.playback_backend {
+        let mut base = match self.settings.playback_backend {
             PlaybackBackend::NetEase | PlaybackBackend::QQMusic => native_player::get_queue_tracks(),
             PlaybackBackend::AppleMusicWeb => web_am_player::get_queue_tracks(),
-            PlaybackBackend::AppleMusicNative | PlaybackBackend::ExternalSmtc => {
-                am_agent::get_queue_tracks()
-            }
+            PlaybackBackend::AppleMusicNative => am_agent::get_queue_tracks(),
+            PlaybackBackend::ExternalSmtc => Vec::new(),
+        };
+        if !self.play_next_queue.is_empty()
+            && matches!(
+                self.settings.playback_backend,
+                PlaybackBackend::AppleMusicNative | PlaybackBackend::AppleMusicWeb
+            )
+        {
+            let mut combined: Vec<AgentTrackInput> = self.play_next_queue.iter().cloned().collect();
+            combined.append(&mut base);
+            return combined;
         }
+        base
     }
 
     pub fn switch_playback_backend(&mut self, next: PlaybackBackend) {
@@ -3153,7 +3405,8 @@ impl AppUi {
         if prev == next {
             return;
         }
-        // Gracefully pause/stop the departing playback engine
+        // Gracefully pause/stop AND detach the departing playback engine so paused AM Native
+        // state never hijacks or deadlocks controls on the newly selected backend!
         match prev {
             PlaybackBackend::NetEase | PlaybackBackend::QQMusic => {
                 native_player::stop_and_clear();
@@ -3164,9 +3417,10 @@ impl AppUi {
                 });
             }
             PlaybackBackend::AppleMusicNative => {
-                if am_agent::is_agent_active() {
+                if am_agent::is_agent_active() || am_agent::is_agent_connected() {
                     std::thread::spawn(|| {
                         let _ = am_agent::control("pause", None);
+                        let _ = am_agent::disconnect_agent();
                     });
                 }
             }
@@ -3180,6 +3434,19 @@ impl AppUi {
         self.playback_loading_started = None;
         self.playback_loading_track_id = None;
         self.playback_loading_container_id = None;
+        self.smtc = SmtcState::default();
+        self.playhead_anchor_sec = 0.0;
+        self.playhead_anchor_inst = Instant::now();
+        self.smtc_optimistic_seek = None;
+        self.current_lyrics = None;
+        self.current_lyrics_key.clear();
+        self.lyrics_loading = false;
+        self.lyrics_view.invalidate_layout_cache();
+        self.last_agent_seq = am_agent::state_seq();
+        self.context_menu = None;
+        self.show_more_popover = false;
+        self.show_queue_popover = false;
+        self.play_next_queue.clear();
 
         // Clear catalog caches so pages cleanly reload with the new backend's content
         self.home_shelves.clear();
@@ -3197,7 +3464,11 @@ impl AppUi {
         self.sidebar_playlists.clear();
         self.detail_data = None;
         self.detail_loading = false;
+        self.pending_detail_artwork = None;
+        self.pending_detail_motion_url = None;
         self.visible_home_motion_urls.clear();
+        self.motion_art.sync_visible_urls(&[]);
+        self.motion_art.set_slot("detail_hero", None, false);
         if !next.supports_motion_artwork() {
             self.motion_art.set_global_enabled(false);
         } else {
@@ -4052,7 +4323,19 @@ impl AppUi {
         });
     }
 
-    fn apply_loaded_container_detail(&mut self, data: ContainerDetailData) {
+    fn apply_loaded_container_detail(&mut self, mut data: ContainerDetailData) {
+        if data.motion_video_url.is_none()
+            && self.pending_detail_id == data.id
+            && self.pending_detail_motion_url.is_some()
+        {
+            data.motion_video_url = self.pending_detail_motion_url.clone();
+        }
+        if data.artwork_url.is_none()
+            && self.pending_detail_id == data.id
+            && self.pending_detail_artwork.is_some()
+        {
+            data.artwork_url = self.pending_detail_artwork.clone();
+        }
         if data.kind.contains("playlist") {
             self.playlist_cache
                 .upsert_detail(&data, current_unix_sec());
@@ -4195,6 +4478,20 @@ impl AppUi {
                         .map(|s| s.clone())
                         .filter(|s| !s.is_empty());
                     let det = netease_api::fetch_container_detail(&kind, &id, &title_hint, ck.as_deref()).await?;
+                    let related_albums = det
+                        .related_albums
+                        .into_iter()
+                        .map(|a| MediaCardItem {
+                            id: a.id,
+                            kind: a.kind,
+                            title: a.title,
+                            subtitle: a.subtitle,
+                            description: a.description,
+                            artwork_url: a.artwork_url,
+                            badge: a.badge,
+                            track_input: a.track_input,
+                        })
+                        .collect();
                     return Ok(ContainerDetailData {
                         id: det.id,
                         kind: det.kind,
@@ -4202,7 +4499,9 @@ impl AppUi {
                         subtitle: det.subtitle,
                         description: det.description,
                         artwork_url: det.artwork_url,
+                        motion_video_url: None,
                         tracks: det.tracks,
+                        related_albums,
                     });
                 }
                 if kind.starts_with("qq-") {
@@ -4212,6 +4511,20 @@ impl AppUi {
                         .map(|s| s.clone())
                         .filter(|s| !s.is_empty());
                     let det = qq_api::fetch_container_detail(&kind, &id, &title_hint, ck.as_deref()).await?;
+                    let related_albums = det
+                        .related_albums
+                        .into_iter()
+                        .map(|a| MediaCardItem {
+                            id: a.id,
+                            kind: a.kind,
+                            title: a.title,
+                            subtitle: a.subtitle,
+                            description: a.description,
+                            artwork_url: a.artwork_url,
+                            badge: a.badge,
+                            track_input: None,
+                        })
+                        .collect();
                     return Ok(ContainerDetailData {
                         id: det.id,
                         kind: det.kind,
@@ -4219,7 +4532,9 @@ impl AppUi {
                         subtitle: det.subtitle,
                         description: det.description,
                         artwork_url: det.artwork_url,
+                        motion_video_url: None,
                         tracks: det.tracks,
+                        related_albums,
                     });
                 }
                 if kind == "library-artists" || kind == "artists" {
@@ -4240,7 +4555,7 @@ impl AppUi {
 
                     if kind == "artists" {
                         let p = format!(
-                            "v1/catalog/{sf}/artists/{id}?views=top-songs&extend=audioTraits&l=zh-Hans-CN"
+                            "v1/catalog/{sf}/artists/{id}?views=top-songs,full-albums&extend=audioTraits&l=zh-Hans-CN"
                         );
                         let json = am_api::fetch_am_api(p, utok, None, Some(sf)).await?;
                         let root = json
@@ -4277,6 +4592,8 @@ impl AppUi {
                                     .collect::<Vec<_>>()
                             })
                             .unwrap_or_default();
+                        let related_albums =
+                            parse_media_cards_array(root.pointer("/views/full-albums/data"), "albums");
                         return Ok(ContainerDetailData {
                             id,
                             kind,
@@ -4284,16 +4601,18 @@ impl AppUi {
                             subtitle,
                             description,
                             artwork_url,
+                            motion_video_url: None,
                             tracks,
+                            related_albums,
                         });
                     }
 
-                    // Library artist -> search catalog for high-res portrait + playable top songs
+                    // Library artist -> search catalog for high-res portrait, albums & playable top songs
                     let enc: String =
                         url::form_urlencoded::byte_serialize(artist_name.trim().as_bytes())
                             .collect();
                     let sp = format!(
-                        "v1/catalog/{sf}/search?term={enc}&types=artists,songs&extend=audioTraits&limit=25&l=zh-Hans-CN"
+                        "v1/catalog/{sf}/search?term={enc}&types=artists,albums,songs&extend=audioTraits&limit=25&l=zh-Hans-CN"
                     );
                     let json = am_api::fetch_am_api(sp, utok, None, Some(sf)).await?;
                     let art_node = json.pointer("/results/artists/data/0");
@@ -4310,14 +4629,18 @@ impl AppUi {
                                 .collect::<Vec<_>>()
                         })
                         .unwrap_or_default();
+                    let related_albums =
+                        parse_media_cards_array(json.pointer("/results/albums/data"), "albums");
                     Ok(ContainerDetailData {
                         id,
                         kind,
                         title: artist_name,
-                        subtitle: "资料库艺人 · 热门曲目".to_string(),
+                        subtitle: "资料库艺人 · 热门曲目与专辑".to_string(),
                         description: String::new(),
                         artwork_url,
+                        motion_video_url: None,
                         tracks,
+                        related_albums,
                     })
                 } else if kind == "library-albums" || kind == "library-playlists" {
                     let sub = if kind == "library-albums" {
@@ -4325,12 +4648,12 @@ impl AppUi {
                     } else {
                         "playlists"
                     };
-                    let meta_path = format!("v1/me/library/{sub}/{id}?l=zh-Hans-CN");
+                    let meta_path = format!("v1/me/library/{sub}/{id}?include=catalog&l=zh-Hans-CN");
                     let tracks_path = format!(
                         "v1/me/library/{sub}/{id}/tracks?include=catalog&extend=audioTraits&limit=100&l=zh-Hans-CN"
                     );
                     let meta_json = am_api::fetch_am_api(meta_path, utok.clone(), None, Some(sf.clone())).await.ok();
-                    let tr_json = am_api::fetch_am_api(tracks_path, utok, None, Some(sf)).await?;
+                    let tr_json = am_api::fetch_am_api(tracks_path, utok.clone(), None, Some(sf.clone())).await?;
 
                     let root = meta_json.as_ref().and_then(|j| j.pointer("/data/0"));
                     let title = root
@@ -4368,6 +4691,27 @@ impl AppUi {
                         })
                         .unwrap_or_default();
 
+                    // Resolve editorial motion artwork for library albums & subscribed playlists via catalog ID
+                    let cat_id = root.and_then(|r| {
+                        r.pointer("/relationships/catalog/data/0/id")
+                            .or_else(|| r.pointer("/attributes/playParams/globalId"))
+                            .or_else(|| r.pointer("/attributes/playParams/catalogId"))
+                            .and_then(Value::as_str)
+                            .map(|s| s.to_string())
+                    });
+                    let mut motion_video_url = None;
+                    if let Some(cid) = cat_id {
+                        let cat_path = format!(
+                            "v1/catalog/{sf}/{sub}/{cid}?extend=editorialVideo&l=zh-Hans-CN"
+                        );
+                        if let Ok(cj) = am_api::fetch_am_api(cat_path, utok, None, Some(sf)).await {
+                            if let Some(attrs) = cj.pointer("/data/0/attributes") {
+                                motion_video_url =
+                                    am_api::extract_editorial_motion_video_from_attrs(attrs);
+                            }
+                        }
+                    }
+
                     Ok(ContainerDetailData {
                         id,
                         kind,
@@ -4375,11 +4719,13 @@ impl AppUi {
                         subtitle,
                         description,
                         artwork_url,
+                        motion_video_url,
                         tracks,
+                        related_albums: Vec::new(),
                     })
                 } else {
                     let path = format!(
-                        "v1/catalog/{sf}/{kind}/{id}?include=tracks&extend=audioTraits&l=zh-Hans-CN"
+                        "v1/catalog/{sf}/{kind}/{id}?include=tracks&extend=audioTraits,editorialVideo&l=zh-Hans-CN"
                     );
                     let json = am_api::fetch_am_api(path, utok, None, Some(sf)).await?;
                     let root = json
@@ -4408,6 +4754,9 @@ impl AppUi {
                         .pointer("/attributes/artwork/url")
                         .and_then(Value::as_str)
                         .map(|u| format_artwork_template(u, 600));
+                    let motion_video_url = root
+                        .get("attributes")
+                        .and_then(am_api::extract_editorial_motion_video_from_attrs);
 
                     let tracks = root
                         .pointer("/relationships/tracks/data")
@@ -4428,7 +4777,9 @@ impl AppUi {
                         subtitle,
                         description,
                         artwork_url,
+                        motion_video_url,
                         tracks,
+                        related_albums: Vec::new(),
                     })
                 }
     }
@@ -4530,6 +4881,27 @@ impl AppUi {
         self.show_lyrics_overlay = false;
         self.show_queue_popover = false;
         self.show_more_popover = false;
+        self.context_menu = None;
+        if self.transfer_modal.as_ref().is_some_and(|m| !m.running) {
+            self.transfer_modal = None;
+        }
+        if let PageRoute::ContainerDetail {
+            ref id,
+            ref title_hint,
+            ..
+        } = next
+        {
+            if self.pending_detail_id != *id {
+                self.pending_detail_id = id.clone();
+                self.pending_detail_title = title_hint.clone();
+                self.pending_detail_artwork = self
+                    .sidebar_playlists
+                    .iter()
+                    .find(|p| p.id == *id)
+                    .and_then(|p| p.artwork_url.clone());
+                self.pending_detail_motion_url = None;
+            }
+        }
         self.update_viz_subscription();
 
         match &next {
@@ -5087,9 +5459,15 @@ impl AppUi {
 
     pub fn on_mouse_move(&mut self, x: f32, y: f32) -> bool {
         let prev = self.mouse_pos;
+        if (x - prev.0).abs() > 0.5 || (y - prev.1).abs() > 0.5 {
+            self.last_mouse_move_at = Instant::now();
+        }
         self.mouse_pos = (x, y);
         if self.mouse_down && self.active_drag.is_some() {
             self.apply_drag_at(x, false);
+            return true;
+        }
+        if self.show_lyrics_overlay && self.settings.lyrics_immersive_mode {
             return true;
         }
         let was_in_tb = prev.0 >= 0.0 && prev.1 >= 0.0 && prev.1 < TOP_BAR_GUARD_H;
@@ -5108,10 +5486,14 @@ impl AppUi {
 
     pub fn on_mouse_down(&mut self, x: f32, y: f32) -> bool {
         self.mouse_pos = (x, y);
+        self.last_mouse_move_at = Instant::now();
         self.mouse_down = true;
         self.active_drag = None;
 
         if self.show_lyrics_overlay {
+            if self.context_menu.is_some() {
+                return true;
+            }
             if let Some(hz) = self
                 .lyrics_view
                 .hit_zones
@@ -5234,6 +5616,20 @@ impl AppUi {
         }
 
         if self.show_lyrics_overlay {
+            if self.context_menu.is_some() {
+                let hit = self
+                    .hit_regions
+                    .iter()
+                    .rev()
+                    .find(|hr| hr.rect.contains(x, y))
+                    .map(|hr| hr.action.clone());
+                if let Some(act) = hit {
+                    self.execute_action(act);
+                } else {
+                    self.context_menu = None;
+                }
+                return true;
+            }
             self.lyrics_view.animator.set_pressed_line(None);
             let hit = self
                 .lyrics_view
@@ -5250,7 +5646,11 @@ impl AppUi {
         }
 
         // Check Visualizer-specific hit zones first when on Visualizer page
-        if self.route == PageRoute::Visualizer && !self.show_queue_popover && !self.show_more_popover
+        if self.route == PageRoute::Visualizer
+            && !self.show_queue_popover
+            && !self.show_more_popover
+            && self.context_menu.is_none()
+            && self.transfer_modal.is_none()
         {
             let vhit = self
                 .viz_state
@@ -5278,9 +5678,10 @@ impl AppUi {
             return true;
         }
 
-        if self.show_queue_popover || self.show_more_popover {
+        if self.show_queue_popover || self.show_more_popover || self.context_menu.is_some() {
             self.show_queue_popover = false;
             self.show_more_popover = false;
+            self.context_menu = None;
             return true;
         }
 
@@ -5457,6 +5858,21 @@ impl AppUi {
                 self.settings.lyrics_free_blur = self.lyrics_view.music_free_blur;
                 self.settings.save();
             }
+            LyricsHitAction::ToggleImmersiveMode => {
+                self.execute_action(UiAction::ToggleLyricsImmersiveMode);
+            }
+            LyricsHitAction::OpenMoreMenu(anchor) => {
+                if self.context_menu.is_some() {
+                    self.context_menu = None;
+                } else {
+                    self.context_menu = Some(ContextMenuState {
+                        anchor,
+                        target: ContextMenuTarget::NowPlaying,
+                        show_playlist_submenu: false,
+                        from_lyrics: true,
+                    });
+                }
+            }
             LyricsHitAction::ImportLocalLyrics => {
                 if let Some(path) = pick_local_lyrics_file_dialog(self.wake_hwnd) {
                     let _ = self.import_lyrics_from_path(&path);
@@ -5604,6 +6020,7 @@ impl AppUi {
                 id,
                 title_hint,
                 artwork_url,
+                motion_video_url,
                 card_rect,
                 card_radius,
             } => {
@@ -5615,6 +6032,10 @@ impl AppUi {
                     });
                     return;
                 }
+                self.pending_detail_id = id.clone();
+                self.pending_detail_title = title_hint.clone();
+                self.pending_detail_artwork = artwork_url.clone();
+                self.pending_detail_motion_url = motion_video_url;
                 if !self.settings.reduce_motion && card_rect.w > 10.0 && card_rect.h > 10.0 {
                     self.cover_launch_anim = Some(CoverLaunchAnimState {
                         target_id: id.clone(),
@@ -6013,10 +6434,13 @@ impl AppUi {
                         PlaybackBackend::AppleMusicWeb => {
                             web_am_player::control("volume", Some(v)).await
                         }
-                        _ => tokio::task::spawn_blocking(move || am_agent::control("volume", Some(v)))
-                            .await
-                            .map_err(|e| e.to_string())
-                            .and_then(|r| r),
+                        PlaybackBackend::AppleMusicNative => {
+                            tokio::task::spawn_blocking(move || am_agent::control("volume", Some(v)))
+                                .await
+                                .map_err(|e| e.to_string())
+                                .and_then(|r| r)
+                        }
+                        PlaybackBackend::ExternalSmtc => Ok(SmtcState::default()),
                     };
                     if let Ok(st) = res {
                         let _ = tx.send(AsyncMsg::PlaybackUpdated(st));
@@ -6705,6 +7129,459 @@ impl AppUi {
                 self.lyrics_view.music_free_blur = self.settings.lyrics_free_blur;
                 self.settings.save();
             }
+            UiAction::ToggleLyricsImmersiveMode => {
+                self.settings.lyrics_immersive_mode = !self.settings.lyrics_immersive_mode;
+                self.lyrics_view.immersive_mode = self.settings.lyrics_immersive_mode;
+                self.last_mouse_move_at = Instant::now();
+                self.context_menu = None;
+                if self.wake_hwnd != 0 {
+                    self.settings.save();
+                }
+                self.set_banner(
+                    if self.settings.lyrics_immersive_mode {
+                        "已开启歌词沉浸模式（鼠标移近四角时自动显示控件）".to_string()
+                    } else {
+                        "已关闭歌词沉浸模式".to_string()
+                    },
+                    false,
+                );
+            }
+            UiAction::OpenTrackContextMenu { track, anchor } => {
+                self.show_more_popover = false;
+                self.show_queue_popover = false;
+                self.context_menu = Some(ContextMenuState {
+                    anchor,
+                    target: ContextMenuTarget::Track(track),
+                    show_playlist_submenu: false,
+                    from_lyrics: false,
+                });
+            }
+            UiAction::OpenDetailContextMenu { anchor } => {
+                self.show_more_popover = false;
+                self.show_queue_popover = false;
+                if let Some(ref det) = self.detail_data {
+                    self.context_menu = Some(ContextMenuState {
+                        anchor,
+                        target: ContextMenuTarget::Container {
+                            kind: det.kind.clone(),
+                            id: det.id.clone(),
+                            title: det.title.clone(),
+                            subtitle: det.subtitle.clone(),
+                            artwork_url: det.artwork_url.clone(),
+                            tracks: det.tracks.clone(),
+                        },
+                        show_playlist_submenu: false,
+                        from_lyrics: false,
+                    });
+                }
+            }
+            UiAction::CloseContextMenu => {
+                self.context_menu = None;
+            }
+            UiAction::ToggleContextPlaylistSubmenu => {
+                if let Some(ref mut cm) = self.context_menu {
+                    cm.show_playlist_submenu = !cm.show_playlist_submenu;
+                }
+            }
+            UiAction::PlayNextTrack(track) => {
+                self.context_menu = None;
+                let tname = track.name.clone();
+                if self.settings.playback_backend.uses_native_stream_player() {
+                    if !native_player::insert_next_in_queue(track.clone()) {
+                        self.play_tracks_async(vec![track], 0);
+                    } else {
+                        self.set_banner(format!("已将「{tname}」加入下一首播放"), false);
+                    }
+                } else if self.smtc.title.is_empty() {
+                    self.play_tracks_async(vec![track], 0);
+                } else {
+                    self.play_next_queue.push_front(track);
+                    self.set_banner(format!("已将「{tname}」加入下一首播放"), false);
+                }
+            }
+            UiAction::AddTrackToPlaylist {
+                playlist_id,
+                playlist_name,
+                track,
+            } => {
+                self.context_menu = None;
+                let backend = self.settings.playback_backend;
+                let sf = self.settings.storefront.clone();
+                let utok = non_empty_opt(&self.settings.user_token);
+                let ne_cookie = self.settings.netease_cookie.clone();
+                let tx = self.tx.clone();
+                let hwnd = self.wake_hwnd;
+                self.rt.spawn(async move {
+                    let res: Result<(), String> = match backend {
+                        PlaybackBackend::NetEase => {
+                            netease_api::add_tracks_to_playlist(
+                                &playlist_id,
+                                &[track.id.clone()],
+                                &ne_cookie,
+                            )
+                            .await
+                        }
+                        PlaybackBackend::AppleMusicNative | PlaybackBackend::AppleMusicWeb => {
+                            let sid = track.effective_adam_id();
+                            am_api::add_tracks_to_library_playlist(
+                                &playlist_id,
+                                &[sid],
+                                utok,
+                                Some(sf),
+                            )
+                            .await
+                        }
+                        PlaybackBackend::QQMusic => {
+                            Err("QQ 音乐网页端暂不开放直接写入云端歌单，可使用「跨平台复制」同步至 Apple Music 或网易云".to_string())
+                        }
+                        PlaybackBackend::ExternalSmtc => {
+                            Err("外置 SMTC 模式下请先切换至对应音乐平台后端".to_string())
+                        }
+                    };
+                    match res {
+                        Ok(()) => {
+                            let _ = tx.send(AsyncMsg::BannerNotice(format!(
+                                "已将「{}」添加到歌单「{}」",
+                                track.name, playlist_name
+                            )));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(AsyncMsg::BannerError(e));
+                        }
+                    }
+                    Self::post_ui_wake(hwnd);
+                });
+            }
+            UiAction::GoToArtistByName(artist_name) => {
+                self.context_menu = None;
+                self.show_more_popover = false;
+                let clean = artist_name.trim().to_string();
+                if clean.is_empty() {
+                    return;
+                }
+                let backend = self.settings.playback_backend;
+                let sf = self.settings.storefront.clone();
+                let utok = non_empty_opt(&self.settings.user_token);
+                let ne_ck = non_empty_opt(&self.settings.netease_cookie);
+                let qq_ck = non_empty_opt(&self.settings.qq_cookie);
+                let tx = self.tx.clone();
+                let hwnd = self.wake_hwnd;
+                self.set_banner(format!("正在打开艺人页：{clean}..."), false);
+                self.rt.spawn(async move {
+                    let found: Option<(String, String, String)> = match backend {
+                        PlaybackBackend::NetEase => {
+                            netease_api::resolve_artist_by_name(&clean, ne_ck.as_deref())
+                                .await
+                                .map(|(id, nm)| ("ne-artist".to_string(), id, nm))
+                        }
+                        PlaybackBackend::QQMusic => {
+                            qq_api::resolve_artist_by_name(&clean, qq_ck.as_deref())
+                                .await
+                                .map(|(id, nm)| ("qq-artist".to_string(), id, nm))
+                        }
+                        _ => am_api::resolve_artist_by_name(&clean, &sf, utok)
+                            .await
+                            .map(|(id, nm)| ("artists".to_string(), id, nm)),
+                    };
+                    if let Some((kind, id, name)) = found {
+                        let _ = tx.send(AsyncMsg::ResolvedArtistNav { kind, id, name });
+                    } else {
+                        let _ = tx.send(AsyncMsg::BannerError(format!(
+                            "未在当前平台找到艺人「{clean}」"
+                        )));
+                    }
+                    Self::post_ui_wake(hwnd);
+                });
+            }
+            UiAction::GoToAlbumByName {
+                album_name,
+                artist_name,
+            } => {
+                self.context_menu = None;
+                self.show_more_popover = false;
+                let clean_alb = album_name.trim().to_string();
+                if clean_alb.is_empty() {
+                    self.set_banner("当前歌曲未包含专辑信息".to_string(), false);
+                    return;
+                }
+                let backend = self.settings.playback_backend;
+                let sf = self.settings.storefront.clone();
+                let utok = non_empty_opt(&self.settings.user_token);
+                let ne_ck = non_empty_opt(&self.settings.netease_cookie);
+                let qq_ck = non_empty_opt(&self.settings.qq_cookie);
+                let tx = self.tx.clone();
+                let hwnd = self.wake_hwnd;
+                self.set_banner(format!("正在打开专辑：{clean_alb}..."), false);
+                self.rt.spawn(async move {
+                    let found: Option<(String, String, String)> = match backend {
+                        PlaybackBackend::NetEase => {
+                            netease_api::resolve_album_by_name(&clean_alb, &artist_name, ne_ck.as_deref())
+                                .await
+                                .map(|(id, nm)| ("ne-album".to_string(), id, nm))
+                        }
+                        PlaybackBackend::QQMusic => {
+                            qq_api::resolve_album_by_name(&clean_alb, &artist_name, qq_ck.as_deref())
+                                .await
+                                .map(|(id, nm)| ("qq-album".to_string(), id, nm))
+                        }
+                        _ => am_api::resolve_album_by_name(&clean_alb, &artist_name, &sf, utok)
+                            .await
+                            .map(|(id, nm)| ("albums".to_string(), id, nm)),
+                    };
+                    if let Some((kind, id, name)) = found {
+                        let _ = tx.send(AsyncMsg::ResolvedAlbumNav { kind, id, name });
+                    } else {
+                        let _ = tx.send(AsyncMsg::BannerError(format!(
+                            "未在当前平台找到专辑「{clean_alb}」"
+                        )));
+                    }
+                    Self::post_ui_wake(hwnd);
+                });
+            }
+            UiAction::OpenPlaylistTransferModal => {
+                self.context_menu = None;
+                self.show_more_popover = false;
+                if let Some(ref det) = self.detail_data {
+                    if det.tracks.is_empty() {
+                        self.set_banner("当前歌单/专辑没有可复制的歌曲".to_string(), true);
+                        return;
+                    }
+                    let default_target = if self.settings.playback_backend.is_apple_music() {
+                        PlaybackBackend::NetEase
+                    } else {
+                        PlaybackBackend::AppleMusicNative
+                    };
+                    self.transfer_modal = Some(PlaylistTransferState {
+                        source_title: det.title.clone(),
+                        source_kind: det.kind.clone(),
+                        source_tracks: det.tracks.clone(),
+                        target_backend: default_target,
+                        running: false,
+                        done: false,
+                        matched: 0,
+                        total: det.tracks.len(),
+                        current_track_name: String::new(),
+                        result_msg: None,
+                        error_msg: None,
+                        created_playlist_id: None,
+                        matched_tracks: Vec::new(),
+                    });
+                }
+            }
+            UiAction::ClosePlaylistTransferModal => {
+                self.transfer_modal = None;
+            }
+            UiAction::SelectTransferTarget(be) => {
+                if let Some(ref mut tm) = self.transfer_modal {
+                    if !tm.running {
+                        tm.target_backend = be;
+                        tm.done = false;
+                        tm.result_msg = None;
+                        tm.error_msg = None;
+                    }
+                }
+            }
+            UiAction::StartPlaylistTransfer => {
+                let Some(ref mut tm) = self.transfer_modal else {
+                    return;
+                };
+                if tm.running || tm.source_tracks.is_empty() {
+                    return;
+                }
+                let target = tm.target_backend;
+                if target.is_apple_music() && self.settings.user_token.trim().is_empty() {
+                    tm.error_msg = Some("目标为 Apple Music 云端歌单，请先在设置中绑定 Media-User-Token".to_string());
+                    return;
+                }
+                if target == PlaybackBackend::NetEase && self.settings.netease_cookie.trim().is_empty() {
+                    tm.error_msg = Some("目标为网易云云端歌单，请先在设置中扫码或粘贴网易云 Cookie 登录".to_string());
+                    return;
+                }
+                tm.running = true;
+                tm.done = false;
+                tm.matched = 0;
+                tm.error_msg = None;
+                tm.result_msg = None;
+                tm.matched_tracks.clear();
+
+                let pl_title = tm.source_title.clone();
+                let tracks = tm.source_tracks.clone();
+                let total = tracks.len();
+                let sf = self.settings.storefront.clone();
+                let utok = non_empty_opt(&self.settings.user_token);
+                let ne_ck = self.settings.netease_cookie.clone();
+                let qq_ck = non_empty_opt(&self.settings.qq_cookie);
+                let tx = self.tx.clone();
+                let hwnd = self.wake_hwnd;
+
+                self.rt.spawn(async move {
+                    let mut matched_tracks: Vec<AgentTrackInput> = Vec::new();
+                    for (idx, src) in tracks.iter().enumerate() {
+                        let _ = tx.send(AsyncMsg::PlaylistTransferProgress {
+                            matched: matched_tracks.len(),
+                            total,
+                            current_name: format!("({}/{}) {} - {}", idx + 1, total, src.name, src.artist_name),
+                        });
+                        Self::post_ui_wake(hwnd);
+
+                        let hit = match target {
+                            PlaybackBackend::AppleMusicNative | PlaybackBackend::AppleMusicWeb => {
+                                am_api::search_best_song_match(
+                                    &src.name,
+                                    &src.artist_name,
+                                    src.duration_sec,
+                                    &sf,
+                                    utok.clone(),
+                                )
+                                .await
+                            }
+                            PlaybackBackend::NetEase => {
+                                netease_api::search_best_song_match(
+                                    &src.name,
+                                    &src.artist_name,
+                                    src.duration_sec,
+                                    (!ne_ck.is_empty()).then_some(ne_ck.as_str()),
+                                )
+                                .await
+                            }
+                            PlaybackBackend::QQMusic => {
+                                qq_api::search_best_song_match(
+                                    &src.name,
+                                    &src.artist_name,
+                                    src.duration_sec,
+                                    qq_ck.as_deref(),
+                                )
+                                .await
+                            }
+                            PlaybackBackend::ExternalSmtc => None,
+                        };
+                        if let Some(m) = hit {
+                            matched_tracks.push(m);
+                        }
+                    }
+
+                    if matched_tracks.is_empty() {
+                        let _ = tx.send(AsyncMsg::PlaylistTransferDone {
+                            ok: false,
+                            message: format!("未能在 {} 曲库中匹配到可导入歌曲", target.display_name()),
+                            target_backend: target,
+                            created_playlist_id: None,
+                            matched_tracks,
+                        });
+                        Self::post_ui_wake(hwnd);
+                        return;
+                    }
+
+                    let matched_n = matched_tracks.len();
+                    match target {
+                        PlaybackBackend::AppleMusicNative | PlaybackBackend::AppleMusicWeb => {
+                            let ids: Vec<String> = matched_tracks
+                                .iter()
+                                .map(|t| t.effective_adam_id())
+                                .filter(|s| !s.is_empty())
+                                .collect();
+                            match am_api::create_library_playlist(
+                                &pl_title,
+                                "由 AM Light 跨平台歌单复制导入",
+                                &ids,
+                                utok,
+                                Some(sf),
+                            )
+                            .await
+                            {
+                                Ok(pid) => {
+                                    let _ = tx.send(AsyncMsg::PlaylistTransferDone {
+                                        ok: true,
+                                        message: format!(
+                                            "已复制至 Apple Music 云端歌单「{pl_title}」：成功导入 {matched_n}/{total} 首"
+                                        ),
+                                        target_backend: target,
+                                        created_playlist_id: Some(pid),
+                                        matched_tracks,
+                                    });
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(AsyncMsg::PlaylistTransferDone {
+                                        ok: false,
+                                        message: e,
+                                        target_backend: target,
+                                        created_playlist_id: None,
+                                        matched_tracks,
+                                    });
+                                }
+                            }
+                        }
+                        PlaybackBackend::NetEase => {
+                            match netease_api::create_playlist(&pl_title, &ne_ck).await {
+                                Ok(pid) => {
+                                    let ids: Vec<String> =
+                                        matched_tracks.iter().map(|t| t.id.clone()).collect();
+                                    match netease_api::add_tracks_to_playlist(&pid, &ids, &ne_ck).await {
+                                        Ok(()) => {
+                                            let _ = tx.send(AsyncMsg::PlaylistTransferDone {
+                                                ok: true,
+                                                message: format!(
+                                                    "已复制至网易云歌单「{pl_title}」：成功导入 {matched_n}/{total} 首"
+                                                ),
+                                                target_backend: target,
+                                                created_playlist_id: Some(pid),
+                                                matched_tracks,
+                                            });
+                                        }
+                                        Err(e) => {
+                                            let _ = tx.send(AsyncMsg::PlaylistTransferDone {
+                                                ok: false,
+                                                message: format!("已建歌单但写入曲目失败：{e}"),
+                                                target_backend: target,
+                                                created_playlist_id: Some(pid),
+                                                matched_tracks,
+                                            });
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(AsyncMsg::PlaylistTransferDone {
+                                        ok: false,
+                                        message: e,
+                                        target_backend: target,
+                                        created_playlist_id: None,
+                                        matched_tracks,
+                                    });
+                                }
+                            }
+                        }
+                        PlaybackBackend::QQMusic => {
+                            let _ = tx.send(AsyncMsg::PlaylistTransferDone {
+                                ok: true,
+                                message: format!(
+                                    "已在 QQ 音乐匹配成功 {matched_n}/{total} 首，点击下方按钮立即切换播放队列"
+                                ),
+                                target_backend: target,
+                                created_playlist_id: None,
+                                matched_tracks,
+                            });
+                        }
+                        PlaybackBackend::ExternalSmtc => {}
+                    }
+                    Self::post_ui_wake(hwnd);
+                });
+            }
+            UiAction::PlayTransferMatchedTracks => {
+                if let Some(tm) = self.transfer_modal.take() {
+                    if !tm.matched_tracks.is_empty() {
+                        if self.settings.playback_backend != tm.target_backend {
+                            self.switch_playback_backend(tm.target_backend);
+                        }
+                        self.play_tracks_async(tm.matched_tracks, 0);
+                    }
+                }
+            }
+            UiAction::ImportLocalLyricsFromMenu => {
+                self.context_menu = None;
+                if let Some(path) = pick_local_lyrics_file_dialog(self.wake_hwnd) {
+                    let _ = self.import_lyrics_from_path(&path);
+                }
+            }
             UiAction::ToggleReduceMotion => {
                 self.settings.reduce_motion = !self.settings.reduce_motion;
                 self.settings.save();
@@ -6791,6 +7668,8 @@ impl AppUi {
         if is_ne || is_qq {
             let tag = if is_ne { "netease" } else { "qqmusic" }.to_string();
             let target_track = tracks[clamped_idx].clone();
+            // Immediately stop outgoing WASAPI audio & lock playhead at 0:00 while resolving the new track!
+            native_player::begin_track_transition();
             self.begin_optimistic_playback_loading(Some(&target_track), container_id);
             let tx = self.tx.clone();
             let hwnd = self.wake_hwnd;
@@ -6866,10 +7745,25 @@ impl AppUi {
     }
 
     fn control_player(&mut self, action: &str, seek_sec: Option<f64>) {
+        let backend = self.settings.playback_backend;
+        if action.eq_ignore_ascii_case("next")
+            && !self.play_next_queue.is_empty()
+            && matches!(
+                backend,
+                PlaybackBackend::AppleMusicNative | PlaybackBackend::AppleMusicWeb
+            )
+        {
+            if let Some(next_tr) = self.play_next_queue.pop_front() {
+                self.play_tracks_async(vec![next_tr], 0);
+                return;
+            }
+        }
         if action.eq_ignore_ascii_case("seek") {
             if let Some(sec) = seek_sec {
                 let clamped = sec.max(0.0);
-                am_agent::notify_optimistic_seek(clamped);
+                if backend == PlaybackBackend::AppleMusicNative {
+                    am_agent::notify_optimistic_seek(clamped);
+                }
                 self.smtc_optimistic_seek = Some((clamped, Instant::now()));
                 self.smtc_seek_pre_univ = self.last_smtc_timeline_univ;
                 self.playhead_anchor_sec = clamped;
@@ -6878,10 +7772,26 @@ impl AppUi {
             }
         } else if action.eq_ignore_ascii_case("next") || action.eq_ignore_ascii_case("prev") {
             self.smtc_optimistic_seek = None;
+            // On NetEase / QQ Music native streaming backends, immediately freeze playhead at 0:00
+            // and enter buffering state so Track 2's lyrics NEVER jump to Track 1's 40s timestamp!
+            if backend.uses_native_stream_player() {
+                let should_restart_only = action.eq_ignore_ascii_case("prev")
+                    && self.smtc.position_sec > 4.0
+                    && !self.playback_loading;
+                self.smtc.position_sec = 0.0;
+                self.playhead_anchor_sec = 0.0;
+                self.playhead_anchor_inst = Instant::now();
+                self.lyrics_view.animator.reset_word_clamps();
+                if !should_restart_only {
+                    self.playback_loading = true;
+                    self.playback_loading_started = Some(Instant::now());
+                    self.playback_loading_track_id = None;
+                    self.smtc.status = "Paused".to_string();
+                }
+            }
         }
-        let backend = self.settings.playback_backend;
         if self.wake_hwnd == 0
-            && !am_agent::is_agent_active()
+            && !(backend == PlaybackBackend::AppleMusicNative && am_agent::is_agent_active())
             && !native_player::is_active()
             && !web_am_player::is_active()
         {
@@ -7054,11 +7964,14 @@ impl AppUi {
         }
 
         // Same-frame (<4ms) gapless & duration/onset sync whenever AMPLibraryAgent increments `state_seq()`!
+        // STRICTLY gated on `PlaybackBackend::AppleMusicNative`!
         let cur_agent_seq = am_agent::state_seq();
         if cur_agent_seq != self.last_agent_seq {
             self.last_agent_seq = cur_agent_seq;
-            let st = am_agent::get_playback_state();
-            self.on_playback_state_changed(st);
+            if self.settings.playback_backend == PlaybackBackend::AppleMusicNative {
+                let st = am_agent::get_playback_state();
+                self.on_playback_state_changed(st);
+            }
         }
 
         let animating_now = self.needs_continuous_animation();
@@ -7198,8 +8111,14 @@ impl AppUi {
             Some(ActiveDrag::LyricsSeek(_) | ActiveDrag::MiniPlayerSeek(_))
         );
         if !scrubbing_seek {
+            let live_agent_playhead =
+                if self.settings.playback_backend == PlaybackBackend::AppleMusicNative {
+                    am_agent::get_live_agent_playhead_ext()
+                } else {
+                    None
+                };
             if let Some((agent_aid, agent_status, live_pos, live_dur, resolved_ep)) =
-                am_agent::get_live_agent_playhead_ext()
+                live_agent_playhead
             {
                 let epoch_ready = !self.playback_loading
                     || (resolved_ep > 0 && resolved_ep >= self.loading_cmd_epoch);
@@ -7414,65 +8333,34 @@ impl AppUi {
         let lyrics_motion_frame = lyrics_motion_url
             .and_then(|u| self.motion_art.latest_frame("lyrics_cover", Some(u)));
 
-        // Dynamic covers on browse/discover & radio are disabled per official Apple Music UX;
-        // ONLY Home (`主页`) & Lyrics (`歌词页`) play dynamic covers (up to 3 viewport-visible Home slots)!
-        let mut home_motion_urls: [Option<String>; 3] = [None, None, None];
-        if motion_on
+        // Album / Playlist Detail Page Hero Motion Cover slot (`detail_hero`)
+        let detail_motion_url = if motion_on
             && self.is_window_focused
             && !self.show_lyrics_overlay
-            && self.route == PageRoute::Home
+            && matches!(self.route, PageRoute::ContainerDetail { .. })
         {
-            let mut picked = 0usize;
-            for u in &self.visible_home_motion_urls {
-                if !u.is_empty() && !home_motion_urls[..picked].iter().any(|x| x.as_deref() == Some(u.as_str())) {
-                    home_motion_urls[picked] = Some(u.clone());
-                    picked += 1;
-                    if picked >= 3 {
-                        break;
-                    }
-                }
-            }
-            if picked == 0 {
-                for s in &self.home_shelves {
-                    for it in &s.items {
-                        let cand = if s.kind == EditorialShelfKind::HomeTopPicks {
-                            it.motion_tall_video_url
-                                .as_deref()
-                                .or(it.motion_video_url.as_deref())
-                        } else {
-                            it.motion_video_url.as_deref()
-                        };
-                        if let Some(u) = cand {
-                            if !home_motion_urls[..picked].iter().any(|x| x.as_deref() == Some(u)) {
-                                home_motion_urls[picked] = Some(u.to_string());
-                                picked += 1;
-                                if picked >= 3 {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    if picked >= 3 {
-                        break;
-                    }
-                }
-            }
+            self.detail_data
+                .as_ref()
+                .and_then(|d| d.motion_video_url.clone())
+                .or_else(|| self.pending_detail_motion_url.clone())
+        } else {
+            None
+        };
+        self.motion_art.set_slot(
+            "detail_hero",
+            detail_motion_url.as_deref(),
+            detail_motion_url.is_some(),
+        );
+
+        // If we are NOT on Home (or Lyrics overlay is open / window unfocused), stop all Home viewport motion slots immediately!
+        if !motion_on
+            || !self.is_window_focused
+            || self.show_lyrics_overlay
+            || self.route != PageRoute::Home
+        {
+            self.visible_home_motion_urls.clear();
+            self.motion_art.sync_visible_urls(&[]);
         }
-        self.motion_art.set_slot(
-            "home_motion_0",
-            home_motion_urls[0].as_deref(),
-            home_motion_urls[0].is_some(),
-        );
-        self.motion_art.set_slot(
-            "home_motion_1",
-            home_motion_urls[1].as_deref(),
-            home_motion_urls[1].is_some(),
-        );
-        self.motion_art.set_slot(
-            "home_motion_2",
-            home_motion_urls[2].as_deref(),
-            home_motion_urls[2].is_some(),
-        );
 
         if lyr_open_t > 0.004 {
             let pal = self
@@ -7493,12 +8381,23 @@ impl AppUi {
                 self.settings.reduce_motion,
                 self.settings.lyrics_latin_by_word,
             );
+            let idle_sec = self.last_mouse_move_at.elapsed().as_secs_f32();
+            self.lyrics_view.step_immersive_corners(
+                win_rect,
+                self.mouse_pos,
+                idle_sec,
+                self.settings.lyrics_immersive_mode,
+                self.context_menu.is_some(),
+                dt,
+                self.settings.reduce_motion,
+            );
         }
 
         // Fast path when Lyrics view is fully expanded (`lyr_open_t >= 0.996`)
         if lyr_open_t >= 0.996 {
             r.release_lyrics_transition_surfaces();
             self.hover_alphas.clear();
+            self.hit_regions.clear();
             r.begin_draw(Theme::BG_PRIMARY);
             let art_key = self.smtc.artwork_url.clone();
             let lyr_key = self.current_lyrics_key.clone();
@@ -7530,6 +8429,12 @@ impl AppUi {
                 1.0,
                 lyrics_motion_frame.as_ref(),
             );
+            if self.context_menu.is_some() {
+                self.draw_context_menu(r, win_rect);
+            }
+            if let Some((ref msg, is_err, _)) = self.banner_text.clone() {
+                self.draw_banner_toast(r, win_rect, msg, is_err);
+            }
             let sync_int = if live_resize_no_vsync {
                 0
             } else {
@@ -7676,6 +8581,17 @@ impl AppUi {
         self.draw_main_content_layer(r, content_area);
         clip_hit_regions_below_topbar(&mut self.hit_regions, TOP_BAR_GUARD_H);
 
+        // Immediately sync URL-keyed viewport motion slots right after drawing Home content:
+        // every visible motion cover plays smoothly, and every cover leaving the viewport stops immediately!
+        if motion_on
+            && self.is_window_focused
+            && !self.show_lyrics_overlay
+            && self.route == PageRoute::Home
+        {
+            self.motion_art
+                .sync_visible_urls(&self.visible_home_motion_urls);
+        }
+
         // Top-Bar Placeholder Scrim (fades in smoothly when cursor hovers into top bar while browsing!)
         let tb_guard_a = if self.route == PageRoute::Visualizer {
             0.0
@@ -7715,8 +8631,11 @@ impl AppUi {
         }
 
         let nav_sb_t = if is_narrow { 0.0 } else { sb_open_t };
+        // Single per-frame GPU backdrop snapshot shared by ALL 9 floating top-bar buttons + MiniPlayer!
+        r.begin_glass_backdrop_snapshot(self.glass_off());
         self.draw_top_floating_nav(r, content_area, nav_sb_t);
         self.draw_floating_mini_player(r, content_area);
+        r.end_glass_backdrop_snapshot();
 
         // Narrow-window floating sidebar drawer + click-to-dismiss scrim
         if is_narrow && sb_open_t > 0.003 {
@@ -7735,6 +8654,12 @@ impl AppUi {
         }
         if self.show_more_popover {
             self.draw_more_popover(r, content_area);
+        }
+        if self.context_menu.is_some() {
+            self.draw_context_menu(r, win_rect);
+        }
+        if self.transfer_modal.is_some() {
+            self.draw_playlist_transfer_modal(r, win_rect);
         }
         if let Some((ref msg, is_err, _)) = self.banner_text.clone() {
             self.draw_banner_toast(r, content_area, msg, is_err);
@@ -9619,6 +10544,7 @@ impl AppUi {
                 id: cur_album.id.clone(),
                 title_hint: cur_album.title.clone(),
                 artwork_url: cur_album.artwork_url.clone(),
+                motion_video_url: None,
                 card_rect: center_hit_rect,
                 card_radius: 12.0,
             },
@@ -9769,20 +10695,98 @@ impl AppUi {
             r.stroke_rounded_rect(cur_r, cur_rad, Color::rgba(255, 255, 255, 0.18), 1.1);
         };
 
+        let motion_on = self.settings.motion_artwork_enabled && !self.settings.reduce_motion;
+        let (route_kind, route_hint) = match &self.route {
+            PageRoute::ContainerDetail {
+                kind, title_hint, ..
+            } => (kind.clone(), title_hint.clone()),
+            _ => (String::new(), String::new()),
+        };
+        let is_pending_artist = matches!(
+            route_kind.as_str(),
+            "artists" | "library-artists" | "ne-artist" | "qq-artist"
+        );
+        let pending_rad = if is_pending_artist { art_sz * 0.5 } else { 14.0 };
+
         if self.detail_loading {
+            let rx = art_rect.right() + 28.0;
+            let rw = (x0 + w - rx).max(140.0);
+            let pending_title = if !self.pending_detail_title.is_empty() && self.pending_detail_id == route_id {
+                self.pending_detail_title.clone()
+            } else {
+                route_hint.clone()
+            };
+            let pending_art = if self.pending_detail_id == route_id {
+                self.pending_detail_artwork.clone()
+            } else {
+                None
+            };
+            let pending_vid = if self.pending_detail_id == route_id {
+                self.pending_detail_motion_url.clone()
+            } else {
+                None
+            };
+
+            // Keep the landed album/playlist cover continuously visible in `art_rect` while tracks load!
+            // Zero black frames or disappearance after the 0.38s cover fly-in finishes!
+            if let Some((cur_r, cur_rad, ref fly_art, _)) = launch_anim_frame {
+                draw_flying_cover(
+                    self,
+                    r,
+                    cur_r,
+                    cur_rad,
+                    fly_art.as_deref().or(pending_art.as_deref()),
+                );
+            } else {
+                let mf = if motion_on {
+                    pending_vid
+                        .as_deref()
+                        .and_then(|u| self.motion_art.latest_frame("detail_hero", Some(u)))
+                } else {
+                    None
+                };
+                if let Some(ref frame) = mf {
+                    r.fill_rounded_rect(
+                        RectF::new(art_rect.x + 4.0, art_rect.y + 8.0, art_sz - 8.0, art_sz),
+                        pending_rad,
+                        Color::rgba(0, 0, 0, 0.45),
+                    );
+                    let _ = r.draw_motion_artwork(frame, art_rect, pending_rad, 1.0);
+                    r.stroke_rounded_rect(art_rect, pending_rad, Color::rgba(255, 255, 255, 0.14), 1.0);
+                } else {
+                    draw_flying_cover(self, r, art_rect, pending_rad, pending_art.as_deref());
+                }
+            }
+
+            if !pending_title.is_empty() {
+                r.draw_text(
+                    &pending_title,
+                    RectF::new(rx, y + 24.0, rw, 36.0),
+                    26.0,
+                    700,
+                    Theme::TEXT_PRIMARY,
+                    TextAlign::Left,
+                    false,
+                    false,
+                );
+            }
+            r.draw_loading_spinner(
+                rx + 10.0,
+                y + 82.0,
+                8.5,
+                self.spinner_phase,
+                Theme::TEXT_SECONDARY,
+            );
             r.draw_text(
                 "正在载入曲目列表...",
-                RectF::new(art_rect.right() + 28.0, y + 60.0, (w - art_sz - 28.0).max(120.0), 32.0),
-                16.0,
+                RectF::new(rx + 28.0, y + 66.0, (rw - 28.0).max(120.0), 32.0),
+                15.0,
                 500,
                 Theme::TEXT_SECONDARY,
                 TextAlign::Left,
                 true,
                 false,
             );
-            if let Some((cur_r, cur_rad, ref fly_art, _)) = launch_anim_frame {
-                draw_flying_cover(self, r, cur_r, cur_rad, fly_art.as_deref());
-            }
             return y + art_sz + 80.0;
         }
 
@@ -9803,6 +10807,11 @@ impl AppUi {
             return y + art_sz + 80.0;
         };
 
+        let is_artist = matches!(
+            detail.kind.as_str(),
+            "artists" | "library-artists" | "ne-artist" | "qq-artist"
+        );
+        let hero_rad = if is_artist { art_sz * 0.5 } else { 14.0 };
         let is_launching = launch_anim_frame.is_some();
         let behind_alpha = launch_anim_frame.as_ref().map(|f| f.3).unwrap_or(1.0);
         let pushed_behind = if is_launching && behind_alpha < 0.995 {
@@ -9814,23 +10823,39 @@ impl AppUi {
             false
         };
 
-        // Hero Artwork Slot (hidden in-slot while the flying cover is in transit in front!)
+        // Hero Artwork Slot (supports animated editorialVideo motion covers on Albums & Playlists!)
         if !is_launching {
             r.fill_rounded_rect(
                 RectF::new(art_rect.x + 4.0, art_rect.y + 8.0, art_sz - 8.0, art_sz),
-                14.0,
+                hero_rad,
                 Color::rgba(0, 0, 0, 0.45),
             );
 
-            let mut drew_hero = false;
-            if let Some(ref u) = detail.artwork_url {
+            let detail_mf = if motion_on && !is_artist {
+                detail
+                    .motion_video_url
+                    .as_deref()
+                    .and_then(|u| self.motion_art.latest_frame("detail_hero", Some(u)))
+            } else {
+                None
+            };
+            let mut drew_hero = detail_mf
+                .as_ref()
+                .map(|mf| r.draw_motion_artwork(mf, art_rect, hero_rad, 1.0))
+                .unwrap_or(false);
+            if !drew_hero {
+                if let Some(ref u) = detail.artwork_url {
+                    self.request_artwork(r, u, true);
+                    drew_hero = r.draw_rounded_artwork(u, true, art_rect, hero_rad, 1.0)
+                        || r.draw_rounded_artwork(u, false, art_rect, hero_rad, 1.0);
+                }
+            } else if let Some(ref u) = detail.artwork_url {
                 self.request_artwork(r, u, true);
-                drew_hero = r.draw_rounded_artwork(u, true, art_rect, 14.0, 1.0);
             }
             if !drew_hero {
-                r.fill_rounded_rect(art_rect, 14.0, Theme::BG_ELEVATED);
+                r.fill_rounded_rect(art_rect, hero_rad, Theme::BG_ELEVATED);
                 r.draw_icon(
-                    SfIcon::Albums,
+                    if is_artist { SfIcon::PersonSquare } else { SfIcon::Albums },
                     art_rect.inset(art_sz * 0.32, art_sz * 0.32),
                     Theme::TEXT_MUTED,
                 );
@@ -9841,7 +10866,7 @@ impl AppUi {
                         detail.tracks.iter().any(|t| t.effective_adam_id() == tid)
                     }));
             if hero_is_loading_slot {
-                r.fill_rounded_rect(art_rect, 14.0, Color::rgba(8, 8, 14, 0.48));
+                r.fill_rounded_rect(art_rect, hero_rad, Color::rgba(8, 8, 14, 0.48));
                 r.draw_loading_spinner(
                     art_rect.center_x(),
                     art_rect.center_y(),
@@ -9850,7 +10875,7 @@ impl AppUi {
                     Color::rgba(255, 255, 255, 0.96),
                 );
             }
-            r.stroke_rounded_rect(art_rect, 14.0, Color::rgba(255, 255, 255, 0.12), 1.0);
+            r.stroke_rounded_rect(art_rect, hero_rad, Color::rgba(255, 255, 255, 0.14), 1.0);
         } else if let Some(ref u) = detail.artwork_url {
             self.request_artwork(r, u, true);
         }
@@ -9873,21 +10898,42 @@ impl AppUi {
             false,
             false,
         );
+        let sub_rect = RectF::new(rx, y + 60.0, rw.min(420.0), 26.0);
+        let can_click_artist = !is_artist
+            && detail.kind.contains("album")
+            && !detail.subtitle.trim().is_empty()
+            && detail.subtitle != "Apple Music"
+            && detail.subtitle != "资料库";
+        let sub_hov = can_click_artist
+            && self.mouse_pos.1 >= TOP_BAR_GUARD_H
+            && sub_rect.contains(self.mouse_pos.0, self.mouse_pos.1);
         r.draw_text(
             &detail.subtitle,
-            RectF::new(rx, y + 60.0, rw, 26.0),
+            sub_rect,
             18.5,
             500,
-            Theme::TEXT_PRIMARY.with_alpha(0.90),
+            if sub_hov {
+                Theme::ACCENT_RED
+            } else if can_click_artist {
+                Theme::ACCENT_RED.with_alpha(0.88)
+            } else {
+                Theme::TEXT_PRIMARY.with_alpha(0.90)
+            },
             TextAlign::Left,
             false,
             false,
         );
+        if can_click_artist {
+            self.hit_regions.push(HitRegion {
+                rect: sub_rect,
+                action: UiAction::GoToArtistByName(detail.subtitle.clone()),
+            });
+        }
 
         if !detail.description.is_empty() {
             r.draw_text(
                 &detail.description,
-                RectF::new(rx, y + 106.0, rw.min(540.0), 56.0),
+                RectF::new(rx, y + 100.0, rw.min(560.0), 62.0),
                 13.5,
                 400,
                 Theme::TEXT_SECONDARY,
@@ -9897,7 +10943,7 @@ impl AppUi {
             );
         }
 
-        // Hero Action Row: [Shuffle Liquid Glass Circle]  [  ▶ 播放 Prominent Capsule ]  [ + Liquid Glass Circle ]
+        // Hero Action Row: [Shuffle] [▶ 播放] [+ 资料库] [跨平台复制] [•••]
         let allow_page_hov = self.mouse_pos.1 >= TOP_BAR_GUARD_H;
         let btn_y = art_rect.bottom() - 42.0;
         let shuf_btn = RectF::new(rx, btn_y, 42.0, 42.0);
@@ -9974,8 +11020,9 @@ impl AppUi {
             },
         });
 
-        if !detail.kind.starts_with("library-") {
-            let add_btn = RectF::new(play_pill.right() + 12.0, btn_y, 42.0, 42.0);
+        let mut next_bx = play_pill.right() + 12.0;
+        if !detail.kind.starts_with("library-") && !is_artist {
+            let add_btn = RectF::new(next_bx, btn_y, 42.0, 42.0);
             let add_hov = allow_page_hov && add_btn.contains(self.mouse_pos.0, self.mouse_pos.1);
             r.draw_liquid_glass_button(
                 add_btn,
@@ -9994,13 +11041,94 @@ impl AppUi {
                     id: detail.id.clone(),
                 },
             });
+            next_bx = add_btn.right() + 10.0;
         }
+
+        // Cross-Platform Transfer / Copy Playlist Pill (for any playlist or album with tracks!)
+        if !detail.tracks.is_empty() && !is_artist {
+            let tr_btn = RectF::new(next_bx, btn_y, 118.0, 42.0);
+            let tr_hov = allow_page_hov && tr_btn.contains(self.mouse_pos.0, self.mouse_pos.1);
+            r.draw_liquid_glass_button(
+                tr_btn,
+                21.0,
+                GlassBtnVariant::Regular,
+                tr_hov,
+                self.mouse_down,
+                self.mouse_pos,
+                self.glass_off(),
+            );
+            r.draw_text(
+                "跨平台复制",
+                tr_btn,
+                13.2,
+                if tr_hov { 600 } else { 500 },
+                Theme::TEXT_PRIMARY,
+                TextAlign::Center,
+                true,
+                false,
+            );
+            self.hit_regions.push(HitRegion {
+                rect: tr_btn,
+                action: UiAction::OpenPlaylistTransferModal,
+            });
+            next_bx = tr_btn.right() + 10.0;
+        }
+
+        // Unified Detail Page `•••` Context Menu Button
+        let more_btn = RectF::new(next_bx, btn_y, 42.0, 42.0);
+        let more_hov = allow_page_hov && more_btn.contains(self.mouse_pos.0, self.mouse_pos.1);
+        r.draw_liquid_glass_button(
+            more_btn,
+            21.0,
+            GlassBtnVariant::Regular,
+            more_hov,
+            self.mouse_down,
+            self.mouse_pos,
+            self.glass_off(),
+        );
+        r.draw_icon(SfIcon::MoreDots, more_btn.inset(11.0, 11.0), Theme::TEXT_PRIMARY);
+        self.hit_regions.push(HitRegion {
+            rect: more_btn,
+            action: UiAction::OpenDetailContextMenu { anchor: more_btn },
+        });
 
         y = art_rect.bottom() + 26.0;
         r.draw_line(x0, y, x0 + w, y, Theme::SEPARATOR, 1.0);
         y += 2.0;
 
-        let out_y = self.draw_tracklist_rows(r, x0, y, w, &detail.tracks, TrackListSource::DetailTracks);
+        if is_artist && !detail.tracks.is_empty() {
+            y += 14.0;
+            r.draw_text(
+                "热门歌曲",
+                RectF::new(x0, y, w, 28.0),
+                20.0,
+                700,
+                Theme::TEXT_PRIMARY,
+                TextAlign::Left,
+                true,
+                false,
+            );
+            y += 34.0;
+        }
+
+        let mut out_y = self.draw_tracklist_rows(r, x0, y, w, &detail.tracks, TrackListSource::DetailTracks);
+
+        if is_artist && !detail.related_albums.is_empty() {
+            out_y += 28.0;
+            r.draw_text(
+                "专辑与单曲",
+                RectF::new(x0, out_y, w, 28.0),
+                20.0,
+                700,
+                Theme::TEXT_PRIMARY,
+                TextAlign::Left,
+                true,
+                false,
+            );
+            out_y += 38.0;
+            out_y = self.draw_media_card_grid(r, x0, out_y, w, &detail.related_albums);
+        }
+
         if pushed_behind {
             r.pop_layer();
         }
@@ -10283,7 +11411,10 @@ impl AppUi {
                         });
                         self.hit_regions.push(HitRegion {
                             rect: dots,
-                            action: UiAction::AddSongToLibrary(eff_id),
+                            action: UiAction::OpenTrackContextMenu {
+                                track: tr.clone(),
+                                anchor: dots,
+                            },
                         });
                     }
                 }
@@ -10366,7 +11497,10 @@ impl AppUi {
             });
             self.hit_regions.push(HitRegion {
                 rect: dots,
-                action: UiAction::AddSongToLibrary(eff_id),
+                action: UiAction::OpenTrackContextMenu {
+                    track: tr.clone(),
+                    anchor: dots,
+                },
             });
         }
         y
@@ -10465,22 +11599,15 @@ impl AppUi {
                             .motion_tall_video_url
                             .as_deref()
                             .or(it.motion_video_url.as_deref());
-                        if motion_enabled {
+                        if motion_enabled && cy + card_h > TOP_BAR_GUARD_H - 12.0 && cy < win_h {
                             if let Some(u) = pick_vid_url {
-                                if self.visible_home_motion_urls.len() < 3
-                                    && !self.visible_home_motion_urls.iter().any(|x| x == u)
-                                {
+                                if !self.visible_home_motion_urls.iter().any(|x| x == u) {
                                     self.visible_home_motion_urls.push(u.to_string());
                                 }
                             }
                         }
                         let pick_mf = if motion_enabled {
-                            pick_vid_url.and_then(|u| {
-                                self.motion_art
-                                    .latest_frame("home_motion_0", Some(u))
-                                    .or_else(|| self.motion_art.latest_frame("home_motion_1", Some(u)))
-                                    .or_else(|| self.motion_art.latest_frame("home_motion_2", Some(u)))
-                            })
+                            pick_vid_url.and_then(|u| self.motion_art.latest_frame_for_url(u))
                         } else {
                             None
                         };
@@ -10579,6 +11706,10 @@ impl AppUi {
                                     id: it.id.clone(),
                                     title_hint: it.title.clone(),
                                     artwork_url: (!it.artwork_url.is_empty()).then(|| it.artwork_url.clone()),
+                                    motion_video_url: it
+                                        .motion_video_url
+                                        .clone()
+                                        .or_else(|| it.motion_tall_video_url.clone()),
                                     card_rect: card_r,
                                     card_radius: 16.0,
                                 }
@@ -10714,6 +11845,7 @@ impl AppUi {
                                     id: it.id.clone(),
                                     title_hint: it.title.clone(),
                                     artwork_url: (!it.artwork_url.is_empty()).then(|| it.artwork_url.clone()),
+                                    motion_video_url: it.motion_video_url.clone(),
                                     card_rect: art_r,
                                     card_radius: 12.0,
                                 }
@@ -10763,22 +11895,17 @@ impl AppUi {
                             fnv1a_hover_key("ed_hero", &it.id) ^ ((s_idx as u64) << 16) ^ ((idx as u64) << 32),
                             is_hov,
                         );
-                        if motion_enabled {
+                        if motion_enabled && cy + card_h > TOP_BAR_GUARD_H - 12.0 && cy < win_h {
                             if let Some(u) = it.motion_video_url.as_deref() {
-                                if self.visible_home_motion_urls.len() < 3
-                                    && !self.visible_home_motion_urls.iter().any(|x| x == u)
-                                {
+                                if !self.visible_home_motion_urls.iter().any(|x| x == u) {
                                     self.visible_home_motion_urls.push(u.to_string());
                                 }
                             }
                         }
                         let hero_mf = if motion_enabled {
-                            it.motion_video_url.as_deref().and_then(|u| {
-                                self.motion_art
-                                    .latest_frame("home_motion_0", Some(u))
-                                    .or_else(|| self.motion_art.latest_frame("home_motion_1", Some(u)))
-                                    .or_else(|| self.motion_art.latest_frame("home_motion_2", Some(u)))
-                            })
+                            it.motion_video_url
+                                .as_deref()
+                                .and_then(|u| self.motion_art.latest_frame_for_url(u))
                         } else {
                             None
                         };
@@ -10873,6 +12000,10 @@ impl AppUi {
                                     id: it.id.clone(),
                                     title_hint: it.title.clone(),
                                     artwork_url: (!it.artwork_url.is_empty()).then(|| it.artwork_url.clone()),
+                                    motion_video_url: it
+                                        .motion_video_url
+                                        .clone()
+                                        .or_else(|| it.motion_tall_video_url.clone()),
                                     card_rect: card_r,
                                     card_radius: 16.0,
                                 }
@@ -11032,22 +12163,17 @@ impl AppUi {
                                 Color::rgba(255, 255, 255, 0.052 * hov_t),
                             );
                         }
-                        if motion_enabled {
+                        if motion_enabled && cy + card_h > TOP_BAR_GUARD_H - 12.0 && cy < win_h {
                             if let Some(u) = it.motion_video_url.as_deref() {
-                                if self.visible_home_motion_urls.len() < 3
-                                    && !self.visible_home_motion_urls.iter().any(|x| x == u)
-                                {
+                                if !self.visible_home_motion_urls.iter().any(|x| x == u) {
                                     self.visible_home_motion_urls.push(u.to_string());
                                 }
                             }
                         }
                         let sq_mf = if motion_enabled {
-                            it.motion_video_url.as_deref().and_then(|u| {
-                                self.motion_art
-                                    .latest_frame("home_motion_0", Some(u))
-                                    .or_else(|| self.motion_art.latest_frame("home_motion_1", Some(u)))
-                                    .or_else(|| self.motion_art.latest_frame("home_motion_2", Some(u)))
-                            })
+                            it.motion_video_url
+                                .as_deref()
+                                .and_then(|u| self.motion_art.latest_frame_for_url(u))
                         } else {
                             None
                         };
@@ -11156,6 +12282,7 @@ impl AppUi {
                                         id: it.id.clone(),
                                         title_hint: it.title.clone(),
                                         artwork_url: (!it.artwork_url.is_empty()).then(|| it.artwork_url.clone()),
+                                        motion_video_url: it.motion_video_url.clone(),
                                         card_rect: art_r,
                                         card_radius: 12.0,
                                     },
@@ -11405,6 +12532,7 @@ impl AppUi {
                     id: item.id.clone(),
                     title_hint: item.title.clone(),
                     artwork_url: item.artwork_url.clone(),
+                    motion_video_url: None,
                     card_rect: art_r,
                     card_radius: 11.0,
                 },
@@ -13138,7 +14266,7 @@ impl AppUi {
         );
         y += 26.0;
 
-        let lyr_card_h = 442.0 + lyr_extra;
+        let lyr_card_h = 504.0 + lyr_extra;
         let g_lyr = RectF::new(x0, y, cw, lyr_card_h);
         r.fill_rounded_rect(g_lyr, 14.0, Theme::BG_ELEVATED);
         r.stroke_rounded_rect(g_lyr, 14.0, Theme::SEPARATOR, 1.0);
@@ -13352,6 +14480,18 @@ impl AppUi {
             "关闭为原生 1× 高清景深模糊；开启后未唱行 0.75× 渲染节能",
             self.settings.lyrics_blur_downsample,
             UiAction::ToggleLyricsBlurDownsample,
+        );
+        ry += 58.0;
+
+        r.draw_line(x0 + 18.0, ry + 4.0, x0 + cw - 18.0, ry + 4.0, Theme::SEPARATOR, 1.0);
+        ry += 10.0;
+        self.draw_toggle_row(
+            r,
+            RectF::new(x0 + 18.0, ry, cw - 36.0, 54.0),
+            "歌词页沉浸模式",
+            "开启后隐藏歌词页四角所有控件，仅保留背景、封面、播放控制与歌词；鼠标移近角落自动渐显",
+            self.settings.lyrics_immersive_mode,
+            UiAction::ToggleLyricsImmersiveMode,
         );
         ry += 58.0;
 
@@ -14382,8 +15522,21 @@ impl AppUi {
     }
 
     fn draw_more_popover(&mut self, r: &mut D2DRenderer, area: RectF) {
-        let pop_w = 270.0;
-        let pop_h = 136.0;
+        let has_track = !self.smtc.title.trim().is_empty();
+        let has_artist = !self.smtc.artist.trim().is_empty();
+        let has_album = !self.smtc.album.trim().is_empty();
+        let mut extra_rows = 0usize;
+        if has_artist {
+            extra_rows += 1;
+        }
+        if has_album {
+            extra_rows += 1;
+        }
+        if has_track && self.smtc.adam_id.as_deref().is_some_and(|a| !a.is_empty()) {
+            extra_rows += 1;
+        }
+        let pop_w = 276.0;
+        let pop_h = 136.0 + (extra_rows as f32) * 34.0 + if extra_rows > 0 { 8.0 } else { 0.0 };
         let pop = RectF::new(
             (area.center_x() + Theme::MINI_PLAYER_MAX_WIDTH * 0.5 - pop_w - 40.0)
                 .min(area.right() - pop_w - 24.0),
@@ -14406,7 +15559,7 @@ impl AppUi {
             pop,
             18.0,
             20.0,
-            Color::rgba(22, 24, 30, 0.44),
+            Color::rgba(22, 24, 30, 0.56),
             Theme::GLASS_RIM_LIGHT,
             self.glass_off(),
         );
@@ -14435,7 +15588,52 @@ impl AppUi {
             action: UiAction::ScrubPopoverVolume(vbar),
         });
 
-        let set_btn = RectF::new(pop.x + 14.0, pop.bottom() - 46.0, pop.w - 28.0, 32.0);
+        let mut iy = pop.y + 68.0;
+        if extra_rows > 0 {
+            r.draw_line(pop.x + 14.0, iy - 4.0, pop.right() - 14.0, iy - 4.0, Theme::SEPARATOR, 1.0);
+            let mut items: Vec<(String, UiAction)> = Vec::new();
+            if has_artist {
+                items.push((
+                    format!("前往艺人 · {}", self.smtc.artist),
+                    UiAction::GoToArtistByName(self.smtc.artist.clone()),
+                ));
+            }
+            if has_album {
+                items.push((
+                    format!("前往专辑 · {}", self.smtc.album),
+                    UiAction::GoToAlbumByName {
+                        album_name: self.smtc.album.clone(),
+                        artist_name: self.smtc.artist.clone(),
+                    },
+                ));
+            }
+            if has_track {
+                if let Some(aid) = self.smtc.adam_id.clone().filter(|s| !s.is_empty()) {
+                    items.push(("添加到资料库".to_string(), UiAction::AddSongToLibrary(aid)));
+                }
+            }
+            for (lbl, act) in items {
+                let row = RectF::new(pop.x + 10.0, iy, pop.w - 20.0, 30.0);
+                let hov = row.contains(self.mouse_pos.0, self.mouse_pos.1);
+                if hov {
+                    r.fill_rounded_rect(row, 8.0, Color::rgba(255, 255, 255, 0.12));
+                }
+                r.draw_text(
+                    &lbl,
+                    row.inset(10.0, 0.0),
+                    12.6,
+                    if hov { 600 } else { 500 },
+                    Theme::TEXT_PRIMARY,
+                    TextAlign::Left,
+                    true,
+                    false,
+                );
+                self.hit_regions.push(HitRegion { rect: row, action: act });
+                iy += 34.0;
+            }
+        }
+
+        let set_btn = RectF::new(pop.x + 14.0, pop.bottom() - 44.0, pop.w - 28.0, 32.0);
         let set_hov = set_btn.contains(self.mouse_pos.0, self.mouse_pos.1);
         r.draw_liquid_glass_button(
             set_btn,
@@ -14460,6 +15658,591 @@ impl AppUi {
             rect: set_btn,
             action: UiAction::Navigate(PageRoute::Settings),
         });
+    }
+
+    fn draw_context_menu(&mut self, r: &mut D2DRenderer, win_rect: RectF) {
+        let Some(cm) = self.context_menu.clone() else {
+            return;
+        };
+
+        let mut rows: Vec<(String, UiAction, bool)> = Vec::new();
+        let mut playlist_track_opt: Option<AgentTrackInput> = None;
+
+        match &cm.target {
+            ContextMenuTarget::Track(tr) => {
+                playlist_track_opt = Some(tr.clone());
+                rows.push(("下一首播放".to_string(), UiAction::PlayNextTrack(tr.clone()), false));
+                rows.push((
+                    if cm.show_playlist_submenu {
+                        "添加到歌单 ▾".to_string()
+                    } else {
+                        "添加到歌单 ›".to_string()
+                    },
+                    UiAction::ToggleContextPlaylistSubmenu,
+                    false,
+                ));
+                let eff_id = tr.effective_adam_id();
+                if !eff_id.is_empty() && self.settings.playback_backend.is_apple_music() {
+                    rows.push(("添加到资料库".to_string(), UiAction::AddSongToLibrary(eff_id), false));
+                }
+                if !tr.artist_name.trim().is_empty() {
+                    rows.push((
+                        format!("前往艺人 · {}", tr.artist_name),
+                        UiAction::GoToArtistByName(tr.artist_name.clone()),
+                        false,
+                    ));
+                }
+                if !tr.album_name.trim().is_empty() {
+                    rows.push((
+                        format!("前往专辑 · {}", tr.album_name),
+                        UiAction::GoToAlbumByName {
+                            album_name: tr.album_name.clone(),
+                            artist_name: tr.artist_name.clone(),
+                        },
+                        false,
+                    ));
+                }
+            }
+            ContextMenuTarget::Container {
+                kind,
+                id,
+                subtitle,
+                tracks,
+                ..
+            } => {
+                let is_artist = matches!(
+                    kind.as_str(),
+                    "artists" | "library-artists" | "ne-artist" | "qq-artist"
+                );
+                if !tracks.is_empty() {
+                    rows.push((
+                        "立即播放全部".to_string(),
+                        UiAction::PlayDetailTracks {
+                            start_index: 0,
+                            shuffle: false,
+                        },
+                        false,
+                    ));
+                    rows.push((
+                        "随机播放".to_string(),
+                        UiAction::PlayDetailTracks {
+                            start_index: 0,
+                            shuffle: true,
+                        },
+                        false,
+                    ));
+                    if !is_artist {
+                        rows.push((
+                            "跨平台复制歌单...".to_string(),
+                            UiAction::OpenPlaylistTransferModal,
+                            true,
+                        ));
+                    }
+                }
+                if !kind.starts_with("library-") && !is_artist {
+                    rows.push((
+                        "添加到资料库".to_string(),
+                        UiAction::AddContainerToLibrary {
+                            kind: kind.clone(),
+                            id: id.clone(),
+                        },
+                        false,
+                    ));
+                }
+                if kind.contains("album") && !subtitle.trim().is_empty() {
+                    rows.push((
+                        format!("前往艺人 · {subtitle}"),
+                        UiAction::GoToArtistByName(subtitle.clone()),
+                        false,
+                    ));
+                }
+            }
+            ContextMenuTarget::NowPlaying => {
+                let np_tr = AgentTrackInput {
+                    id: self.smtc.adam_id.clone().unwrap_or_default(),
+                    catalog_id: self.smtc.adam_id.clone(),
+                    kind: None,
+                    name: self.smtc.title.clone(),
+                    artist_name: self.smtc.artist.clone(),
+                    album_name: self.smtc.album.clone(),
+                    duration_sec: self.smtc.duration_sec,
+                    artwork_url: self.smtc.artwork_url.clone(),
+                    audio_traits: Vec::new(),
+                };
+                if !np_tr.id.is_empty() {
+                    playlist_track_opt = Some(np_tr);
+                }
+                if !self.smtc.artist.trim().is_empty() {
+                    rows.push((
+                        format!("前往艺人 · {}", self.smtc.artist),
+                        UiAction::GoToArtistByName(self.smtc.artist.clone()),
+                        false,
+                    ));
+                }
+                if !self.smtc.album.trim().is_empty() {
+                    rows.push((
+                        format!("前往专辑 · {}", self.smtc.album),
+                        UiAction::GoToAlbumByName {
+                            album_name: self.smtc.album.clone(),
+                            artist_name: self.smtc.artist.clone(),
+                        },
+                        false,
+                    ));
+                }
+                if playlist_track_opt.is_some() {
+                    rows.push((
+                        if cm.show_playlist_submenu {
+                            "添加到歌单 ▾".to_string()
+                        } else {
+                            "添加到歌单 ›".to_string()
+                        },
+                        UiAction::ToggleContextPlaylistSubmenu,
+                        false,
+                    ));
+                }
+                if let Some(aid) = self.smtc.adam_id.clone().filter(|s| !s.is_empty()) {
+                    if self.settings.playback_backend.is_apple_music() {
+                        rows.push(("添加到资料库".to_string(), UiAction::AddSongToLibrary(aid), false));
+                    }
+                }
+                rows.push((
+                    if self.settings.lyrics_immersive_mode {
+                        "关闭歌词沉浸模式".to_string()
+                    } else {
+                        "开启歌词沉浸模式".to_string()
+                    },
+                    UiAction::ToggleLyricsImmersiveMode,
+                    true,
+                ));
+                rows.push((
+                    "导入本地歌词 (.lrc / .ttml)...".to_string(),
+                    UiAction::ImportLocalLyricsFromMenu,
+                    false,
+                ));
+            }
+        }
+
+        let pls_shown: Vec<MediaCardItem> = if cm.show_playlist_submenu && playlist_track_opt.is_some() {
+            self.sidebar_playlists.iter().take(6).cloned().collect()
+        } else {
+            Vec::new()
+        };
+        let sub_h = if cm.show_playlist_submenu && playlist_track_opt.is_some() {
+            if pls_shown.is_empty() {
+                34.0
+            } else {
+                (pls_shown.len() as f32) * 30.0 + 10.0
+            }
+        } else {
+            0.0
+        };
+
+        let menu_w = 246.0f32;
+        let row_h = 34.0f32;
+        let menu_h = 16.0 + (rows.len() as f32) * row_h + sub_h;
+        let mut mx = cm.anchor.right() - menu_w;
+        if mx < win_rect.x + 12.0 {
+            mx = cm.anchor.x;
+        }
+        mx = mx.clamp(win_rect.x + 12.0, (win_rect.right() - menu_w - 12.0).max(win_rect.x + 12.0));
+        let mut my = cm.anchor.bottom() + 6.0;
+        if my + menu_h > win_rect.bottom() - 16.0 {
+            my = (cm.anchor.y - menu_h - 6.0).max(win_rect.y + 12.0);
+        }
+        let menu_r = RectF::new(mx, my, menu_w, menu_h);
+
+        // Fullscreen click-outside catcher so clicking anywhere outside cleanly dismisses the menu
+        self.hit_regions.push(HitRegion {
+            rect: win_rect,
+            action: UiAction::CloseContextMenu,
+        });
+        self.hit_regions.push(HitRegion {
+            rect: menu_r,
+            action: UiAction::SwallowClick,
+        });
+
+        r.fill_rounded_rect(
+            RectF::new(menu_r.x + 2.0, menu_r.y + 6.0, menu_r.w - 4.0, menu_r.h),
+            16.0,
+            Color::rgba(0, 0, 0, 0.44),
+        );
+        r.draw_liquid_glass(
+            menu_r,
+            16.0,
+            18.0,
+            Color::rgba(22, 24, 32, 0.72),
+            Theme::GLASS_RIM_LIGHT,
+            self.glass_off(),
+        );
+
+        let mut cy = menu_r.y + 8.0;
+        for (lbl, act, accent) in rows {
+            let is_pl_toggle = matches!(act, UiAction::ToggleContextPlaylistSubmenu);
+            let rr = RectF::new(menu_r.x + 8.0, cy, menu_r.w - 16.0, row_h - 2.0);
+            let hov = rr.contains(self.mouse_pos.0, self.mouse_pos.1);
+            if hov {
+                r.fill_rounded_rect(rr, 9.0, Color::rgba(255, 255, 255, 0.14));
+            }
+            r.draw_text(
+                &lbl,
+                rr.inset(12.0, 0.0),
+                13.0,
+                if hov || accent { 600 } else { 500 },
+                if accent {
+                    Theme::ACCENT_RED.lerp(Theme::TEXT_PRIMARY, 0.25)
+                } else {
+                    Theme::TEXT_PRIMARY
+                },
+                TextAlign::Left,
+                true,
+                false,
+            );
+            self.hit_regions.push(HitRegion {
+                rect: rr,
+                action: act,
+            });
+            cy += row_h;
+
+            if is_pl_toggle && cm.show_playlist_submenu {
+                if let Some(ref tr) = playlist_track_opt {
+                    if pls_shown.is_empty() {
+                        r.draw_text(
+                            "暂无可写入歌单（请先登录）",
+                            RectF::new(menu_r.x + 20.0, cy, menu_r.w - 32.0, 28.0),
+                            11.5,
+                            400,
+                            Theme::TEXT_MUTED,
+                            TextAlign::Left,
+                            true,
+                            false,
+                        );
+                        cy += 34.0;
+                    } else {
+                        for pl in &pls_shown {
+                            let pr = RectF::new(menu_r.x + 18.0, cy, menu_r.w - 28.0, 28.0);
+                            let phov = pr.contains(self.mouse_pos.0, self.mouse_pos.1);
+                            if phov {
+                                r.fill_rounded_rect(pr, 7.0, Theme::ACCENT_RED.with_alpha(0.26));
+                            }
+                            r.draw_text(
+                                &format!("+ {}", pl.title),
+                                pr.inset(8.0, 0.0),
+                                12.0,
+                                if phov { 600 } else { 400 },
+                                Theme::TEXT_SECONDARY.lerp(Theme::TEXT_PRIMARY, if phov { 1.0 } else { 0.45 }),
+                                TextAlign::Left,
+                                true,
+                                false,
+                            );
+                            self.hit_regions.push(HitRegion {
+                                rect: pr,
+                                action: UiAction::AddTrackToPlaylist {
+                                    playlist_id: pl.id.clone(),
+                                    playlist_name: pl.title.clone(),
+                                    track: tr.clone(),
+                                },
+                            });
+                            cy += 30.0;
+                        }
+                        cy += 10.0;
+                    }
+                }
+            }
+        }
+    }
+
+    fn draw_playlist_transfer_modal(&mut self, r: &mut D2DRenderer, win_rect: RectF) {
+        let Some(tm) = self.transfer_modal.clone() else {
+            return;
+        };
+
+        // Backdrop dimming scrim
+        r.fill_rect(win_rect, Color::rgba(4, 6, 12, 0.56));
+        self.hit_regions.push(HitRegion {
+            rect: win_rect,
+            action: if tm.running {
+                UiAction::SwallowClick
+            } else {
+                UiAction::ClosePlaylistTransferModal
+            },
+        });
+
+        let mw = 480.0f32.min(win_rect.w - 40.0);
+        let mh = 310.0f32;
+        let modal = RectF::new(
+            win_rect.center_x() - mw * 0.5,
+            win_rect.center_y() - mh * 0.5,
+            mw,
+            mh,
+        );
+        self.hit_regions.push(HitRegion {
+            rect: modal,
+            action: UiAction::SwallowClick,
+        });
+        r.fill_rounded_rect(
+            RectF::new(modal.x + 4.0, modal.y + 10.0, modal.w - 8.0, modal.h),
+            20.0,
+            Color::rgba(0, 0, 0, 0.52),
+        );
+        r.draw_liquid_glass(
+            modal,
+            20.0,
+            22.0,
+            Color::rgba(20, 22, 30, 0.78),
+            Theme::GLASS_RIM_LIGHT,
+            self.glass_off(),
+        );
+
+        let px = modal.x + 24.0;
+        let pw = modal.w - 48.0;
+        r.draw_text(
+            "跨平台歌单复制",
+            RectF::new(px, modal.y + 20.0, pw, 26.0),
+            19.0,
+            700,
+            Theme::TEXT_PRIMARY,
+            TextAlign::Left,
+            true,
+            false,
+        );
+        r.draw_text(
+            &format!("源歌单：「{}」 · 共 {} 首歌曲", tm.source_title, tm.total),
+            RectF::new(px, modal.y + 50.0, pw, 20.0),
+            13.0,
+            400,
+            Theme::TEXT_SECONDARY,
+            TextAlign::Left,
+            true,
+            false,
+        );
+
+        r.draw_text(
+            "选择目标平台：",
+            RectF::new(px, modal.y + 84.0, pw, 18.0),
+            12.2,
+            600,
+            Theme::TEXT_MUTED,
+            TextAlign::Left,
+            true,
+            false,
+        );
+
+        let targets = [
+            (PlaybackBackend::AppleMusicNative, "Apple Music 云端歌单"),
+            (PlaybackBackend::NetEase, "网易云云端歌单"),
+            (PlaybackBackend::QQMusic, "QQ 音乐匹配队列"),
+        ];
+        let gap = 8.0;
+        let bw = (pw - gap * 2.0) / 3.0;
+        let mut bx = px;
+        for (be, lbl) in targets {
+            let br = RectF::new(bx, modal.y + 108.0, bw, 34.0);
+            let sel = tm.target_backend == be;
+            let hov = !tm.running && br.contains(self.mouse_pos.0, self.mouse_pos.1);
+            r.draw_liquid_glass_button(
+                br,
+                10.0,
+                if sel {
+                    GlassBtnVariant::Tinted(be.accent_color())
+                } else {
+                    GlassBtnVariant::Regular
+                },
+                hov,
+                self.mouse_down,
+                self.mouse_pos,
+                self.glass_off(),
+            );
+            r.draw_text(
+                lbl,
+                br.inset(4.0, 0.0),
+                11.8,
+                if sel || hov { 600 } else { 500 },
+                Theme::TEXT_PRIMARY,
+                TextAlign::Center,
+                true,
+                false,
+            );
+            if !tm.running {
+                self.hit_regions.push(HitRegion {
+                    rect: br,
+                    action: UiAction::SelectTransferTarget(be),
+                });
+            }
+            bx += bw + gap;
+        }
+
+        // Auth readiness / progress / result status box
+        let status_r = RectF::new(px, modal.y + 158.0, pw, 72.0);
+        r.fill_rounded_rect(status_r, 12.0, Color::rgba(255, 255, 255, 0.06));
+        if tm.running {
+            let pct = if tm.total > 0 {
+                ((tm.matched as f32) / (tm.total as f32)).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            r.draw_text(
+                &format!("正在匹配歌曲... 已命中 {}/{}", tm.matched, tm.total),
+                RectF::new(status_r.x + 14.0, status_r.y + 10.0, status_r.w - 28.0, 18.0),
+                12.5,
+                600,
+                Theme::TEXT_PRIMARY,
+                TextAlign::Left,
+                true,
+                false,
+            );
+            r.draw_text(
+                &tm.current_track_name,
+                RectF::new(status_r.x + 14.0, status_r.y + 30.0, status_r.w - 28.0, 16.0),
+                11.5,
+                400,
+                Theme::TEXT_SECONDARY,
+                TextAlign::Left,
+                true,
+                false,
+            );
+            let bar = RectF::new(status_r.x + 14.0, status_r.y + 54.0, status_r.w - 28.0, 6.0);
+            r.fill_rounded_rect(bar, 3.0, Color::rgba(255, 255, 255, 0.14));
+            let sweep_w = (bar.w * pct.max(0.08)).min(bar.w);
+            r.fill_rounded_rect(
+                RectF::new(bar.x, bar.y, sweep_w, bar.h),
+                3.0,
+                tm.target_backend.accent_color(),
+            );
+        } else if let Some(ref err) = tm.error_msg {
+            r.draw_text(
+                err,
+                status_r.inset(14.0, 10.0),
+                12.5,
+                500,
+                Theme::ACCENT_RED,
+                TextAlign::Left,
+                false,
+                true,
+            );
+        } else if let Some(ref ok_msg) = tm.result_msg {
+            r.draw_text(
+                ok_msg,
+                status_r.inset(14.0, 10.0),
+                12.8,
+                600,
+                Theme::SIGNAL_GREEN,
+                TextAlign::Left,
+                false,
+                true,
+            );
+        } else {
+            let ready_hint = match tm.target_backend {
+                PlaybackBackend::AppleMusicNative | PlaybackBackend::AppleMusicWeb => {
+                    if self.settings.user_token.trim().is_empty() {
+                        "提示：尚未绑定 Apple Music Media-User-Token，请先前往「设置」绑定后再复制。"
+                    } else {
+                        "已连接 Apple Music 账号：将自动逐首匹配曲库歌曲并新建 Apple Music 云端歌单。"
+                    }
+                }
+                PlaybackBackend::NetEase => {
+                    if self.settings.netease_cookie.trim().is_empty() {
+                        "提示：尚未登录网易云音乐账号，请先前往「设置」扫码或粘贴 Cookie 登录。"
+                    } else {
+                        "已连接网易云音乐账号：将自动逐首匹配网易云曲库并新建云端歌单。"
+                    }
+                }
+                _ => "将在 QQ 音乐全库逐首匹配并生成可一键切换直出播放的跨平台队列。",
+            };
+            r.draw_text(
+                ready_hint,
+                status_r.inset(14.0, 12.0),
+                12.2,
+                400,
+                Theme::TEXT_SECONDARY,
+                TextAlign::Left,
+                false,
+                true,
+            );
+        }
+
+        // Bottom Action Buttons
+        let btn_y = modal.bottom() - 52.0;
+        let close_btn = RectF::new(px, btn_y, 96.0, 34.0);
+        let close_hov = !tm.running && close_btn.contains(self.mouse_pos.0, self.mouse_pos.1);
+        r.draw_liquid_glass_button(
+            close_btn,
+            10.0,
+            GlassBtnVariant::Regular,
+            close_hov,
+            self.mouse_down,
+            self.mouse_pos,
+            self.glass_off(),
+        );
+        r.draw_text(
+            if tm.done { "完成" } else { "取消" },
+            close_btn,
+            13.0,
+            500,
+            Theme::TEXT_PRIMARY,
+            TextAlign::Center,
+            true,
+            false,
+        );
+        if !tm.running {
+            self.hit_regions.push(HitRegion {
+                rect: close_btn,
+                action: UiAction::ClosePlaylistTransferModal,
+            });
+        }
+
+        if tm.done && !tm.matched_tracks.is_empty() {
+            let play_btn = RectF::new(modal.right() - 24.0 - 184.0, btn_y, 184.0, 34.0);
+            let play_hov = play_btn.contains(self.mouse_pos.0, self.mouse_pos.1);
+            r.draw_liquid_glass_button(
+                play_btn,
+                10.0,
+                GlassBtnVariant::Tinted(tm.target_backend.accent_color()),
+                play_hov,
+                self.mouse_down,
+                self.mouse_pos,
+                self.glass_off(),
+            );
+            r.draw_text(
+                "切换平台并播放",
+                play_btn,
+                13.0,
+                600,
+                Theme::TEXT_PRIMARY,
+                TextAlign::Center,
+                true,
+                false,
+            );
+            self.hit_regions.push(HitRegion {
+                rect: play_btn,
+                action: UiAction::PlayTransferMatchedTracks,
+            });
+        } else if !tm.running {
+            let go_btn = RectF::new(modal.right() - 24.0 - 156.0, btn_y, 156.0, 34.0);
+            let go_hov = go_btn.contains(self.mouse_pos.0, self.mouse_pos.1);
+            r.draw_liquid_glass_button(
+                go_btn,
+                10.0,
+                GlassBtnVariant::Tinted(tm.target_backend.accent_color()),
+                go_hov,
+                self.mouse_down,
+                self.mouse_pos,
+                self.glass_off(),
+            );
+            r.draw_text(
+                "开始跨平台复制",
+                go_btn,
+                13.0,
+                600,
+                Theme::TEXT_PRIMARY,
+                TextAlign::Center,
+                true,
+                false,
+            );
+            self.hit_regions.push(HitRegion {
+                rect: go_btn,
+                action: UiAction::StartPlaylistTransfer,
+            });
+        }
     }
 
     fn draw_banner_toast(&mut self, r: &mut D2DRenderer, area: RectF, msg: &str, is_err: bool) {

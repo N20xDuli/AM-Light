@@ -57,6 +57,7 @@ type AutoAdvanceCb = Arc<dyn Fn(String, usize, AgentTrackInput) + Send + Sync>;
 struct PlayerShared {
     active: bool,
     paused: bool,
+    switching_track: bool,
     repeat: bool,
     backend_tag: String,
     queue: Vec<AgentTrackInput>,
@@ -78,6 +79,7 @@ impl Default for PlayerShared {
         Self {
             active: false,
             paused: false,
+            switching_track: false,
             repeat: false,
             backend_tag: "netease".to_string(),
             queue: Vec::new(),
@@ -147,6 +149,41 @@ pub fn get_queue_tracks() -> Vec<AgentTrackInput> {
         .unwrap_or_default()
 }
 
+/// Inserts a track immediately after the currently playing track in the native playback queue
+/// ("下一首播放"). Returns `true` if inserted into an active queue; `false` if queue was empty.
+pub fn insert_next_in_queue(track: AgentTrackInput) -> bool {
+    let Ok(mut g) = PLAYER.lock() else {
+        return false;
+    };
+    if g.queue.is_empty() {
+        return false;
+    }
+    let insert_pos = (g.queue_index + 1).min(g.queue.len());
+    if g.queue.get(insert_pos).is_some_and(|t| t.id == track.id && !t.id.is_empty()) {
+        return true;
+    }
+    g.queue.insert(insert_pos, track);
+    wake_ui();
+    true
+}
+
+/// Immediately silences any outgoing track and freezes playhead at `0.0s` while the incoming
+/// NetEase / QQ track resolves & downloads, preventing old `40s` playhead bleed into the next song's lyrics!
+pub fn begin_track_transition() {
+    PLAY_SESSION_GEN.fetch_add(1, Ordering::AcqRel);
+    if let Ok(mut g) = PLAYER.lock() {
+        if let Some(ref flag) = g.worker_stop {
+            flag.store(true, Ordering::Release);
+        }
+        g.switching_track = true;
+        g.paused = true;
+        g.position_sec = 0.0;
+        g.pending_seek_sec = None;
+        g.last_updated = Instant::now();
+    }
+    wake_ui();
+}
+
 pub fn get_queue_index() -> usize {
     PLAYER.lock().map(|g| g.queue_index).unwrap_or(0)
 }
@@ -169,7 +206,9 @@ pub fn get_playback_state() -> SmtcState {
     } else {
         tr.duration_sec
     };
-    let pos = if dur > 0.0 {
+    let pos = if g.switching_track {
+        0.0
+    } else if dur > 0.0 {
         g.position_sec.clamp(0.0, dur)
     } else {
         g.position_sec.max(0.0)
@@ -180,7 +219,7 @@ pub fn get_playback_state() -> SmtcState {
         title: tr.name.clone(),
         artist: tr.artist_name.clone(),
         album: tr.album_name.clone(),
-        status: if g.paused {
+        status: if g.paused || g.switching_track {
             "Paused".to_string()
         } else {
             "Playing".to_string()
@@ -197,7 +236,7 @@ pub fn get_playback_state() -> SmtcState {
         stream_specs: g.stream_specs.clone(),
         sampled_at: Some(g.last_updated),
         timeline_updated_univ: 0,
-        position_is_calibrated: true,
+        position_is_calibrated: !g.switching_track,
     }
 }
 
@@ -431,6 +470,7 @@ pub fn inspect_audio_file_specs(
 }
 
 pub fn stop_and_clear() {
+    PLAY_SESSION_GEN.fetch_add(1, Ordering::AcqRel);
     let join_handle = {
         let Ok(mut g) = PLAYER.lock() else { return };
         if let Some(flag) = g.worker_stop.take() {
@@ -438,6 +478,7 @@ pub fn stop_and_clear() {
         }
         g.active = false;
         g.paused = false;
+        g.switching_track = false;
         g.position_sec = 0.0;
         g.duration_sec = 0.0;
         g.pending_seek_sec = None;
@@ -492,6 +533,7 @@ pub fn start_playback_file(
         g.backend_tag = tag_owned.clone();
         g.active = true;
         g.paused = false;
+        g.switching_track = false;
         g.position_sec = 0.0;
         g.duration_sec = g
             .queue
@@ -596,7 +638,7 @@ pub fn control(action: &str, value: Option<f64>) -> Result<SmtcState, String> {
                 let len = g.queue.len();
                 let next_idx = if act == "next" {
                     (g.queue_index + 1) % len
-                } else if g.position_sec > 4.0 {
+                } else if g.position_sec > 4.0 && !g.switching_track {
                     // Restart current track if >4s into track on Prev
                     g.position_sec = 0.0;
                     g.pending_seek_sec = Some(0.0);
@@ -607,10 +649,20 @@ pub fn control(action: &str, value: Option<f64>) -> Result<SmtcState, String> {
                 } else {
                     g.queue_index - 1
                 };
+                // Immediately invalidate the outgoing track's WASAPI render thread so it stops
+                // outputting audio AND cannot overwrite `position_sec` with the old song's playhead!
+                PLAY_SESSION_GEN.fetch_add(1, Ordering::AcqRel);
+                if let Some(ref flag) = g.worker_stop {
+                    flag.store(true, Ordering::Release);
+                }
+                let tr = g.queue[next_idx].clone();
                 g.queue_index = next_idx;
                 g.position_sec = 0.0;
+                g.duration_sec = tr.duration_sec;
+                g.paused = true;
+                g.switching_track = true;
+                g.pending_seek_sec = None;
                 g.last_updated = Instant::now();
-                let tr = g.queue[next_idx].clone();
                 let tag = g.backend_tag.clone();
                 g.auto_advance_cb.clone().map(|cb| (cb, tag, next_idx, tr))
             };
@@ -925,6 +977,9 @@ fn render_audio_file_loop(
                         g.paused = true;
                         None
                     } else if g.repeat && g.queue.len() == 1 {
+                        g.position_sec = 0.0;
+                        g.switching_track = true;
+                        g.paused = true;
                         let tr = g.queue[g.queue_index].clone();
                         let tag = g.backend_tag.clone();
                         let idx = g.queue_index;
@@ -932,6 +987,8 @@ fn render_audio_file_loop(
                     } else if g.queue_index + 1 < g.queue.len() {
                         g.queue_index += 1;
                         g.position_sec = 0.0;
+                        g.switching_track = true;
+                        g.paused = true;
                         let tr = g.queue[g.queue_index].clone();
                         let tag = g.backend_tag.clone();
                         let idx = g.queue_index;
@@ -939,6 +996,8 @@ fn render_audio_file_loop(
                     } else if g.repeat {
                         g.queue_index = 0;
                         g.position_sec = 0.0;
+                        g.switching_track = true;
+                        g.paused = true;
                         let tr = g.queue[0].clone();
                         let tag = g.backend_tag.clone();
                         g.auto_advance_cb.clone().map(|cb| (cb, tag, 0, tr))

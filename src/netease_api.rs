@@ -51,6 +51,7 @@ pub struct NetEaseDetail {
     pub description: String,
     pub artwork_url: Option<String>,
     pub tracks: Vec<AgentTrackInput>,
+    pub related_albums: Vec<NetEaseCard>,
 }
 
 #[derive(Clone, Debug)]
@@ -978,6 +979,7 @@ pub async fn fetch_container_detail(
             description: "根据你的网易云听歌偏好每日 6:00 更新".to_string(),
             artwork_url: art,
             tracks,
+            related_albums: Vec::new(),
         });
     }
 
@@ -1022,12 +1024,18 @@ pub async fn fetch_container_detail(
             description,
             artwork_url,
             tracks,
+            related_albums: Vec::new(),
         });
     }
 
     if kind == "ne-artist" {
         let url = format!("https://music.163.com/api/v1/artist/{id}");
-        let json = ne_get_json(&url, cookie).await?;
+        let alb_url = format!("https://music.163.com/api/artist/albums/{id}?offset=0&limit=24");
+        let (artist_res, albums_res) = tokio::join!(
+            ne_get_json(&url, cookie),
+            ne_get_json(&alb_url, cookie)
+        );
+        let json = artist_res?;
         let artist = json.get("artist").unwrap_or(&Value::Null);
         let title = artist
             .get("name")
@@ -1045,7 +1053,7 @@ pub async fn fetch_container_detail(
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(|u| upgrade_https_cover(u, 600));
-        let tracks = json
+        let tracks: Vec<AgentTrackInput> = json
             .get("hotSongs")
             .and_then(Value::as_array)
             .map(|arr| {
@@ -1054,14 +1062,46 @@ pub async fn fetch_container_detail(
                     .collect()
             })
             .unwrap_or_default();
+        let mut related_albums = Vec::new();
+        if let Ok(aj) = albums_res {
+            if let Some(arr) = aj.get("hotAlbums").and_then(Value::as_array) {
+                for a in arr.iter().take(24) {
+                    let Some(aid) = a.get("id").and_then(Value::as_i64) else {
+                        continue;
+                    };
+                    let aname = a
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("未知专辑")
+                        .to_string();
+                    let aart = a
+                        .get("picUrl")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(|u| upgrade_https_cover(u, 360));
+                    let sz = a.get("size").and_then(Value::as_u64).unwrap_or(0);
+                    related_albums.push(NetEaseCard {
+                        id: aid.to_string(),
+                        kind: "ne-album".to_string(),
+                        title: aname,
+                        subtitle: if sz > 0 { format!("{sz} 首歌曲") } else { title.clone() },
+                        description: String::new(),
+                        artwork_url: aart,
+                        badge: None,
+                        track_input: None,
+                    });
+                }
+            }
+        }
         return Ok(NetEaseDetail {
             id: id.to_string(),
             kind: kind.to_string(),
             title,
-            subtitle: "网易云音乐 · 热门曲目".to_string(),
+            subtitle: format!("网易云音乐 · {} 首热门 · {} 张专辑", tracks.len(), related_albums.len()),
             description,
             artwork_url,
             tracks,
+            related_albums,
         });
     }
 
@@ -1125,7 +1165,219 @@ pub async fn fetch_container_detail(
         description,
         artwork_url,
         tracks,
+        related_albums: Vec::new(),
     })
+}
+
+pub async fn resolve_artist_by_name(name: &str, cookie: Option<&str>) -> Option<(String, String)> {
+    let clean = name
+        .split(&['/', ',', '&', '、', '，'][..])
+        .next()
+        .unwrap_or(name)
+        .trim();
+    if clean.is_empty() {
+        return None;
+    }
+    let json = ne_post_form_json(
+        "https://music.163.com/api/cloudsearch/pc",
+        &[
+            ("s", clean.to_string()),
+            ("type", "100".to_string()),
+            ("limit", "5".to_string()),
+            ("offset", "0".to_string()),
+        ],
+        cookie,
+    )
+    .await
+    .ok()?;
+    let arr = json.pointer("/result/artists").and_then(Value::as_array)?;
+    let want = crate::backends::normalize_match_text(clean);
+    let best = arr
+        .iter()
+        .find(|v| {
+            v.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|nm| crate::backends::normalize_match_text(nm) == want)
+        })
+        .or_else(|| arr.first())?;
+    let id = best.get("id").and_then(Value::as_i64)?.to_string();
+    let nm = best
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or(clean)
+        .to_string();
+    Some((id, nm))
+}
+
+pub async fn resolve_album_by_name(
+    album_name: &str,
+    artist_name: &str,
+    cookie: Option<&str>,
+) -> Option<(String, String)> {
+    let alb = album_name.trim();
+    if alb.is_empty() {
+        return None;
+    }
+    let q = if artist_name.trim().is_empty() {
+        alb.to_string()
+    } else {
+        format!("{alb} {}", artist_name.trim())
+    };
+    let json = ne_post_form_json(
+        "https://music.163.com/api/cloudsearch/pc",
+        &[
+            ("s", q),
+            ("type", "10".to_string()),
+            ("limit", "5".to_string()),
+            ("offset", "0".to_string()),
+        ],
+        cookie,
+    )
+    .await
+    .ok()?;
+    let arr = json.pointer("/result/albums").and_then(Value::as_array)?;
+    let want = crate::backends::normalize_match_text(alb);
+    let best = arr
+        .iter()
+        .find(|v| {
+            v.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|nm| crate::backends::normalize_match_text(nm) == want)
+        })
+        .or_else(|| arr.first())?;
+    let id = best.get("id").and_then(Value::as_i64)?.to_string();
+    let nm = best
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or(alb)
+        .to_string();
+    Some((id, nm))
+}
+
+pub async fn create_playlist(name: &str, cookie: &str) -> Result<String, String> {
+    if cookie.trim().is_empty() {
+        return Err("创建网易云歌单需要先扫码或粘贴 Cookie 登录网易云账号".to_string());
+    }
+    let json = ne_post_form_json(
+        "https://music.163.com/api/playlist/create",
+        &[
+            ("name", name.trim().to_string()),
+            ("privacy", "0".to_string()),
+            ("type", "NORMAL".to_string()),
+        ],
+        Some(cookie),
+    )
+    .await?;
+    let code = json.get("code").and_then(Value::as_i64).unwrap_or(-1);
+    if code != 200 {
+        let msg = json
+            .get("message")
+            .or_else(|| json.get("msg"))
+            .and_then(Value::as_str)
+            .unwrap_or("创建歌单失败，请确认 Cookie 登录态有效");
+        return Err(format!("网易云创建歌单失败 ({code}): {msg}"));
+    }
+    let pid = json
+        .get("id")
+        .and_then(Value::as_i64)
+        .or_else(|| json.pointer("/playlist/id").and_then(Value::as_i64))
+        .ok_or_else(|| "网易云未返回新建歌单 ID".to_string())?;
+    Ok(pid.to_string())
+}
+
+pub async fn add_tracks_to_playlist(
+    playlist_id: &str,
+    song_ids: &[String],
+    cookie: &str,
+) -> Result<(), String> {
+    if cookie.trim().is_empty() {
+        return Err("收藏歌曲到网易云歌单需要先登录网易云账号".to_string());
+    }
+    let clean_ids: Vec<String> = song_ids
+        .iter()
+        .map(|s| strip_ne_id(s))
+        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+        .collect();
+    if clean_ids.is_empty() {
+        return Err("没有有效的网易云歌曲 ID".to_string());
+    }
+    for chunk in clean_ids.chunks(50) {
+        let arr_str = format!("[{}]", chunk.join(","));
+        let json = ne_post_form_json(
+            "https://music.163.com/api/playlist/tracks",
+            &[
+                ("op", "add".to_string()),
+                ("pid", playlist_id.trim().to_string()),
+                ("trackIds", arr_str),
+                ("imme", "true".to_string()),
+            ],
+            Some(cookie),
+        )
+        .await?;
+        let code = json.get("code").and_then(Value::as_i64).unwrap_or(-1);
+        if code != 200 && code != 502 {
+            let msg = json
+                .get("message")
+                .or_else(|| json.get("msg"))
+                .and_then(Value::as_str)
+                .unwrap_or("写入歌单曲目失败");
+            return Err(format!("网易云写入歌单失败 ({code}): {msg}"));
+        }
+    }
+    Ok(())
+}
+
+pub async fn search_best_song_match(
+    title: &str,
+    artist: &str,
+    duration_sec: f64,
+    cookie: Option<&str>,
+) -> Option<AgentTrackInput> {
+    let clean_t = title.trim();
+    if clean_t.is_empty() {
+        return None;
+    }
+    let primary_artist = artist
+        .split(&['/', ',', '&', '、', '，'][..])
+        .next()
+        .unwrap_or(artist)
+        .trim();
+    let q = if primary_artist.is_empty() {
+        clean_t.to_string()
+    } else {
+        format!("{clean_t} {primary_artist}")
+    };
+    let json = ne_post_form_json(
+        "https://music.163.com/api/cloudsearch/pc",
+        &[
+            ("s", q),
+            ("type", "1".to_string()),
+            ("limit", "8".to_string()),
+            ("offset", "0".to_string()),
+        ],
+        cookie,
+    )
+    .await
+    .ok()?;
+    let arr = json.pointer("/result/songs").and_then(Value::as_array)?;
+    let mut best: Option<(f32, AgentTrackInput)> = None;
+    for node in arr {
+        let Some(tr) = parse_ne_song(node, None) else {
+            continue;
+        };
+        let sc = crate::backends::match_track_score(
+            clean_t,
+            artist,
+            duration_sec,
+            &tr.name,
+            &tr.artist_name,
+            tr.duration_sec,
+        );
+        if sc >= 0.54 && best.as_ref().is_none_or(|(bs, _)| sc > *bs) {
+            best = Some((sc, tr));
+        }
+    }
+    best.map(|(_, tr)| tr)
 }
 
 // ============================================================================

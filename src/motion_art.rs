@@ -1,4 +1,4 @@
-use std::collections::{hash_map::DefaultHasher, HashMap};
+use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
 use std::ffi::c_void;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -95,6 +95,100 @@ impl MotionArtManager {
                 self.state.1.notify_all();
             }
         }
+    }
+
+    pub fn slot_key_for_url(url: &str) -> String {
+        format!("u_{}", hash_url_key(url.trim()))
+    }
+
+    /// Synchronizes all viewport-visible URL-keyed motion cover slots (`u_*`) in one lock
+    /// acquisition:
+    /// - Every currently visible cover plays simultaneously (up to 12 slots).
+    /// - Existing visible URLs NEVER change slot key and NEVER wipe their decoded frame -> zero flicker!
+    /// - Any cover that scrolled out of the viewport is immediately removed and its decoder stopped!
+    pub fn sync_visible_urls(&self, visible_urls: &[String]) {
+        const MAX_VIEWPORT_SLOTS: usize = 12;
+        let mut desired: Vec<(String, String)> = Vec::new();
+        let mut desired_keys: HashSet<String> = HashSet::new();
+        for raw in visible_urls {
+            let clean = raw.trim();
+            if clean.is_empty() {
+                continue;
+            }
+            let key = Self::slot_key_for_url(clean);
+            if desired_keys.insert(key.clone()) {
+                desired.push((key, clean.to_string()));
+                if desired.len() >= MAX_VIEWPORT_SLOTS {
+                    break;
+                }
+            }
+        }
+
+        let mut need_worker = false;
+        if let Ok(mut guard) = self.state.0.lock() {
+            let mut changed = false;
+            let stale_keys: Vec<String> = guard
+                .slots
+                .keys()
+                .filter(|k| k.starts_with("u_") && !desired_keys.contains(*k))
+                .cloned()
+                .collect();
+            for sk in stale_keys {
+                guard.slots.remove(&sk);
+                guard.frames.remove(&sk);
+                changed = true;
+            }
+
+            let effective_active = guard.global_enabled;
+            for (k, url) in desired {
+                let next_req = SlotRequest {
+                    url,
+                    active: effective_active,
+                };
+                let prev = guard.slots.get(&k);
+                if prev != Some(&next_req) {
+                    if prev.map(|p| &p.url) != Some(&next_req.url) {
+                        guard.frames.remove(&k);
+                    }
+                    guard.slots.insert(k, next_req);
+                    changed = true;
+                }
+                if effective_active {
+                    need_worker = true;
+                }
+            }
+
+            if changed {
+                self.state.1.notify_all();
+            }
+        }
+        if need_worker {
+            self.ensure_worker_started();
+        }
+    }
+
+    pub fn latest_frame_for_url(&self, url: &str) -> Option<MotionFrameSnapshot> {
+        let clean = url.trim();
+        if clean.is_empty() {
+            return None;
+        }
+        let key = Self::slot_key_for_url(clean);
+        self.latest_frame(&key, Some(clean))
+    }
+
+    pub fn active_slot_urls(&self) -> Vec<String> {
+        let Ok(guard) = self.state.0.lock() else {
+            return Vec::new();
+        };
+        if !guard.global_enabled {
+            return Vec::new();
+        }
+        guard
+            .slots
+            .values()
+            .filter(|r| r.active && !r.url.is_empty())
+            .map(|r| r.url.clone())
+            .collect()
     }
 
     pub fn set_slot(&self, slot_key: &str, m3u8_url: Option<&str>, active: bool) {
@@ -377,8 +471,8 @@ fn hash_url_key(url: &str) -> String {
 }
 
 fn prune_motion_cache_dir(dir: &Path) {
-    const MAX_FILES: usize = 24;
-    const MAX_BYTES: u64 = 48 * 1024 * 1024;
+    const MAX_FILES: usize = 48;
+    const MAX_BYTES: u64 = 96 * 1024 * 1024;
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
@@ -413,8 +507,19 @@ fn prune_motion_cache_dir(dir: &Path) {
     }
 }
 
-fn ensure_cached_mp4_for_m3u8(
-    rt: &tokio::runtime::Runtime,
+fn cached_mp4_path_if_ready(m3u8_url: &str) -> Option<PathBuf> {
+    let dir = motion_cache_dir()?;
+    let key = hash_url_key(m3u8_url);
+    let out_path = dir.join(format!("{key}.mp4"));
+    let meta = std::fs::metadata(&out_path).ok()?;
+    if meta.is_file() && meta.len() > 8192 {
+        Some(out_path)
+    } else {
+        None
+    }
+}
+
+async fn ensure_cached_mp4_for_m3u8_async(
     http: &reqwest::Client,
     m3u8_url: &str,
 ) -> Result<PathBuf, String> {
@@ -428,7 +533,7 @@ fn ensure_cached_mp4_for_m3u8(
     }
 
     let tmp_path = dir.join(format!("{key}.mp4.part"));
-    let master_text = rt.block_on(async {
+    let master_text = {
         let resp = http
             .get(m3u8_url)
             .send()
@@ -439,25 +544,24 @@ fn ensure_cached_mp4_for_m3u8(
         }
         resp.text()
             .await
-            .map_err(|e| format!("读取动态封面列表失败: {e}"))
-    })?;
+            .map_err(|e| format!("读取动态封面列表失败: {e}"))?
+    };
 
     let (variant_url, variant_text) = if master_text.contains("#EXT-X-STREAM-INF") {
         let v_url = parse_best_avc_variant_from_master(&master_text, m3u8_url)
             .ok_or_else(|| "未找到可用的 AVC H.264 视频流".to_string())?;
-        let v_txt = rt.block_on(async {
-            let resp = http
-                .get(&v_url)
-                .send()
-                .await
-                .map_err(|e| format!("拉取子播放列表失败: {e}"))?;
-            if !resp.status().is_success() {
-                return Err(format!("子播放列表 HTTP {}", resp.status()));
-            }
-            resp.text()
-                .await
-                .map_err(|e| format!("读取子播放列表失败: {e}"))
-        })?;
+        let resp = http
+            .get(&v_url)
+            .send()
+            .await
+            .map_err(|e| format!("拉取子播放列表失败: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("子播放列表 HTTP {}", resp.status()));
+        }
+        let v_txt = resp
+            .text()
+            .await
+            .map_err(|e| format!("读取子播放列表失败: {e}"))?;
         (v_url, v_txt)
     } else {
         (m3u8_url.to_string(), master_text)
@@ -488,20 +592,18 @@ fn ensure_cached_mp4_for_m3u8(
 
     let mut combined: Vec<u8> = Vec::with_capacity(512 * 1024);
     for seg_url in download_urls {
-        let chunk = rt.block_on(async {
-            let resp = http
-                .get(&seg_url)
-                .send()
-                .await
-                .map_err(|e| format!("下载动态封面分段失败: {e}"))?;
-            if !resp.status().is_success() {
-                return Err(format!("动态封面媒体 HTTP {}", resp.status()));
-            }
-            resp.bytes()
-                .await
-                .map(|b| b.to_vec())
-                .map_err(|e| format!("读取动态封面字节失败: {e}"))
-        })?;
+        let resp = http
+            .get(&seg_url)
+            .send()
+            .await
+            .map_err(|e| format!("下载动态封面分段失败: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("动态封面媒体 HTTP {}", resp.status()));
+        }
+        let chunk = resp
+            .bytes()
+            .await
+            .map_err(|e| format!("读取动态封面字节失败: {e}"))?;
         combined.extend_from_slice(&chunk);
         if combined.len() > 24 * 1024 * 1024 {
             return Err("动态封面体积超出安全上限 (24 MB)".to_string());
@@ -512,13 +614,19 @@ fn ensure_cached_mp4_for_m3u8(
         return Err("动态封面 MP4 文件过小".to_string());
     }
 
-    std::fs::write(&tmp_path, &combined)
-        .map_err(|e| format!("写入缓存文件失败: {e}"))?;
-    let _ = std::fs::remove_file(&out_path);
-    std::fs::rename(&tmp_path, &out_path)
-        .map_err(|e| format!("提交缓存文件失败: {e}"))?;
-    prune_motion_cache_dir(&dir);
-    Ok(out_path)
+    let out_clone = out_path.clone();
+    let dir_clone = dir.clone();
+    tokio::task::spawn_blocking(move || {
+        std::fs::write(&tmp_path, &combined)
+            .map_err(|e| format!("写入缓存文件失败: {e}"))?;
+        let _ = std::fs::remove_file(&out_clone);
+        std::fs::rename(&tmp_path, &out_clone)
+            .map_err(|e| format!("提交缓存文件失败: {e}"))?;
+        prune_motion_cache_dir(&dir_clone);
+        Ok::<PathBuf, String>(out_clone)
+    })
+    .await
+    .map_err(|e| format!("缓存写盘线程异常: {e}"))?
 }
 
 // ============================================================================
@@ -1228,7 +1336,9 @@ fn motion_worker_loop(
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
 
-    let rt = match tokio::runtime::Builder::new_current_thread()
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("am-motion-dl")
         .enable_all()
         .build()
     {
@@ -1243,6 +1353,7 @@ fn motion_worker_loop(
     };
     let http = match reqwest::Client::builder()
         .timeout(Duration::from_secs(18))
+        .pool_max_idle_per_host(8)
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
         .build()
     {
@@ -1258,6 +1369,8 @@ fn motion_worker_loop(
 
     let mut mf: Option<MfRuntime> = None;
     let mut decoders: HashMap<String, ActiveDecoderSlot> = HashMap::new();
+    let downloading_urls: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let dl_sem = Arc::new(tokio::sync::Semaphore::new(4));
 
     loop {
         let active_reqs: Vec<(String, String)> = {
@@ -1313,7 +1426,7 @@ fn motion_worker_loop(
             }
         };
 
-        // Drop stale decoders not in active_reqs
+        // Drop stale decoders immediately when a card scrolls out of viewport!
         decoders.retain(|k, slot| {
             active_reqs
                 .iter()
@@ -1335,6 +1448,13 @@ fn motion_worker_loop(
 
         let mut any_frame_updated = false;
         let mut next_wake: Option<Instant> = None;
+        let total_active = active_reqs.len();
+        // Smooth adaptive pacing: 30fps for hero/<=4 covers, 24fps when 5+ cards play simultaneously
+        let min_frame_pace = if total_active >= 5 {
+            Duration::from_millis(42)
+        } else {
+            Duration::from_millis(33)
+        };
 
         for (slot_key, url) in active_reqs {
             let need_open = decoders
@@ -1342,25 +1462,58 @@ fn motion_worker_loop(
                 .map(|s| s.url != url)
                 .unwrap_or(true);
             if need_open {
-                match ensure_cached_mp4_for_m3u8(&rt, &http, &url)
-                    .and_then(|path| Mp4VideoDecoder::open(mf_ref, &path))
-                {
-                    Ok(dec) => {
-                        decoders.insert(
-                            slot_key.clone(),
-                            ActiveDecoderSlot {
-                                url: url.clone(),
-                                decoder: dec,
-                                next_due: Instant::now(),
-                            },
-                        );
-                    }
-                    Err(_) => {
-                        if let Ok(mut guard) = shared.0.lock() {
-                            guard.failed_urls.insert(url, Instant::now());
+                if let Some(cached_path) = cached_mp4_path_if_ready(&url) {
+                    match Mp4VideoDecoder::open(mf_ref, &cached_path) {
+                        Ok(dec) => {
+                            decoders.insert(
+                                slot_key.clone(),
+                                ActiveDecoderSlot {
+                                    url: url.clone(),
+                                    decoder: dec,
+                                    next_due: Instant::now(),
+                                },
+                            );
                         }
-                        continue;
+                        Err(_) => {
+                            let _ = std::fs::remove_file(&cached_path);
+                            if let Ok(mut guard) = shared.0.lock() {
+                                guard.failed_urls.insert(url, Instant::now());
+                            }
+                            continue;
+                        }
                     }
+                } else {
+                    // Non-blocking concurrent HLS download so playing covers NEVER stutter!
+                    let should_spawn = downloading_urls
+                        .lock()
+                        .map(|mut set| set.insert(url.clone()))
+                        .unwrap_or(false);
+                    if should_spawn {
+                        let http_c = http.clone();
+                        let url_c = url.clone();
+                        let shared_c = Arc::clone(&shared);
+                        let dl_set = Arc::clone(&downloading_urls);
+                        let sem_c = Arc::clone(&dl_sem);
+                        rt.spawn(async move {
+                            let _permit = sem_c.acquire().await;
+                            let res = ensure_cached_mp4_for_m3u8_async(&http_c, &url_c).await;
+                            if let Ok(mut set) = dl_set.lock() {
+                                set.remove(&url_c);
+                            }
+                            if res.is_err() {
+                                if let Ok(mut guard) = shared_c.0.lock() {
+                                    guard.failed_urls.insert(url_c, Instant::now());
+                                }
+                            }
+                            shared_c.1.notify_all();
+                        });
+                    }
+                    let retry_due = Instant::now() + Duration::from_millis(90);
+                    next_wake = Some(match next_wake {
+                        Some(w) => w.min(retry_due),
+                        None => retry_due,
+                    });
+                    continue;
                 }
             }
 
@@ -1375,7 +1528,7 @@ fn motion_worker_loop(
                 }
                 match slot_dec.decoder.read_next_frame(mf_ref, &slot_key) {
                     Ok((Some(snap), wait)) => {
-                        let due = Instant::now() + wait;
+                        let due = Instant::now() + wait.max(min_frame_pace);
                         slot_dec.next_due = due;
                         next_wake = Some(match next_wake {
                             Some(w) => w.min(due),
@@ -1394,7 +1547,7 @@ fn motion_worker_loop(
                         }
                     }
                     Ok((None, wait)) => {
-                        let due = Instant::now() + wait;
+                        let due = Instant::now() + wait.max(min_frame_pace);
                         slot_dec.next_due = due;
                         next_wake = Some(match next_wake {
                             Some(w) => w.min(due),

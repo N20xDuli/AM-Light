@@ -29,8 +29,52 @@ pub enum LyricsHitAction {
     ImportLocalLyrics,
     ToggleTranslation,
     ToggleFreeBlur,
+    ToggleImmersiveMode,
+    OpenMoreMenu(RectF),
     NudgeLyricsOffset(f64),
     ResetLyricsOffset,
+}
+
+/// Evaluates target visibility (`[top_left, top_right, bottom_left, bottom_right]`) for peripheral
+/// chrome on the Lyrics overlay when「沉浸模式」is enabled:
+/// - All four corners fade out cleanly unless the pointer recently moved near that specific corner.
+/// - Core playback controls, album artwork, synced lyrics, and flowing aurora background remain 100% visible.
+pub fn eval_immersive_corner_targets(
+    win_rect: RectF,
+    mouse: (f32, f32),
+    idle_sec: f32,
+    immersive: bool,
+    force_visible: bool,
+) -> [f32; 4] {
+    if !immersive || force_visible {
+        return [1.0, 1.0, 1.0, 1.0];
+    }
+    if idle_sec > 2.4 {
+        return [0.0, 0.0, 0.0, 0.0];
+    }
+    let (mx, my) = mouse;
+    let in_tl = mx >= win_rect.x - 4.0
+        && mx <= win_rect.x + 170.0
+        && my >= win_rect.y - 4.0
+        && my <= win_rect.y + 104.0;
+    let in_tr = mx >= win_rect.right() - 224.0
+        && mx <= win_rect.right() + 4.0
+        && my >= win_rect.y - 4.0
+        && my <= win_rect.y + 104.0;
+    let in_bl = mx >= win_rect.x - 4.0
+        && mx <= win_rect.x + 360.0
+        && my >= win_rect.bottom() - 96.0
+        && my <= win_rect.bottom() + 4.0;
+    let in_br = mx >= win_rect.right() - 520.0
+        && mx <= win_rect.right() + 4.0
+        && my >= win_rect.bottom() - 108.0
+        && my <= win_rect.bottom() + 4.0;
+    [
+        if in_tl { 1.0 } else { 0.0 },
+        if in_tr { 1.0 } else { 0.0 },
+        if in_bl { 1.0 } else { 0.0 },
+        if in_br { 1.0 } else { 0.0 },
+    ]
 }
 
 #[derive(Clone, Debug)]
@@ -203,6 +247,9 @@ pub struct LyricsViewState {
     pub lyrics_column_rect: RectF,
     pub progress_bar_rect: RectF,
     pub volume_bar_rect: RectF,
+    pub immersive_mode: bool,
+    pub immersive_corner_alphas: [f32; 4],
+    pub immersive_corner_targets: [f32; 4],
     cached_layout_key: CachedLyricsLayoutKey,
     cached_line_layouts: Vec<CachedLyricLineLayout>,
 }
@@ -235,6 +282,9 @@ impl Default for LyricsViewState {
             lyrics_column_rect: RectF::default(),
             progress_bar_rect: RectF::default(),
             volume_bar_rect: RectF::default(),
+            immersive_mode: false,
+            immersive_corner_alphas: [1.0, 1.0, 1.0, 1.0],
+            immersive_corner_targets: [1.0, 1.0, 1.0, 1.0],
             cached_layout_key: CachedLyricsLayoutKey::default(),
             cached_line_layouts: Vec::new(),
         }
@@ -243,7 +293,50 @@ impl Default for LyricsViewState {
 
 impl LyricsViewState {
     pub fn has_active_layout_motion(&self) -> bool {
-        !self.center_layout_spring.is_settled_norm() || self.cover_vel.abs() > 0.01
+        let corner_settling = (0..4).any(|i| {
+            (self.immersive_corner_alphas[i] - self.immersive_corner_targets[i]).abs() > 0.008
+        });
+        !self.center_layout_spring.is_settled_norm() || self.cover_vel.abs() > 0.01 || corner_settling
+    }
+
+    pub fn step_immersive_corners(
+        &mut self,
+        win_rect: RectF,
+        hovered_pt: (f32, f32),
+        mouse_idle_sec: f32,
+        immersive: bool,
+        force_visible: bool,
+        dt_sec: f32,
+        reduce_motion: bool,
+    ) {
+        self.immersive_mode = immersive;
+        let targets = eval_immersive_corner_targets(
+            win_rect,
+            hovered_pt,
+            mouse_idle_sec,
+            immersive,
+            force_visible,
+        );
+        self.immersive_corner_targets = targets;
+        if reduce_motion {
+            self.immersive_corner_alphas = targets;
+        } else {
+            let dt = dt_sec.clamp(0.001, 0.05);
+            let k_in = (1.0 - (-16.0 * dt).exp()).clamp(0.05, 1.0);
+            let k_out = (1.0 - (-8.5 * dt).exp()).clamp(0.03, 1.0);
+            for i in 0..4 {
+                let k = if targets[i] > self.immersive_corner_alphas[i] {
+                    k_in
+                } else {
+                    k_out
+                };
+                self.immersive_corner_alphas[i] +=
+                    (targets[i] - self.immersive_corner_alphas[i]) * k;
+                if (self.immersive_corner_alphas[i] - targets[i]).abs() < 0.004 {
+                    self.immersive_corner_alphas[i] = targets[i];
+                }
+            }
+        }
     }
 
     #[inline]
@@ -467,65 +560,91 @@ impl LyricsViewState {
         let top_y = win_rect.y + Theme::TOP_BAR_Y;
         let btn_h = Theme::TOP_BAR_H;
         let btn_r = Theme::TOP_BAR_RADIUS;
+        let [a_tl, a_tr, a_bl, a_br] = self.immersive_corner_alphas;
 
-        // Top-Left Close Chevron Circle (live refracting floating Liquid Glass!)
+        // Top-Left Close Chevron Circle (hidden cleanly in Immersive Mode until mouse nears top-left)
         let close_btn = RectF::new(win_rect.x + 20.0, top_y, btn_h, btn_h);
-        let close_hov = close_btn.contains(hovered_pt.0, hovered_pt.1);
-        r.draw_liquid_glass_floating_button(
-            close_btn,
-            btn_r,
-            GlassBtnVariant::Regular,
-            close_hov,
-            mouse_down,
-            hovered_pt,
-            glass_off,
-        );
-        r.draw_icon(SfIcon::ChevronDown, close_btn.inset(9.0, 9.0), Theme::TEXT_PRIMARY);
-        self.hit_zones.push(LyricsHitZone {
-            rect: close_btn,
-            action: LyricsHitAction::CloseLyrics,
-            line_idx: None,
-        });
+        if a_tl > 0.02 {
+            let pushed_tl = if a_tl < 0.995 {
+                r.push_opacity_layer(close_btn.inset(-14.0, -14.0), a_tl)
+            } else {
+                false
+            };
+            let close_hov = close_btn.contains(hovered_pt.0, hovered_pt.1);
+            r.draw_liquid_glass_floating_button(
+                close_btn,
+                btn_r,
+                GlassBtnVariant::Regular,
+                close_hov,
+                mouse_down,
+                hovered_pt,
+                glass_off,
+            );
+            r.draw_icon(SfIcon::ChevronDown, close_btn.inset(9.0, 9.0), Theme::TEXT_PRIMARY);
+            if pushed_tl {
+                r.pop_layer();
+            }
+            if a_tl > 0.20 {
+                self.hit_zones.push(LyricsHitZone {
+                    rect: close_btn,
+                    action: LyricsHitAction::CloseLyrics,
+                    line_idx: None,
+                });
+            }
+        }
 
         // Top-Right Unified Window Controls (`─`, `□`, `×`), pixel-identical to Main UI
         let close_x = win_rect.right() - 18.0 - btn_h;
         let max_x = close_x - 8.0 - btn_h;
         let min_x = max_x - 8.0 - btn_h;
-        for (wx, wic, wact, is_cls) in [
-            (min_x, SfIcon::WinMinimize, LyricsHitAction::WinMinimize, false),
-            (
-                max_x,
-                if is_maximized {
-                    SfIcon::WinRestore
-                } else {
-                    SfIcon::WinMaximize
-                },
-                LyricsHitAction::WinToggleMaximize,
-                false,
-            ),
-            (close_x, SfIcon::WinClose, LyricsHitAction::WinClose, true),
-        ] {
-            let wb = RectF::new(wx, top_y, btn_h, btn_h);
-            let whov = wb.contains(hovered_pt.0, hovered_pt.1);
-            r.draw_liquid_glass_floating_button(
-                wb,
-                btn_r,
-                if is_cls && whov {
-                    GlassBtnVariant::Tinted(Theme::ACCENT_RED)
-                } else {
-                    GlassBtnVariant::Regular
-                },
-                whov,
-                mouse_down,
-                hovered_pt,
-                glass_off,
-            );
-            r.draw_icon(wic, wb.inset(9.5, 9.5), Theme::TEXT_PRIMARY);
-            self.hit_zones.push(LyricsHitZone {
-                rect: wb,
-                action: wact,
-                line_idx: None,
-            });
+        if a_tr > 0.02 {
+            let tr_bounds = RectF::new(min_x - 14.0, top_y - 12.0, (close_x + btn_h - min_x) + 28.0, btn_h + 24.0);
+            let pushed_tr = if a_tr < 0.995 {
+                r.push_opacity_layer(tr_bounds, a_tr)
+            } else {
+                false
+            };
+            for (wx, wic, wact, is_cls) in [
+                (min_x, SfIcon::WinMinimize, LyricsHitAction::WinMinimize, false),
+                (
+                    max_x,
+                    if is_maximized {
+                        SfIcon::WinRestore
+                    } else {
+                        SfIcon::WinMaximize
+                    },
+                    LyricsHitAction::WinToggleMaximize,
+                    false,
+                ),
+                (close_x, SfIcon::WinClose, LyricsHitAction::WinClose, true),
+            ] {
+                let wb = RectF::new(wx, top_y, btn_h, btn_h);
+                let whov = wb.contains(hovered_pt.0, hovered_pt.1);
+                r.draw_liquid_glass_floating_button(
+                    wb,
+                    btn_r,
+                    if is_cls && whov {
+                        GlassBtnVariant::Tinted(Theme::ACCENT_RED)
+                    } else {
+                        GlassBtnVariant::Regular
+                    },
+                    whov,
+                    mouse_down,
+                    hovered_pt,
+                    glass_off,
+                );
+                r.draw_icon(wic, wb.inset(9.5, 9.5), Theme::TEXT_PRIMARY);
+                if a_tr > 0.20 {
+                    self.hit_zones.push(LyricsHitZone {
+                        rect: wb,
+                        action: wact,
+                        line_idx: None,
+                    });
+                }
+            }
+            if pushed_tr {
+                r.pop_layer();
+            }
         }
 
         // Responsive Viewport Scale (scales proportionally on large / maximized / 4K displays!)
@@ -675,7 +794,7 @@ impl LyricsViewState {
         );
         self.hit_zones.push(LyricsHitZone {
             rect: dots_btn,
-            action: LyricsHitAction::ImportLocalLyrics,
+            action: LyricsHitAction::OpenMoreMenu(dots_btn),
             line_idx: None,
         });
 
@@ -892,21 +1011,23 @@ impl LyricsViewState {
         } else {
             format!("AM Light · {}", self.source_pref.label())
         };
-        r.draw_icon(
-            SfIcon::Radio,
-            RectF::new(win_rect.x + 28.0, win_rect.bottom() - 34.0, 16.0, 16.0),
-            Color::rgba(255, 255, 255, 0.45),
-        );
-        r.draw_text(
-            &src_caption,
-            RectF::new(win_rect.x + 50.0, win_rect.bottom() - 36.0, 320.0, 20.0),
-            11.8,
-            500,
-            Color::rgba(255, 255, 255, 0.48),
-            TextAlign::Left,
-            true,
-            false,
-        );
+        if a_bl > 0.02 {
+            r.draw_icon(
+                SfIcon::Radio,
+                RectF::new(win_rect.x + 28.0, win_rect.bottom() - 34.0, 16.0, 16.0),
+                Color::rgba(255, 255, 255, 0.45 * a_bl),
+            );
+            r.draw_text(
+                &src_caption,
+                RectF::new(win_rect.x + 50.0, win_rect.bottom() - 36.0, 320.0, 20.0),
+                11.8,
+                500,
+                Color::rgba(255, 255, 255, 0.48 * a_bl),
+                TextAlign::Left,
+                true,
+                false,
+            );
+        }
 
         // --- Draw Right Column: SyncedLyricsViewController (Hidden smoothly when Instrumental / No Lyrics!) ---
         let lyrics_col_alpha = ((1.0 - center_t * 1.38).clamp(0.0, 1.0) * sa).clamp(0.0, 1.0);
@@ -964,14 +1085,17 @@ impl LyricsViewState {
             }
         }
 
-        // Bottom-Right Floating Controls Capsule
-        self.draw_bottom_right_glass_controls(
-            r,
-            win_rect,
-            hovered_pt,
-            mouse_down,
-            glass_off,
-        );
+        // Bottom-Right Floating Controls Capsule (hidden cleanly in Immersive Mode until mouse nears bottom-right)
+        if a_br > 0.02 {
+            self.draw_bottom_right_glass_controls(
+                r,
+                win_rect,
+                hovered_pt,
+                mouse_down,
+                glass_off,
+                a_br,
+            );
+        }
     }
 
     pub fn invalidate_layout_cache(&mut self) {
@@ -2384,6 +2508,7 @@ impl LyricsViewState {
         hovered_pt: (f32, f32),
         mouse_down: bool,
         glass_off: bool,
+        corner_alpha: f32,
     ) {
         let src_lbl = self.source_pref.label();
         let blur_lbl = if self.music_free_blur {
@@ -2397,7 +2522,7 @@ impl LyricsViewState {
         } else {
             "0.0s".to_string()
         };
-        let items: [(String, f32, bool, LyricsHitAction); 7] = [
+        let items: [(String, f32, bool, LyricsHitAction); 8] = [
             (
                 "-0.1s".to_string(),
                 40.0,
@@ -2418,25 +2543,31 @@ impl LyricsViewState {
             ),
             (
                 "译".to_string(),
-                34.0,
+                32.0,
                 self.show_translation,
                 LyricsHitAction::ToggleTranslation,
             ),
             (
                 src_lbl.to_string(),
-                76.0,
+                74.0,
                 self.source_pref != LyricsSourcePref::Auto,
                 LyricsHitAction::CycleLyricsSource,
             ),
             (
                 blur_lbl.to_string(),
-                46.0,
+                44.0,
                 self.music_free_blur,
                 LyricsHitAction::ToggleFreeBlur,
             ),
             (
+                "沉浸".to_string(),
+                44.0,
+                self.immersive_mode,
+                LyricsHitAction::ToggleImmersiveMode,
+            ),
+            (
                 "导入".to_string(),
-                46.0,
+                44.0,
                 false,
                 LyricsHitAction::ImportLocalLyrics,
             ),
@@ -2452,6 +2583,12 @@ impl LyricsViewState {
             total_w,
             pill_h,
         );
+
+        let pushed_br = if corner_alpha < 0.995 {
+            r.push_opacity_layer(pill.inset(-16.0, -16.0), corner_alpha)
+        } else {
+            false
+        };
 
         r.draw_liquid_glass(
             pill,
@@ -2501,12 +2638,17 @@ impl LyricsViewState {
                 true,
                 false,
             );
-            self.hit_zones.push(LyricsHitZone {
-                rect: br,
-                action: act,
-                line_idx: None,
-            });
+            if corner_alpha > 0.20 {
+                self.hit_zones.push(LyricsHitZone {
+                    rect: br,
+                    action: act,
+                    line_idx: None,
+                });
+            }
             x += bw + inner_gap;
+        }
+        if pushed_br {
+            r.pop_layer();
         }
     }
 }

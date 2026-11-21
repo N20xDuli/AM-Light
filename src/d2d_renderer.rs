@@ -17,23 +17,23 @@ use windows::Win32::Graphics::DirectComposition::{
     DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
 };
 use windows::Win32::Graphics::Direct2D::{
-    CLSID_D2D1ColorMatrix, CLSID_D2D1GaussianBlur, D2D1CreateFactory, ID2D1Bitmap1,
+    CLSID_D2D1ColorMatrix, CLSID_D2D1Crop, CLSID_D2D1GaussianBlur, D2D1CreateFactory, ID2D1Bitmap1,
     ID2D1BitmapBrush1, ID2D1Device, ID2D1DeviceContext, ID2D1Effect, ID2D1Factory, ID2D1Factory1,
     ID2D1Geometry, ID2D1Image, ID2D1LinearGradientBrush, ID2D1PathGeometry, ID2D1RenderTarget,
     ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_BRUSH_PROPERTIES1,
     D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_NONE, D2D1_BITMAP_OPTIONS_TARGET,
     D2D1_BITMAP_PROPERTIES1, D2D1_CAP_STYLE_ROUND, D2D1_COLORMATRIX_PROP_COLOR_MATRIX,
-    D2D1_COMBINE_MODE_EXCLUDE, D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_DRAW_TEXT_OPTIONS_CLIP,
-    D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT, D2D1_DRAW_TEXT_OPTIONS_NO_SNAP, D2D1_ELLIPSE,
-    D2D1_EXTEND_MODE_CLAMP, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_GAMMA_2_2,
-    D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED, D2D1_GAUSSIANBLUR_OPTIMIZATION_SPEED,
-    D2D1_GAUSSIANBLUR_PROP_BORDER_MODE, D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION,
-    D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, D2D1_INTERPOLATION_MODE_LINEAR,
-    D2D1_LAYER_OPTIONS1_NONE, D2D1_LAYER_PARAMETERS1, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES,
-    D2D1_LINE_JOIN_ROUND, D2D1_PRIMITIVE_BLEND_COPY, D2D1_PRIMITIVE_BLEND_SOURCE_OVER,
-    D2D1_PROPERTY_TYPE_BLOB, D2D1_PROPERTY_TYPE_FLOAT, D2D1_PROPERTY_TYPE_UINT32,
-    D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES, D2D1_ROUNDED_RECT, D2D1_STROKE_STYLE_PROPERTIES,
-    D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
+    D2D1_COMBINE_MODE_EXCLUDE, D2D1_CROP_PROP_RECT, D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
+    D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
+    D2D1_DRAW_TEXT_OPTIONS_NO_SNAP, D2D1_ELLIPSE, D2D1_EXTEND_MODE_CLAMP,
+    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_GAMMA_2_2, D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED,
+    D2D1_GAUSSIANBLUR_OPTIMIZATION_SPEED, D2D1_GAUSSIANBLUR_PROP_BORDER_MODE,
+    D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION, D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION,
+    D2D1_INTERPOLATION_MODE_LINEAR, D2D1_LAYER_OPTIONS1_NONE, D2D1_LAYER_PARAMETERS1,
+    D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_LINE_JOIN_ROUND, D2D1_PRIMITIVE_BLEND_COPY,
+    D2D1_PRIMITIVE_BLEND_SOURCE_OVER, D2D1_PROPERTY_TYPE_BLOB, D2D1_PROPERTY_TYPE_FLOAT,
+    D2D1_PROPERTY_TYPE_UINT32, D2D1_PROPERTY_TYPE_VECTOR4, D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES,
+    D2D1_ROUNDED_RECT, D2D1_STROKE_STYLE_PROPERTIES, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
 };
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL_10_0,
@@ -231,6 +231,7 @@ pub struct D2DRenderer {
     pub solid_brush: ID2D1SolidColorBrush,
     pub round_stroke: windows::Win32::Graphics::Direct2D::ID2D1StrokeStyle,
     pub blur_effect: Option<ID2D1Effect>,
+    pub glass_crop_effect: Option<ID2D1Effect>,
     pub glass_rim_blur_effect: Option<ID2D1Effect>,
     pub glass_vibrancy_effect: Option<ID2D1Effect>,
     pub glass_rim_vibrancy_effect: Option<ID2D1Effect>,
@@ -249,10 +250,16 @@ pub struct D2DRenderer {
     corner_cutout_key: (u32, u32, u16),
     corner_cutout_geom: Option<ID2D1PathGeometry>,
 
-    // Reusable scratch bitmap for Liquid Glass backdrop capture (max 960x120 px = ~460 KB!)
+    // Reusable scratch bitmap for Liquid Glass backdrop capture + single per-frame scene snapshot
+    // (eliminates 10+ per-button GPU Flush/Copy stalls per frame!)
     glass_capture_bmp: Option<ID2D1Bitmap1>,
     glass_cap_w: u32,
     glass_cap_h: u32,
+    glass_frame_snapshot: Option<ID2D1Bitmap1>,
+    glass_snap_w: u32,
+    glass_snap_h: u32,
+    glass_snapshot_active: bool,
+    frame_counter: u64,
 
     // Bounded LRU offscreen premultiplied bitmaps for true GPU Gaussian depth-of-field lyrics blur
     lyrics_bmp_track: String,
@@ -269,7 +276,7 @@ pub struct D2DRenderer {
     mesh_last_free_blur: bool,
     fade_mask_key: Option<(i32, i32, i32, i32, i32, i32)>,
     fade_mask_brush: Option<ID2D1LinearGradientBrush>,
-    motion_textures: HashMap<String, (ID2D1Bitmap1, ID2D1BitmapBrush1, u32, u32, u64)>,
+    motion_textures: HashMap<String, (ID2D1Bitmap1, ID2D1BitmapBrush1, u32, u32, u64, u64)>,
 
     // Reusable low-res 128x128 bitmap for Spek waterfall & dynamic lyrics mesh background
     pub waterfall_bmp: Option<ID2D1Bitmap1>,
@@ -491,6 +498,7 @@ impl D2DRenderer {
                 .map_err(|e| format!("CreateStrokeStyle 失败: {e}"))?;
 
             let blur_effect = dc.CreateEffect(&CLSID_D2D1GaussianBlur).ok();
+            let glass_crop_effect = dc.CreateEffect(&CLSID_D2D1Crop).ok();
             let glass_rim_blur_effect = dc.CreateEffect(&CLSID_D2D1GaussianBlur).ok();
             let glass_vibrancy_effect = dc.CreateEffect(&CLSID_D2D1ColorMatrix).ok();
             let glass_rim_vibrancy_effect = dc.CreateEffect(&CLSID_D2D1ColorMatrix).ok();
@@ -580,6 +588,7 @@ impl D2DRenderer {
                 solid_brush,
                 round_stroke,
                 blur_effect,
+                glass_crop_effect,
                 glass_rim_blur_effect,
                 glass_vibrancy_effect,
                 glass_rim_vibrancy_effect,
@@ -598,6 +607,11 @@ impl D2DRenderer {
                 glass_capture_bmp: None,
                 glass_cap_w: 0,
                 glass_cap_h: 0,
+                glass_frame_snapshot: None,
+                glass_snap_w: 0,
+                glass_snap_h: 0,
+                glass_snapshot_active: false,
+                frame_counter: 0,
                 lyrics_bmp_track: String::new(),
                 lyrics_bmp_cache: HashMap::new(),
                 lyrics_bmp_lru: VecDeque::new(),
@@ -730,12 +744,17 @@ impl D2DRenderer {
         self.width_px = w;
         self.height_px = h;
         self.corner_cutout_geom = None;
+        self.glass_frame_snapshot = None;
+        self.glass_snap_w = 0;
+        self.glass_snap_h = 0;
+        self.glass_snapshot_active = false;
         self.release_lyrics_transition_surfaces();
         unsafe {
             self.dc.SetTarget(None);
             self.target_bitmap = None;
             for eff in [
                 &self.blur_effect,
+                &self.glass_crop_effect,
                 &self.glass_rim_blur_effect,
                 &self.glass_vibrancy_effect,
                 &self.glass_rim_vibrancy_effect,
@@ -886,6 +905,12 @@ impl D2DRenderer {
             }
 
             let hr_end = self.dc.EndDraw(None, None);
+            self.glass_snapshot_active = false;
+            self.frame_counter = self.frame_counter.wrapping_add(1);
+            if self.frame_counter % 60 == 0 && !self.motion_textures.is_empty() {
+                let cutoff = self.frame_counter.saturating_sub(180);
+                self.motion_textures.retain(|_, v| v.5 >= cutoff);
+            }
             let clamped_sync = sync_interval.min(4);
             let hr_pres = self.swap_chain.Present(clamped_sync, DXGI_PRESENT(0));
             if self.needs_dcomp_commit {
@@ -1809,7 +1834,10 @@ impl D2DRenderer {
                 rect
             };
             let rad = radius.min(r.w * 0.5).min(r.h * 0.5).max(0.0);
-            used_live_backdrop = self.draw_liquid_glass_backdrop_only(r, rad, 10.0, 1.11, true);
+            // Compact 34px circles skip the heavy 2nd CombineWithGeometry+Blur bezel pass;
+            // wide glass pills & hero capsules keep full two-zone optical bezel refraction!
+            let want_bezel = r.w >= 96.0 || r.h >= 96.0;
+            used_live_backdrop = self.draw_liquid_glass_backdrop_only(r, rad, 10.0, 1.11, want_bezel);
             if used_live_backdrop {
                 let (sc, sf, dy) = if pressed && hovered {
                     (0.16, 0.07, 1.2)
@@ -1865,6 +1893,77 @@ impl D2DRenderer {
         }
     }
 
+    /// Captures the entire active render target ONCE into an immutable reusable GPU bitmap so
+    /// all subsequent non-overlapping floating Liquid Glass elements in this pass (9 top-bar
+    /// buttons + MiniPlayer) sample live refracted pixels with ZERO per-button `dc.Flush()` or
+    /// `CopyFromBitmap()` pipeline stalls!
+    pub fn begin_glass_backdrop_snapshot(&mut self, reduce_transparency: bool) {
+        self.glass_snapshot_active = false;
+        if reduce_transparency || self.blur_effect.is_none() || self.width_px < 4 || self.height_px < 4 {
+            return;
+        }
+        let Some(active_tgt) = self.active_draw_target().cloned() else {
+            return;
+        };
+        unsafe {
+            if self.glass_frame_snapshot.is_none()
+                || self.glass_snap_w != self.width_px
+                || self.glass_snap_h != self.height_px
+            {
+                let dpi = 96.0 * self.dpi_scale;
+                let alpha_mode = if self.premultiplied_swapchain {
+                    D2D1_ALPHA_MODE_PREMULTIPLIED
+                } else {
+                    D2D1_ALPHA_MODE_IGNORE
+                };
+                let props = D2D1_BITMAP_PROPERTIES1 {
+                    pixelFormat: D2D1_PIXEL_FORMAT {
+                        format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                        alphaMode: alpha_mode,
+                    },
+                    dpiX: dpi,
+                    dpiY: dpi,
+                    bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
+                    colorContext: std::mem::ManuallyDrop::new(None),
+                };
+                if let Ok(bmp) = self.dc.CreateBitmap(
+                    D2D_SIZE_U {
+                        width: self.width_px,
+                        height: self.height_px,
+                    },
+                    None,
+                    0,
+                    &props,
+                ) {
+                    self.glass_snap_w = self.width_px;
+                    self.glass_snap_h = self.height_px;
+                    self.glass_frame_snapshot = Some(bmp);
+                    self.gpu_staging_dirty = true;
+                }
+            }
+            if let Some(ref snap_bmp) = self.glass_frame_snapshot {
+                let _ = self.dc.Flush(None, None);
+                let src_u = D2D_RECT_U {
+                    left: 0,
+                    top: 0,
+                    right: self.width_px,
+                    bottom: self.height_px,
+                };
+                let dst_pt = D2D_POINT_2U { x: 0, y: 0 };
+                if snap_bmp
+                    .CopyFromBitmap(Some(&dst_pt), &active_tgt, Some(&src_u))
+                    .is_ok()
+                {
+                    self.glass_snapshot_active = true;
+                }
+            }
+        }
+    }
+
+    pub fn end_glass_backdrop_snapshot(&mut self) {
+        self.glass_snapshot_active = false;
+    }
+
     /// Captures padded live pixels underneath `rect` from `active_draw_target()`, applies Apple-style
     /// Gaussian blur + ColorMatrix vibrancy saturation boost, and optionally renders a two-zone
     /// curved outer refractive bezel ring (`bezel_ring_geom`) so album covers visibly bend and
@@ -1880,9 +1979,6 @@ impl D2DRenderer {
         if rect.w <= 2.0 || rect.h <= 2.0 || self.blur_effect.is_none() {
             return false;
         }
-        let Some(active_tgt) = self.active_draw_target().cloned() else {
-            return false;
-        };
         if self.width_px < 4 || self.height_px < 4 {
             return false;
         }
@@ -1909,71 +2005,111 @@ impl D2DRenderer {
             }
             b
         };
+        let rect_to_bytes = |v: [f32; 4]| -> [u8; 16] {
+            let mut b = [0u8; 16];
+            for (i, f) in v.iter().enumerate() {
+                b[i * 4..(i + 1) * 4].copy_from_slice(&f.to_le_bytes());
+            }
+            b
+        };
+
+        let cap_ox = (px_l as f32) / self.dpi_scale;
+        let cap_oy = (px_t as f32) / self.dpi_scale;
+        let cap_dip_w = (cap_w as f32) / self.dpi_scale;
+        let cap_dip_h = (cap_h as f32) / self.dpi_scale;
+
+        let use_batch_snapshot = self.glass_snapshot_active
+            && self.glass_frame_snapshot.is_some()
+            && self.glass_crop_effect.is_some();
 
         unsafe {
-            // Dynamically grow reusable scratch bitmap up to full window dimensions (fixes 512px cutoff!)
-            if self.glass_capture_bmp.is_none() || cap_w > self.glass_cap_w || cap_h > self.glass_cap_h
-            {
-                let alloc_w = ((cap_w + 63) & !63).clamp(128, self.width_px.max(128));
-                let alloc_h = ((cap_h + 63) & !63).clamp(64, self.height_px.max(64));
-                let dpi = 96.0 * self.dpi_scale;
-                let alpha_mode = if self.premultiplied_swapchain {
-                    D2D1_ALPHA_MODE_PREMULTIPLIED
-                } else {
-                    D2D1_ALPHA_MODE_IGNORE
+            let (src_bmp_owned, crop_bounds_dip) = if use_batch_snapshot {
+                let snap = self.glass_frame_snapshot.as_ref().unwrap().clone();
+                (snap, [cap_ox, cap_oy, cap_ox + cap_dip_w, cap_oy + cap_dip_h])
+            } else {
+                let Some(active_tgt) = self.active_draw_target().cloned() else {
+                    return false;
                 };
-                let props = D2D1_BITMAP_PROPERTIES1 {
-                    pixelFormat: D2D1_PIXEL_FORMAT {
-                        format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                        alphaMode: alpha_mode,
-                    },
-                    dpiX: dpi,
-                    dpiY: dpi,
-                    bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
-                    colorContext: std::mem::ManuallyDrop::new(None),
-                };
-                if let Ok(bmp) = self.dc.CreateBitmap(
-                    D2D_SIZE_U {
-                        width: alloc_w,
-                        height: alloc_h,
-                    },
-                    None,
-                    0,
-                    &props,
-                ) {
-                    self.glass_cap_w = alloc_w;
-                    self.glass_cap_h = alloc_h;
-                    self.glass_capture_bmp = Some(bmp);
-                    self.gpu_staging_dirty = true;
+                if self.glass_capture_bmp.is_none() || cap_w > self.glass_cap_w || cap_h > self.glass_cap_h
+                {
+                    let alloc_w = ((cap_w + 63) & !63).clamp(128, self.width_px.max(128));
+                    let alloc_h = ((cap_h + 63) & !63).clamp(64, self.height_px.max(64));
+                    let dpi = 96.0 * self.dpi_scale;
+                    let alpha_mode = if self.premultiplied_swapchain {
+                        D2D1_ALPHA_MODE_PREMULTIPLIED
+                    } else {
+                        D2D1_ALPHA_MODE_IGNORE
+                    };
+                    let props = D2D1_BITMAP_PROPERTIES1 {
+                        pixelFormat: D2D1_PIXEL_FORMAT {
+                            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                            alphaMode: alpha_mode,
+                        },
+                        dpiX: dpi,
+                        dpiY: dpi,
+                        bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
+                        colorContext: std::mem::ManuallyDrop::new(None),
+                    };
+                    if let Ok(bmp) = self.dc.CreateBitmap(
+                        D2D_SIZE_U {
+                            width: alloc_w,
+                            height: alloc_h,
+                        },
+                        None,
+                        0,
+                        &props,
+                    ) {
+                        self.glass_cap_w = alloc_w;
+                        self.glass_cap_h = alloc_h;
+                        self.glass_capture_bmp = Some(bmp);
+                        self.gpu_staging_dirty = true;
+                    }
                 }
-            }
+                let Some(ref cap_bmp) = self.glass_capture_bmp else {
+                    return false;
+                };
+                if cap_w > self.glass_cap_w || cap_h > self.glass_cap_h {
+                    return false;
+                }
+                let _ = self.dc.Flush(None, None);
+                let src_u = D2D_RECT_U {
+                    left: px_l,
+                    top: px_t,
+                    right: px_r,
+                    bottom: px_b,
+                };
+                let dst_pt = D2D_POINT_2U { x: 0, y: 0 };
+                if cap_bmp
+                    .CopyFromBitmap(Some(&dst_pt), &active_tgt, Some(&src_u))
+                    .is_err()
+                {
+                    return false;
+                }
+                (cap_bmp.clone(), [0.0, 0.0, cap_dip_w, cap_dip_h])
+            };
 
-            let (Some(ref cap_bmp), Some(ref blur)) = (&self.glass_capture_bmp, &self.blur_effect)
-            else {
+            let Some(ref blur) = self.blur_effect else {
                 return false;
             };
-            if cap_w > self.glass_cap_w || cap_h > self.glass_cap_h {
-                return false;
-            }
 
-            // Flush all queued draws before copying live pixels from active render target!
-            let _ = self.dc.Flush(None, None);
-            let src_u = D2D_RECT_U {
-                left: px_l,
-                top: px_t,
-                right: px_r,
-                bottom: px_b,
+            // Strictly crop input bitmap to the exact captured region BEFORE Gaussian blur
+            // so stale pixels outside `[cap_w, cap_h]` NEVER bleed into glass edges!
+            let blur_input_img: ID2D1Image = if let Some(ref crop) = self.glass_crop_effect {
+                crop.SetInput(0, &src_bmp_owned, true);
+                let cb = rect_to_bytes(crop_bounds_dip);
+                let _ = crop.SetValue(
+                    D2D1_CROP_PROP_RECT.0 as u32,
+                    D2D1_PROPERTY_TYPE_VECTOR4,
+                    &cb,
+                );
+                crop.GetOutput()
+                    .unwrap_or_else(|_| src_bmp_owned.cast().unwrap())
+            } else {
+                src_bmp_owned.cast().unwrap()
             };
-            let dst_pt = D2D_POINT_2U { x: 0, y: 0 };
-            if cap_bmp
-                .CopyFromBitmap(Some(&dst_pt), &active_tgt, Some(&src_u))
-                .is_err()
-            {
-                return false;
-            }
 
             let sigma_core = (sigma * 0.72 * self.dpi_scale).clamp(3.2, 26.0);
-            blur.SetInput(0, cap_bmp, true);
+            blur.SetInput(0, &blur_input_img, true);
             let _ = blur.SetValue(
                 D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION.0 as u32,
                 D2D1_PROPERTY_TYPE_FLOAT,
@@ -2020,15 +2156,11 @@ impl D2DRenderer {
                 return false;
             };
 
-            let cap_ox = (px_l as f32) / self.dpi_scale;
-            let cap_oy = (px_t as f32) / self.dpi_scale;
-            let cap_dip_w = (cap_w as f32) / self.dpi_scale;
-            let cap_dip_h = (cap_h as f32) / self.dpi_scale;
             let src_full = D2D_RECT_F {
-                left: 0.0,
-                top: 0.0,
-                right: cap_dip_w,
-                bottom: cap_dip_h,
+                left: crop_bounds_dip[0],
+                top: crop_bounds_dip[1],
+                right: crop_bounds_dip[2],
+                bottom: crop_bounds_dip[3],
             };
             let rcx = rect.center_x();
             let rcy = rect.center_y();
@@ -2109,7 +2241,7 @@ impl D2DRenderer {
                             };
                             if built {
                                 let sigma_rim = (sigma * 0.24 * self.dpi_scale).clamp(1.2, 5.5);
-                                rim_blur.SetInput(0, cap_bmp, true);
+                                rim_blur.SetInput(0, &blur_input_img, true);
                                 let _ = rim_blur.SetValue(
                                     D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION.0 as u32,
                                     D2D1_PROPERTY_TYPE_FLOAT,
@@ -2188,9 +2320,11 @@ impl D2DRenderer {
             self.dc.PopLayer();
             let _ = std::mem::ManuallyDrop::into_inner(layer_params.geometricMask);
 
-            // Flush immediately so subsequent Liquid Glass elements in the same frame never overwrite
-            // `glass_capture_bmp` before GPU sampling of this panel completes!
-            let _ = self.dc.Flush(None, None);
+            // Only flush when using the mutable scratch `glass_capture_bmp`; when reading from the
+            // immutable per-frame snapshot, ZERO flushes are needed!
+            if !use_batch_snapshot {
+                let _ = self.dc.Flush(None, None);
+            }
             true
         }
     }
@@ -3219,6 +3353,10 @@ impl D2DRenderer {
             self.glass_capture_bmp = None;
             self.glass_cap_w = 0;
             self.glass_cap_h = 0;
+            self.glass_frame_snapshot = None;
+            self.glass_snap_w = 0;
+            self.glass_snap_h = 0;
+            self.glass_snapshot_active = false;
         }
         self.gpu_staging_dirty = true;
         self.trim_gpu_staging_if_dirty();
@@ -3241,6 +3379,7 @@ impl D2DRenderer {
         unsafe {
             for eff in [
                 &self.blur_effect,
+                &self.glass_crop_effect,
                 &self.glass_rim_blur_effect,
                 &self.glass_vibrancy_effect,
                 &self.glass_rim_vibrancy_effect,
@@ -5078,16 +5217,18 @@ impl D2DRenderer {
         let need_recreate = self
             .motion_textures
             .get(&frame.key)
-            .map(|(_, _, w, h, _)| *w != frame.width || *h != frame.height)
+            .map(|(_, _, w, h, _, _)| *w != frame.width || *h != frame.height)
             .unwrap_or(true);
 
+        let now_frame = self.frame_counter;
         if need_recreate {
-            if self.motion_textures.len() >= 4 {
+            if self.motion_textures.len() >= 16 {
                 if let Some(evict_k) = self
                     .motion_textures
-                    .keys()
-                    .find(|k| *k != &frame.key)
-                    .cloned()
+                    .iter()
+                    .filter(|(k, _)| *k != &frame.key)
+                    .min_by_key(|(_, v)| v.5)
+                    .map(|(k, _)| k.clone())
                 {
                     self.motion_textures.remove(&evict_k);
                 }
@@ -5124,11 +5265,14 @@ impl D2DRenderer {
                 };
                 self.motion_textures.insert(
                     frame.key.clone(),
-                    (bmp, bbrush, frame.width, frame.height, frame.frame_seq),
+                    (bmp, bbrush, frame.width, frame.height, frame.frame_seq, now_frame),
                 );
                 self.gpu_staging_dirty = true;
             }
-        } else if let Some((bmp, _, _, _, cached_seq)) = self.motion_textures.get_mut(&frame.key) {
+        } else if let Some((bmp, _, _, _, cached_seq, last_used)) =
+            self.motion_textures.get_mut(&frame.key)
+        {
+            *last_used = now_frame;
             if *cached_seq != frame.frame_seq {
                 unsafe {
                     let dst_u = D2D_RECT_U {
@@ -5147,7 +5291,7 @@ impl D2DRenderer {
             }
         }
 
-        let Some((_, bbrush, w, h, _)) = self.motion_textures.get(&frame.key) else {
+        let Some((_, bbrush, w, h, _, _)) = self.motion_textures.get(&frame.key) else {
             return false;
         };
         let fw = (*w as f32).max(1.0);

@@ -262,3 +262,119 @@ pub struct WebAmStatus {
     pub storefront: String,
     pub status_text: String,
 }
+
+/// Normalizes a song title or artist name for accurate cross-platform playlist transfer matching:
+/// lowercases ASCII, folds common CJK/fullwidth punctuation, strips parenthetical decorations like
+/// `(feat. ...)` / `（Live）`, and collapses whitespace.
+pub fn normalize_match_text(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut depth_paren = 0u32;
+    for ch in raw.chars() {
+        match ch {
+            '(' | '（' | '[' | '【' => {
+                depth_paren = depth_paren.saturating_add(1);
+                continue;
+            }
+            ')' | '）' | ']' | '】' => {
+                depth_paren = depth_paren.saturating_sub(1);
+                continue;
+            }
+            _ if depth_paren > 0 => continue,
+            _ => {}
+        }
+        let lower = ch.to_ascii_lowercase();
+        if lower.is_alphanumeric() || ('\u{4e00}'..='\u{9fff}').contains(&lower) || ('\u{3040}'..='\u{30ff}').contains(&lower) || ('\u{ac00}'..='\u{d7af}').contains(&lower) {
+            out.push(lower);
+        }
+    }
+    if out.is_empty() {
+        raw.trim().to_ascii_lowercase()
+    } else {
+        out
+    }
+}
+
+/// Scores how well a candidate track on a target platform matches a source track during
+/// cross-platform playlist transfer (`>= 0.55` is a solid match; higher is better).
+pub fn match_track_score(
+    src_title: &str,
+    src_artist: &str,
+    src_dur: f64,
+    cand_title: &str,
+    cand_artist: &str,
+    cand_dur: f64,
+) -> f32 {
+    let st = normalize_match_text(src_title);
+    let ct = normalize_match_text(cand_title);
+    if st.is_empty() || ct.is_empty() {
+        return 0.0;
+    }
+
+    let mut score = if st == ct {
+        0.65f32
+    } else if ct.contains(&st) || st.contains(&ct) {
+        let min_l = st.chars().count().min(ct.chars().count()) as f32;
+        let max_l = st.chars().count().max(ct.chars().count()).max(1) as f32;
+        0.42 + 0.18 * (min_l / max_l)
+    } else {
+        // Character overlap ratio
+        let st_chars: Vec<char> = st.chars().collect();
+        let ct_chars: Vec<char> = ct.chars().collect();
+        let hits = st_chars.iter().filter(|c| ct_chars.contains(c)).count() as f32;
+        let denom = st_chars.len().max(ct_chars.len()).max(1) as f32;
+        0.45 * (hits / denom)
+    };
+
+    let sa = normalize_match_text(src_artist);
+    let ca = normalize_match_text(cand_artist);
+    if !sa.is_empty() && !ca.is_empty() {
+        if sa == ca || ca.contains(&sa) || sa.contains(&ca) {
+            score += 0.28;
+        } else {
+            // Check individual artist tokens split by `/`, `,`, `&`, `、`
+            let src_parts: Vec<String> = src_artist
+                .split(&['/', ',', '&', '、', '，'][..])
+                .map(normalize_match_text)
+                .filter(|s| !s.is_empty())
+                .collect();
+            let cand_parts: Vec<String> = cand_artist
+                .split(&['/', ',', '&', '、', '，'][..])
+                .map(normalize_match_text)
+                .filter(|s| !s.is_empty())
+                .collect();
+            if src_parts
+                .iter()
+                .any(|sp| cand_parts.iter().any(|cp| cp == sp || cp.contains(sp) || sp.contains(cp)))
+            {
+                score += 0.24;
+            }
+        }
+    }
+
+    if src_dur > 10.0 && cand_dur > 10.0 {
+        let diff = (src_dur - cand_dur).abs();
+        if diff <= 3.5 {
+            score += 0.12;
+        } else if diff <= 8.0 {
+            score += 0.06;
+        } else if diff > 25.0 {
+            score -= 0.18;
+        }
+    }
+
+    // Penalize unwanted remix/live/cover/instrumental mismatches when source is studio version
+    let src_low = src_title.to_ascii_lowercase();
+    let cand_low = cand_title.to_ascii_lowercase();
+    for kw in ["dj", "remix", "伴奏", "instrumental", "karaoke", "翻唱", "cover"] {
+        if cand_low.contains(kw) && !src_low.contains(kw) {
+            score -= 0.25;
+        }
+    }
+    if (cand_low.contains("live") || cand_low.contains("现场"))
+        && !(src_low.contains("live") || src_low.contains("现场"))
+    {
+        score -= 0.12;
+    }
+
+    score.clamp(0.0, 1.15)
+}
