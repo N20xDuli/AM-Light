@@ -3793,4 +3793,162 @@ lo48.m3u8\n";
         assert_eq!(sui.search_query, "");
         assert_eq!(sui.search_cursor, 0);
     }
+
+    #[test]
+    fn test_v027_multi_backend_switching_cookies_flac_specs_and_live_apis() {
+        use am_light_lib::app_ui::{
+            get_active_playback_backend, AppSettings, AppUi, PageRoute, UiAction,
+        };
+        use am_light_lib::backends::{NetEaseQuality, PlaybackBackend, QQQuality};
+        use am_light_lib::native_player::{detect_audio_magic_ext, parse_flac_streaminfo};
+        use am_light_lib::netease_api;
+        use am_light_lib::qq_api;
+
+        // 1. Legacy AppSettings JSON backward compatibility: defaults cleanly to AppleMusicNative
+        let legacy: AppSettings =
+            serde_json::from_str(r#"{"storefront":"jp","use_builtin_service":true}"#)
+                .expect("legacy settings deserialize");
+        assert_eq!(legacy.playback_backend, PlaybackBackend::AppleMusicNative);
+        assert_eq!(legacy.netease_quality, NetEaseQuality::ExHigh);
+        assert_eq!(legacy.qq_quality, QQQuality::Mp3_320);
+
+        // 2. Roundtrip serialization of all 5 PlaybackBackend variants + headings & motion support
+        for &be in &PlaybackBackend::ALL {
+            let s = serde_json::to_string(&be).unwrap();
+            let back: PlaybackBackend = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, be);
+            assert!(!be.short_label().is_empty());
+            assert!(!be.display_name().is_empty());
+            assert!(!be.home_heading().is_empty());
+            assert!(!be.search_placeholder().is_empty());
+        }
+        assert!(PlaybackBackend::AppleMusicNative.supports_motion_artwork());
+        assert!(PlaybackBackend::AppleMusicWeb.supports_motion_artwork());
+        assert!(!PlaybackBackend::NetEase.supports_motion_artwork());
+        assert!(!PlaybackBackend::QQMusic.supports_motion_artwork());
+
+        // 3. UI backend switching updates settings, global active backend, clears stale caches cleanly
+        let mut ui = AppUi::new(0);
+        ui.execute_action(UiAction::SetPlaybackBackend(PlaybackBackend::NetEase));
+        assert_eq!(ui.settings.playback_backend, PlaybackBackend::NetEase);
+        assert_eq!(get_active_playback_backend(), PlaybackBackend::NetEase);
+        ui.execute_action(UiAction::SetNetEaseQuality(NetEaseQuality::HiRes));
+        assert_eq!(ui.settings.netease_quality, NetEaseQuality::HiRes);
+
+        ui.execute_action(UiAction::SetPlaybackBackend(PlaybackBackend::QQMusic));
+        assert_eq!(ui.settings.playback_backend, PlaybackBackend::QQMusic);
+        assert_eq!(get_active_playback_backend(), PlaybackBackend::QQMusic);
+        ui.execute_action(UiAction::SetQQQuality(QQQuality::Flac));
+        assert_eq!(ui.settings.qq_quality, QQQuality::Flac);
+
+        ui.execute_action(UiAction::SetPlaybackBackend(PlaybackBackend::AppleMusicWeb));
+        assert_eq!(ui.settings.playback_backend, PlaybackBackend::AppleMusicWeb);
+        assert_eq!(get_active_playback_backend(), PlaybackBackend::AppleMusicWeb);
+
+        ui.execute_action(UiAction::SetPlaybackBackend(PlaybackBackend::ExternalSmtc));
+        assert_eq!(ui.settings.playback_backend, PlaybackBackend::ExternalSmtc);
+
+        // Restore default AppleMusicNative so subsequent tests remain isolated
+        ui.execute_action(UiAction::SetPlaybackBackend(PlaybackBackend::AppleMusicNative));
+        assert_eq!(get_active_playback_backend(), PlaybackBackend::AppleMusicNative);
+
+        // 4. NetEase & QQ Cookie normalization / parsing & smart Settings paste routing
+        assert_eq!(
+            netease_api::normalize_netease_cookie("foo=1; MUSIC_U=abcdef123456; __csrf=xyz999; bar=2"),
+            "MUSIC_U=abcdef123456; __csrf=xyz999"
+        );
+        let (uin, keyst) =
+            qq_api::parse_qq_cookie_fields("pgv_pvid=1; uin=o012345678; qm_keyst=Q_H_L_5XYZ999; foo=bar");
+        assert_eq!(uin, "12345678");
+        assert_eq!(keyst, "Q_H_L_5XYZ999");
+
+        ui.route = PageRoute::Settings;
+        ui.settings.playback_backend = PlaybackBackend::NetEase;
+        assert!(ui.on_paste_text("MUSIC_U=test_token_value_1234567890"));
+        assert!(ui.settings.netease_cookie.contains("MUSIC_U=test_token_value_1234567890"));
+        ui.execute_action(UiAction::ClearNetEaseAuth);
+        assert!(ui.settings.netease_cookie.is_empty());
+
+        ui.settings.playback_backend = PlaybackBackend::QQMusic;
+        assert!(ui.on_paste_text("uin=o088887777; qm_keyst=Q_H_L_DEMO123"));
+        assert_eq!(ui.settings.qq_uin, "88887777");
+        ui.execute_action(UiAction::ClearQQAuth);
+        assert!(ui.settings.qq_cookie.is_empty());
+        ui.settings.playback_backend = PlaybackBackend::AppleMusicNative;
+
+        // 5. Native audio container magic detection & Hi-Res 24-bit/96kHz FLAC STREAMINFO parsing
+        assert_eq!(detect_audio_magic_ext(b"fLaC\x00\x00\x00\x22"), Some("flac"));
+        assert_eq!(detect_audio_magic_ext(b"\x00\x00\x00\x20ftypM4A "), Some("m4a"));
+        assert_eq!(detect_audio_magic_ext(b"ID3\x03\x00\x00"), Some("mp3"));
+
+        // Construct valid 42-byte FLAC header: sr=96000 (0x17700), ch=2 (ch-1=1), bps=24 (bps-1=23)
+        let mut flac_hdr = [0u8; 42];
+        flac_hdr[0..4].copy_from_slice(b"fLaC");
+        flac_hdr[4] = 0x00; // STREAMINFO block type 0
+        let sr: u32 = 96_000;
+        let ch_m1: u32 = 1; // 2 channels
+        let bps_m1: u32 = 23; // 24-bit
+        flac_hdr[18] = ((sr >> 12) & 0xFF) as u8;
+        flac_hdr[19] = ((sr >> 4) & 0xFF) as u8;
+        flac_hdr[20] = (((sr & 0x0F) << 4) | ((ch_m1 & 0x07) << 1) | ((bps_m1 >> 4) & 0x01)) as u8;
+        flac_hdr[21] = ((bps_m1 & 0x0F) << 4) as u8;
+        assert_eq!(parse_flac_streaminfo(&flac_hdr), Some((96_000, 2, 24)));
+
+        // 6. Live end-to-end verification of NetEase & QQ Music catalog, QR matrix, stream URL & lyrics
+        let rt = tokio::runtime::Runtime::new().expect("tokio rt");
+        rt.block_on(async {
+            // NetEase Home + Search + QR code matrix + Direct Stream URL + Direct YRC/LRC Lyrics
+            let ne_home = netease_api::fetch_home_and_browse(None)
+                .await
+                .expect("NetEase home fetch");
+            assert!(
+                !ne_home.shelves.is_empty() && !ne_home.songs.is_empty(),
+                "NetEase home shelves & songs must populate"
+            );
+            let qr = netease_api::start_qr_login()
+                .await
+                .expect("NetEase QR login key");
+            assert!(qr.qr_width >= 21 && qr.qr_modules.len() == qr.qr_width * qr.qr_width);
+
+            let ne_stream = netease_api::resolve_song_stream("ne:1973665667", NetEaseQuality::ExHigh, None)
+                .await
+                .expect("NetEase free track stream url");
+            assert!(ne_stream.url.starts_with("http"));
+
+            let ne_lyr = netease_api::fetch_lyrics_by_id("ne:1973665667", None).await;
+            assert!(
+                ne_lyr.as_ref().is_some_and(|l| !l.lines.is_empty()),
+                "NetEase direct song-id lyrics must resolve"
+            );
+
+            // QQ Music Home + Radio + Radio Tracks + Direct Stream URL + Direct LRC Lyrics
+            let qq_home = qq_api::fetch_home_and_browse(None)
+                .await
+                .expect("QQ Music home fetch");
+            assert!(
+                !qq_home.shelves.is_empty() && !qq_home.songs.is_empty(),
+                "QQ Music home shelves & songs must populate"
+            );
+            let (qq_rshelves, _) = qq_api::fetch_radio_shelves(None)
+                .await
+                .expect("QQ Music radio shelves");
+            assert!(!qq_rshelves.is_empty(), "QQ Music radio shelves must populate");
+
+            let qq_radio_tracks = qq_api::fetch_radio_tracks("199", None)
+                .await
+                .expect("QQ Music radio tracks");
+            assert!(!qq_radio_tracks.is_empty(), "QQ Music radio tracks must populate");
+
+            let qq_stream = qq_api::resolve_song_stream("qq:002lzYCa14usQ5", None, QQQuality::M4a, None)
+                .await
+                .expect("QQ Music free track vkey url");
+            assert!(qq_stream.url.starts_with("http"));
+
+            let qq_lyr = qq_api::fetch_lyrics_by_mid("qq:002lzYCa14usQ5", None).await;
+            assert!(
+                qq_lyr.as_ref().is_some_and(|l| !l.lines.is_empty()),
+                "QQ Music direct songmid lyrics must resolve"
+            );
+        });
+    }
 }

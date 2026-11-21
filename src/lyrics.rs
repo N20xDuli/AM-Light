@@ -2800,6 +2800,31 @@ pub async fn fetch_lyrics_with_pref_ex(
     // official Apple Music `/syllable-lyrics`, `AMLL`, or `NetEase YRC` word-by-word lyrics!
     let mut line_fallback: Option<ParsedLyrics> = None;
 
+    // Direct native-backend exact song ID fast-path (`ne:<id>` NetEase YRC / `qq:<mid>` QQ Music LRC)
+    if let Some(raw_aid) = adam_id.as_deref().map(str::trim) {
+        if raw_aid.starts_with("ne:") && matches!(pref, LyricsSourcePref::Auto | LyricsSourcePref::NetEase) {
+            if let Some(parsed) = crate::netease_api::fetch_lyrics_by_id(raw_aid, None).await {
+                if parsed.is_syllable_synced || pref == LyricsSourcePref::NetEase {
+                    if can_cache {
+                        put_cache_bounded(&key, Some(parsed.clone()));
+                    }
+                    return Some(parsed);
+                }
+                line_fallback = Some(parsed);
+            }
+        } else if raw_aid.starts_with("qq:") {
+            if let Some(parsed) = crate::qq_api::fetch_lyrics_by_mid(raw_aid, None).await {
+                if parsed.is_syllable_synced {
+                    if can_cache {
+                        put_cache_bounded(&key, Some(parsed.clone()));
+                    }
+                    return Some(parsed);
+                }
+                line_fallback = Some(parsed);
+            }
+        }
+    }
+
     // Resolve numeric catalog `adam_id` up front when missing (SMTC) or non-numeric (`i.xxxx` library ID)
     let numeric_aid: Option<String> = match adam_id
         .as_deref()

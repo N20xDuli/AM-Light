@@ -100,11 +100,19 @@ pub async fn fetch_artwork_bytes(url: &str, high_priority: bool) -> Result<Vec<u
         }
     }
 
+    let referer = if url.contains("126.net") || url.contains("163.com") {
+        "https://music.163.com/".to_string()
+    } else if url.contains("gtimg.cn") || url.contains("qq.com") {
+        "https://y.qq.com/".to_string()
+    } else {
+        format!("{WEB_ORIGIN}/")
+    };
+
     for attempt in 0..2 {
         let res = HTTP_CLIENT
             .get(url)
             .timeout(Duration::from_secs(8))
-            .header("Referer", format!("{WEB_ORIGIN}/"))
+            .header("Referer", &referer)
             .send()
             .await;
         match res {

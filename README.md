@@ -26,10 +26,10 @@ AM Light 通过对接微软商店版官方 Apple Music 的本地后台播放服�
   https://github.com/N20xDuli/apple-music-windows-drm-fix
 
 ### 第二步：安装与启动 AM Light
-1. 前往 [GitHub Releases](https://github.com/N20xDuli/AM-Light/releases) 下载最新的 Windows 安装包（如 `AM-Light-Setup-v0.2.6-x64.exe`）并运行安装。
-   - 支持静默安装：`AM-Light-Setup-v0.2.6-x64.exe --silent [--dir="C:\Path\To\AM-Light"]`
+1. 前往 [GitHub Releases](https://github.com/N20xDuli/AM-Light/releases) 下载最新的 Windows 安装包（如 `AM-Light-Setup-v0.2.7-x64.exe`）并运行安装。
+   - 支持静默安装：`AM-Light-Setup-v0.2.7-x64.exe --silent [--dir="C:\Path\To\AM-Light"]`
    - 卸载方式：通过系统「已安装的应用」或安装目录下的 `Uninstall-AM-Light.exe` 卸载。
-2. 启动 AM Light，在首页浏览或搜索歌曲，软件会自动连接本地 Apple Music 播放服务（亦可在设置中切换控制原版客户端）。
+2. 启动 AM Light，在首页浏览或搜索歌曲，软件默认连接本地 Apple Music 播放服务；也可在 **「设置 -> 播放后端与音乐源」** 一键切换为 **Apple Music 网页版**、**网易云音乐**、**QQ 音乐** 或 **外置 SMTC**。
 
 ### 第三步：同步个人云端歌单与资料库（可选）
 若需浏览个人资料库、同步自建歌单与最近添加：
@@ -42,6 +42,7 @@ AM Light 通过对接微软商店版官方 Apple Music 的本地后台播放服�
 
 ## 核心特性
 
+- **多播放后端一键切换**：在「设置 -> 播放后端与音乐源」支持切换 **Apple Music 原生**、**Apple Music 网页版（Edge MusicKit JS，免装微软商店客户端）**、**网易云音乐（内置二维码扫码登录 + YRC 逐字歌词）**、**QQ 音乐（巅峰榜/电台 + Cookie 高音质与自动降级）** 及 **外置 SMTC 接管**，主页、新发现、电台、搜索与资料库自动随当前后端切换联动。
 - **原生 Direct2D / DirectComposition UI**：无边框可调圆角窗口（`0..28 px`）、平滑窗口拖拽缩放/最大化与还原自适应、平滑弹簧侧栏与惯性滚动、可选液态玻璃控件质感（默认关闭）。
 - **逐字/逐词亚像素歌词系统**：支持 TTML / YRC / LRC 格式，支持 `DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC` + 亚像素定位平滑上浮、象形文字逐字与西文按词（可在设置切换）精准动效、强调段落高亮放大、间奏纯音乐自动居中与双通道 GPU 高斯景深模糊。
 - **音频可视化与信号分析**：基于 WASAPI Loopback 的实时频谱、音质鉴真检测、声场散点图（带荧光视觉暂留）、高密度反应堆芯视图与多频段 Onset 节拍锁定圆环。
@@ -63,12 +64,12 @@ AM Light 通过对接微软商店版官方 Apple Music 的本地后台播放服�
 
 ```powershell
 # 运行单元测试（Release）
-cargo test --release --bin AM-Light
+cargo test --release --bin AM-Light -- --test-threads=1
 
 # 构建主程序
 cargo build --release
 
-# 打包 Windows 安装器（输出至 dist\AM-Light-Setup-v0.2.6-x64.exe）
+# 打包 Windows 安装器（输出至 dist\AM-Light-Setup-v0.2.7-x64.exe）
 $env:AM_LIGHT_BIN_PATH = "target\release\AM-Light.exe"
 cargo build --release --manifest-path installer\Cargo.toml
 ```

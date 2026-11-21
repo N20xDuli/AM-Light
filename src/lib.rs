@@ -1,12 +1,15 @@
 pub mod am_agent;
 pub mod am_api;
 pub mod audio_viz;
+pub mod backends;
 pub mod binaural_dsp;
 pub mod bplist;
 pub mod downloads;
 pub mod drm_fix;
 pub mod lyrics;
 pub mod motion_art;
+pub mod netease_api;
+pub mod qq_api;
 pub mod smtc;
 pub mod theme;
 
@@ -17,7 +20,11 @@ pub mod d2d_renderer;
 #[cfg(target_os = "windows")]
 pub mod lyrics_view;
 #[cfg(target_os = "windows")]
+pub mod native_player;
+#[cfg(target_os = "windows")]
 pub mod visualizers;
+#[cfg(target_os = "windows")]
+pub mod web_am_player;
 
 #[cfg(target_os = "windows")]
 mod win_app {
@@ -848,6 +855,8 @@ mod win_app {
             }
 
             WM_DESTROY => {
+                crate::native_player::stop_and_clear();
+                crate::web_am_player::shutdown();
                 WIN_CTX.with(|cell| {
                     if let Ok(borrow) = cell.try_borrow() {
                         if let Some(ctx) = borrow.as_ref() {
