@@ -115,6 +115,23 @@ pub fn set_wake_hwnd(hwnd: usize) {
     WAKE_HWND.store(hwnd, Ordering::Release);
 }
 
+/// Seeds the persistent user volume into the native MF+WASAPI player (NetEase / QQ Music)
+/// so startup and backend switches preserve the exact volume chosen by the user.
+pub fn set_saved_volume(vol: f64) {
+    let v = if vol.is_finite() {
+        vol.clamp(0.0, 1.0)
+    } else {
+        0.75
+    };
+    if let Ok(mut g) = PLAYER.lock() {
+        g.volume = v;
+    }
+}
+
+pub fn get_saved_volume() -> f64 {
+    PLAYER.lock().map(|g| g.volume).unwrap_or(0.75)
+}
+
 fn wake_ui() {
     NATIVE_STATE_SEQ.fetch_add(1, Ordering::AcqRel);
     let h = WAKE_HWND.load(Ordering::Acquire);

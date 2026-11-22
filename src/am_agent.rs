@@ -77,6 +77,23 @@ pub fn get_active_storefront() -> String {
         .unwrap_or_else(|_| "cn".to_string())
 }
 
+/// Seeds the persistent user volume into `am_agent` so connecting to `AMPLibraryAgent`
+/// restores the user's saved volume instead of resetting to 75%.
+pub fn set_saved_volume(vol: f64) {
+    let v = if vol.is_finite() {
+        vol.clamp(0.0, 1.0)
+    } else {
+        0.75
+    };
+    if let Ok(mut snap) = SHARED.write() {
+        snap.volume = v;
+    }
+}
+
+pub fn get_saved_volume() -> f64 {
+    SHARED.read().map(|s| s.volume).unwrap_or(0.75)
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentTrackInput {

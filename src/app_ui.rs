@@ -11,6 +11,7 @@ use crate::binaural_dsp::{self, BinauralConfig, BinauralStatus};
 use crate::d2d_renderer::{D2DRenderer, GlassBtnVariant, SfIcon, TextAlign};
 use crate::downloads::{self, DownloadsOverview};
 use crate::drm_fix::{self, DrmDiagReport};
+use crate::i18n::{self, AppLanguage};
 use crate::lyrics::{self, NonEmphasisLyricsEffect, ParsedLyrics};
 use crate::lyrics_view::{LyricsHitAction, LyricsViewState};
 use crate::motion_art::MotionArtManager;
@@ -74,6 +75,14 @@ fn sync_backend_runtime_globals(s: &AppSettings) {
     if let Ok(mut g) = ACTIVE_QQ_QUALITY.write() {
         *g = s.qq_quality;
     }
+    let vol = if s.playback_volume.is_finite() {
+        s.playback_volume.clamp(0.0, 1.0)
+    } else {
+        0.75
+    };
+    am_agent::set_saved_volume(vol);
+    native_player::set_saved_volume(vol);
+    web_am_player::set_saved_volume(vol);
 }
 
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -253,6 +262,10 @@ fn default_vsync_cap() -> FpsCap {
     FpsCap::VSync
 }
 
+fn default_playback_volume() -> f64 {
+    0.75
+}
+
 pub const TOP_BAR_GUARD_H: f32 = 58.0;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -320,6 +333,10 @@ pub struct AppSettings {
     pub lyrics_free_blur: bool,
     #[serde(default)]
     pub lyrics_immersive_mode: bool,
+    #[serde(default)]
+    pub language: AppLanguage,
+    #[serde(default = "default_playback_volume")]
+    pub playback_volume: f64,
     pub hidden_sidebar_keys: Vec<String>,
 }
 
@@ -363,6 +380,8 @@ impl Default for AppSettings {
             reduce_transparency: false,
             lyrics_free_blur: false,
             lyrics_immersive_mode: false,
+            language: AppLanguage::Auto,
+            playback_volume: default_playback_volume(),
             hidden_sidebar_keys: Vec::new(),
         }
     }
@@ -423,6 +442,11 @@ impl AppSettings {
         s.window_corner_radius = s.window_corner_radius.clamp(0.0, 28.0);
         s.viz_custom_fps = s.viz_custom_fps.clamp(30, 360);
         s.lyrics_custom_fps = s.lyrics_custom_fps.clamp(30, 360);
+        s.playback_volume = if s.playback_volume.is_finite() {
+            s.playback_volume.clamp(0.0, 1.0)
+        } else {
+            default_playback_volume()
+        };
         let official = am_api::detect_official_am_account();
         let mut dirty = false;
 
@@ -456,6 +480,7 @@ impl AppSettings {
         }
 
         am_agent::set_active_storefront(&s.storefront);
+        i18n::set_active_language(s.language);
         sync_backend_runtime_globals(&s);
         if dirty {
             s.save();
@@ -469,6 +494,7 @@ impl AppSettings {
 
     pub fn save(&self) {
         am_agent::set_active_storefront(&self.storefront);
+        i18n::set_active_language(self.language);
         sync_backend_runtime_globals(self);
         if let Ok(txt) = serde_json::to_string_pretty(self) {
             for p in Self::config_paths() {
@@ -786,6 +812,7 @@ pub enum UiAction {
     RevealDownload(String),
     DeleteDownload(String),
     // Settings actions
+    SetAppLanguage(AppLanguage),
     SetPlaybackBackend(PlaybackBackend),
     StartWebAmLogin,
     ToggleWebAmWindow,
@@ -1419,6 +1446,7 @@ impl AppUi {
                 "未配置 QQ 音乐 Cookie（游客模式可浏览全站并播放免费曲目）".to_string()
             },
         };
+        let init_volume = settings.playback_volume.clamp(0.0, 1.0);
         let mut ui = Self {
             settings,
             rt,
@@ -1479,7 +1507,10 @@ impl AppUi {
             detail_loading: false,
             downloads_info: DownloadsOverview::default(),
             downloads_paused: false,
-            smtc: SmtcState::default(),
+            smtc: SmtcState {
+                volume: Some(init_volume),
+                ..Default::default()
+            },
             agent_status: AgentStatus::default(),
             audio_prefs: AudioPrefs::default(),
             devices: Vec::new(),
@@ -3240,6 +3271,8 @@ impl AppUi {
             Some(ActiveDrag::LyricsVolume(_) | ActiveDrag::PopoverVolume(_))
         ) {
             st.volume = self.smtc.volume;
+        } else if st.volume.is_none() {
+            st.volume = Some(self.settings.playback_volume.clamp(0.0, 1.0));
         }
 
         self.smtc = st;
@@ -3427,14 +3460,29 @@ impl AppUi {
             PlaybackBackend::ExternalSmtc => {}
         }
 
+        let saved_vol = self.settings.playback_volume.clamp(0.0, 1.0);
         self.settings.playback_backend = next;
-        self.settings.save();
+        sync_backend_runtime_globals(&self.settings);
+        if self.wake_hwnd != 0 {
+            self.settings.save();
+        }
+        am_agent::set_saved_volume(saved_vol);
+        native_player::set_saved_volume(saved_vol);
+        web_am_player::set_saved_volume(saved_vol);
+        if next == PlaybackBackend::AppleMusicWeb && web_am_player::get_status().running {
+            self.rt.spawn(async move {
+                let _ = web_am_player::control("volume", Some(saved_vol)).await;
+            });
+        }
         self.netease_qr = None;
         self.playback_loading = false;
         self.playback_loading_started = None;
         self.playback_loading_track_id = None;
         self.playback_loading_container_id = None;
-        self.smtc = SmtcState::default();
+        self.smtc = SmtcState {
+            volume: Some(saved_vol),
+            ..Default::default()
+        };
         self.playhead_anchor_sec = 0.0;
         self.playhead_anchor_inst = Instant::now();
         self.smtc_optimistic_seek = None;
@@ -5710,10 +5758,14 @@ impl AppUi {
             }
             ActiveDrag::LyricsVolume(bar) | ActiveDrag::PopoverVolume(bar) => {
                 let ratio = ((x - bar.x) / bar.w.max(1.0)).clamp(0.0, 1.0) as f64;
+                self.settings.playback_volume = ratio;
                 self.smtc.volume = Some(ratio);
                 if send_now {
                     self.last_drag_ipc = Instant::now();
                     self.execute_action(UiAction::SetVolumeRatio(ratio));
+                }
+                if commit && self.wake_hwnd != 0 {
+                    self.settings.save();
                 }
             }
             ActiveDrag::BinauralWidth(bar) => {
@@ -6418,8 +6470,23 @@ impl AppUi {
                 }
             }
             UiAction::SetVolumeRatio(vol) => {
-                let v = vol.clamp(0.0, 1.0);
+                let v = if vol.is_finite() {
+                    vol.clamp(0.0, 1.0)
+                } else {
+                    self.settings.playback_volume.clamp(0.0, 1.0)
+                };
+                self.settings.playback_volume = v;
                 self.smtc.volume = Some(v);
+                am_agent::set_saved_volume(v);
+                native_player::set_saved_volume(v);
+                web_am_player::set_saved_volume(v);
+                let dragging_vol = matches!(
+                    self.active_drag,
+                    Some(ActiveDrag::LyricsVolume(_) | ActiveDrag::PopoverVolume(_))
+                );
+                if self.wake_hwnd != 0 && !dragging_vol {
+                    self.settings.save();
+                }
                 let backend = self.settings.playback_backend;
                 let tx = self.tx.clone();
                 let hwnd = self.wake_hwnd;
@@ -7145,6 +7212,24 @@ impl AppUi {
                     },
                     false,
                 );
+            }
+            UiAction::SetAppLanguage(lang) => {
+                self.settings.language = lang;
+                i18n::set_active_language(lang);
+                if self.wake_hwnd != 0 {
+                    self.settings.save();
+                    if self.settings.playback_backend.is_apple_music() {
+                        // Invalidate cached localized Apple Music editorial shelves so next visit refetches in new locale
+                        self.home_shelves.clear();
+                        self.radio_shelves.clear();
+                    }
+                }
+                let lbl = if lang == AppLanguage::Auto {
+                    "跟随系统"
+                } else {
+                    lang.autonym()
+                };
+                self.set_banner(format!("界面语言已切换为：{lbl}"), false);
             }
             UiAction::OpenTrackContextMenu { track, anchor } => {
                 self.show_more_popover = false;
@@ -13131,6 +13216,72 @@ impl AppUi {
         );
         y += 118.0;
 
+        // --- Group 0.5: 界面语言 / Language (Auto + 5 UI Languages, instant no-restart switch) ---
+        r.draw_text(
+            "界面语言",
+            RectF::new(x0 + 4.0, y, cw, 22.0),
+            13.0,
+            600,
+            Theme::TEXT_MUTED,
+            TextAlign::Left,
+            true,
+            false,
+        );
+        y += 26.0;
+
+        let g_lang = RectF::new(x0, y, cw, 92.0);
+        r.fill_rounded_rect(g_lang, 14.0, Theme::BG_ELEVATED);
+        r.stroke_rounded_rect(g_lang, 14.0, Theme::SEPARATOR, 1.0);
+
+        let lang_gap = 8.0f32;
+        let lang_w = (cw - 36.0 - lang_gap * 5.0) / 6.0;
+        let mut lx = x0 + 18.0;
+        for &lang in &AppLanguage::ALL {
+            let sel = self.settings.language == lang;
+            let lr = RectF::new(lx, y + 14.0, lang_w, 32.0);
+            let lhov = self.mouse_pos.1 >= TOP_BAR_GUARD_H
+                && lr.contains(self.mouse_pos.0, self.mouse_pos.1);
+            r.draw_liquid_glass_button(
+                lr,
+                9.0,
+                if sel {
+                    GlassBtnVariant::Tinted(active_be.accent_color())
+                } else {
+                    GlassBtnVariant::Regular
+                },
+                lhov,
+                self.mouse_down,
+                self.mouse_pos,
+                self.glass_off(),
+            );
+            r.draw_text(
+                lang.autonym(),
+                lr.inset(4.0, 0.0),
+                12.2,
+                if sel || lhov { 600 } else { 500 },
+                Theme::TEXT_PRIMARY,
+                TextAlign::Center,
+                true,
+                false,
+            );
+            self.hit_regions.push(HitRegion {
+                rect: lr,
+                action: UiAction::SetAppLanguage(lang),
+            });
+            lx += lang_w + lang_gap;
+        }
+        r.draw_text(
+            "跟随系统自动识别语言，或手动切换界面显示语言（立即生效）",
+            RectF::new(x0 + 18.0, y + 54.0, cw - 36.0, 26.0),
+            11.8,
+            400,
+            Theme::TEXT_SECONDARY,
+            TextAlign::Left,
+            true,
+            false,
+        );
+        y += 112.0;
+
         // --- Backend-Adaptive Group 1: Web Apple Music / NetEase / QQ Music / External SMTC ---
         match active_be {
             PlaybackBackend::AppleMusicWeb => {
@@ -15564,7 +15715,11 @@ impl AppUi {
             self.glass_off(),
         );
 
-        let vol = self.smtc.volume.unwrap_or(0.75).clamp(0.0, 1.0) as f32;
+        let vol = self
+            .smtc
+            .volume
+            .unwrap_or(self.settings.playback_volume)
+            .clamp(0.0, 1.0) as f32;
         r.draw_text(
             &format!("播放音量  {:.0}%", vol * 100.0),
             RectF::new(pop.x + 16.0, pop.y + 14.0, pop.w - 32.0, 20.0),

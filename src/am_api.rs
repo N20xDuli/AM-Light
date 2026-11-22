@@ -2226,12 +2226,13 @@ pub async fn fetch_home_editorial_shelves(
         .filter(|s| !s.is_empty());
 
     let mut shelves: Vec<EditorialShelf> = Vec::new();
+    let loc = crate::i18n::am_api_locale();
 
     if let Some(ref tok) = utok {
         // Official Apple Music Personalized Home: Recommendations (up to 20 groups: Top Picks, Mixes,
         // Recently Played, New Releases, Stations / Personal Station, Mood Stations) + Recent Played!
-        let rec_path = "v1/me/recommendations?l=zh-Hans-CN&limit=20&extend=editorialVideo&extend%5Balbums%5D=editorialVideo&extend%5Bplaylists%5D=editorialVideo&extend%5Bstations%5D=editorialVideo".to_string();
-        let recent_path = "v1/me/recent/played?l=zh-Hans-CN&limit=12&extend=editorialVideo&extend%5Balbums%5D=editorialVideo&extend%5Bplaylists%5D=editorialVideo&extend%5Bstations%5D=editorialVideo".to_string();
+        let rec_path = format!("v1/me/recommendations?l={loc}&limit=20&extend=editorialVideo&extend%5Balbums%5D=editorialVideo&extend%5Bplaylists%5D=editorialVideo&extend%5Bstations%5D=editorialVideo");
+        let recent_path = format!("v1/me/recent/played?l={loc}&limit=12&extend=editorialVideo&extend%5Balbums%5D=editorialVideo&extend%5Bplaylists%5D=editorialVideo&extend%5Bstations%5D=editorialVideo");
         let tok1 = tok.clone();
         let sf1 = sf.to_string();
         let rec_task = tokio::spawn(async move {
@@ -2396,7 +2397,7 @@ pub async fn fetch_home_editorial_shelves(
     // Fallback (signed out or empty recommendations): official Charts + Spotlight
     if shelves.is_empty() {
         let charts_path = format!(
-            "v1/catalog/{sf}/charts?types=albums,playlists,songs&extend=editorialVideo,editorialArtwork,editorialNotes,audioTraits&limit=18&l=zh-Hans-CN"
+            "v1/catalog/{sf}/charts?types=albums,playlists,songs&extend=editorialVideo,editorialArtwork,editorialNotes,audioTraits&limit=18&l={loc}"
         );
         if let Ok(cj) = fetch_am_api(charts_path, utok.clone(), None, Some(sf.to_string())).await {
             let mut picks: Vec<EditorialItem> = Vec::new();
@@ -2512,12 +2513,14 @@ pub async fn fetch_official_radio_shelves(
     let mut shelves: Vec<EditorialShelf> = Vec::new();
 
     // 1. Personal / Recent / Recommended Stations (all format="tracks" -> instant lossless playback!)
+    let loc = crate::i18n::am_api_locale();
     if utok.is_some() {
         let sf_r = sf.to_string();
         let ut_r = utok.clone();
+        let rec_recent_path = format!("v1/me/recent/radio-stations?limit=12&l={loc}");
         let recent_handle = tokio::spawn(async move {
             fetch_am_api(
-                "v1/me/recent/radio-stations?limit=12&l=zh-Hans-CN".to_string(),
+                rec_recent_path,
                 ut_r,
                 None,
                 Some(sf_r),
@@ -2525,7 +2528,7 @@ pub async fn fetch_official_radio_shelves(
             .await
         });
         let rec_res = fetch_am_api(
-            "v1/me/recommendations?limit=15&l=zh-Hans-CN".to_string(),
+            format!("v1/me/recommendations?limit=15&l={loc}"),
             utok.clone(),
             None,
             Some(sf.to_string()),
@@ -2601,7 +2604,7 @@ pub async fn fetch_official_radio_shelves(
     let mut live_items: Vec<EditorialItem> = Vec::new();
     for live_sf in [sf, "jp", "us"] {
         let p = format!(
-            "v1/catalog/{live_sf}/stations?filter[featured]=apple-music-live-radio&l=zh-Hans-CN"
+            "v1/catalog/{live_sf}/stations?filter[featured]=apple-music-live-radio&l={loc}"
         );
         if let Ok(lj) = fetch_am_api(p, utok.clone(), None, Some(live_sf.to_string())).await {
             if let Some(arr) = lj.get("data").and_then(Value::as_array) {
@@ -2643,7 +2646,7 @@ pub async fn fetch_official_radio_shelves(
     // 3. Official Station Genres & their track-based algorithmic stations (all support next-tracks!)
     let mut genres: Vec<(String, String, String)> = Vec::new();
     for g_sf in [sf, "jp", "us"] {
-        let gp = format!("v1/catalog/{g_sf}/station-genres?limit=8&l=zh-Hans-CN");
+        let gp = format!("v1/catalog/{g_sf}/station-genres?limit=8&l={loc}");
         if let Ok(gj) = fetch_am_api(gp, utok.clone(), None, Some(g_sf.to_string())).await {
             if let Some(arr) = gj.get("data").and_then(Value::as_array) {
                 for g in arr.iter().take(4) {
@@ -2668,7 +2671,7 @@ pub async fn fetch_official_radio_shelves(
     for (g_sf, gid, gname) in genres {
         let ut = utok.clone();
         genre_futs.push(async move {
-            let sp = format!("v1/catalog/{g_sf}/station-genres/{gid}/stations?limit=12&l=zh-Hans-CN");
+            let sp = format!("v1/catalog/{g_sf}/station-genres/{gid}/stations?limit=12&l={loc}");
             let json = fetch_am_api(sp, ut, None, Some(g_sf.clone())).await.ok()?;
             let arr = json.get("data").and_then(Value::as_array)?;
             let mut items = Vec::new();

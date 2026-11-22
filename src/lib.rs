@@ -6,6 +6,7 @@ pub mod binaural_dsp;
 pub mod bplist;
 pub mod downloads;
 pub mod drm_fix;
+pub mod i18n;
 pub mod lyrics;
 pub mod motion_art;
 pub mod netease_api;

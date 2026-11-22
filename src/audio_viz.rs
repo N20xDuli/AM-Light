@@ -4195,3 +4195,109 @@ pub use win::{
     ensure_loopback_worker, is_default_endpoint_spatial_ready, list_output_devices,
     set_output_device, wake_registered_ui_window,
 };
+
+#[doc(hidden)]
+pub fn feed_synthetic_stereo_for_capture(
+    device_name: &str,
+    sample_rate: u32,
+    bit_depth: u16,
+    pcm_lr: &[[f32; 2]],
+    accum: &mut ForensicAccumulator,
+) {
+    let mut sum_sq = 0.0f32;
+    let mut peak_l = 0.0f32;
+    let mut peak_r = 0.0f32;
+    let mut sum_l2 = 0.0f32;
+    let mut sum_r2 = 0.0f32;
+    let mut sum_lr = 0.0f32;
+    let mut sum_mid2 = 0.0f32;
+    let mut sum_side2 = 0.0f32;
+    for &[l, r] in pcm_lr {
+        let m = 0.5 * (l + r);
+        let s = 0.5 * (l - r);
+        sum_sq += 0.5 * (l * l + r * r);
+        peak_l = peak_l.max(l.abs());
+        peak_r = peak_r.max(r.abs());
+        sum_l2 += l * l;
+        sum_r2 += r * r;
+        sum_lr += l * r;
+        sum_mid2 += m * m;
+        sum_side2 += s * s;
+    }
+
+    let mut mono_tail = Vec::new();
+    if let Ok(mut rs) = RING_STATE.write() {
+        rs.active_signal = true;
+        rs.device_id = "demo-dac".to_string();
+        rs.device_name = device_name.to_string();
+        rs.sample_rate = sample_rate;
+        rs.bit_depth = bit_depth;
+        rs.channels = 2;
+        for &lr in pcm_lr {
+            let wp = rs.write_pos;
+            rs.stereo[wp] = lr;
+            rs.write_pos = (wp + 1) & RING_MASK;
+        }
+        let n = pcm_lr.len().max(1) as f32;
+        let rms = (sum_sq / n).sqrt();
+        let dl = (20.0 * peak_l.max(1.58e-5).log10()).clamp(-96.0, 0.0);
+        let dr = (20.0 * peak_r.max(1.58e-5).log10()).clamp(-96.0, 0.0);
+        let drms = (20.0 * rms.max(1.58e-5).log10()).clamp(-96.0, 0.0);
+        let crest = (dl.max(dr) - drms).max(0.0);
+        let denom = (sum_l2 * sum_r2).sqrt();
+        let corr = if denom > 1e-9 { (sum_lr / denom).clamp(-1.0, 1.0) } else { 1.0 };
+        let tot_ms = sum_mid2 + sum_side2;
+        let width = if tot_ms > 1e-9 {
+            ((sum_side2 / tot_ms).sqrt() * 140.0).clamp(0.0, 100.0)
+        } else {
+            0.0
+        };
+        rs.peak_db_l = dl;
+        rs.peak_db_r = dr;
+        rs.rms_db = drms;
+        rs.dynamic_range_db = crest;
+        rs.phase_correlation = corr;
+        rs.stereo_width_pct = width;
+
+        let flen = accum.fft_len();
+        mono_tail.resize(flen, 0.0);
+        let start = (rs.write_pos + RING_LEN - flen) & RING_MASK;
+        for i in 0..flen {
+            let lr = rs.stereo[(start + i) & RING_MASK];
+            mono_tail[i] = 0.5 * (lr[0] + lr[1]);
+        }
+    }
+
+    if !mono_tail.is_empty() {
+        let (inst_spec, inst_cut) = accum.process_fft_window(&mono_tail);
+        let (
+            tier_code,
+            verdict_title,
+            estimated_bitrate,
+            confidence_pct,
+            forensic_notes,
+            cutoff_hz,
+            brickwall_drop_db,
+            has_brickwall_cut,
+        ) = accum.evaluate_verdict();
+        if let Ok(mut fs) = FORENSIC_SUMMARY.write() {
+            fs.inst_spectrum_db = inst_spec;
+            fs.peak_envelope_db = accum.peak_env_db.clone();
+            fs.inst_spectrum_low24_db = accum.smooth_inst_low24_db.clone();
+            fs.peak_envelope_low24_db = accum.peak_env_low24_db.clone();
+            fs.tier_code = tier_code;
+            fs.verdict_title = verdict_title;
+            fs.estimated_bitrate = estimated_bitrate;
+            fs.confidence_pct = confidence_pct;
+            fs.forensic_notes = forensic_notes;
+            fs.cutoff_hz = cutoff_hz;
+            fs.inst_cutoff_hz = inst_cut;
+            fs.brickwall_drop_db = brickwall_drop_db;
+            fs.has_brickwall_cut = has_brickwall_cut;
+            fs.mdct_hole_pct = (accum.mdct_hole_ema * 10.0).round() / 10.0;
+            fs.detected_bit_grid = "24-bit 实测".to_string();
+            fs.clip_count = 0;
+            fs.analyzed_frames = accum.analyzed_frames;
+        }
+    }
+}

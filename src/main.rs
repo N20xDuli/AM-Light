@@ -4201,4 +4201,588 @@ lo48.m3u8\n";
             }
         });
     }
+
+    #[test]
+    fn test_i18n_languages_autonyms_templates_and_metadata_safety() {
+        use am_light_lib::app_ui::{AppSettings, AppUi, UiAction};
+        use am_light_lib::i18n::{
+            active_resolved_language, map_win32_langid, set_active_language, translate_ui_text_for,
+            AppLanguage, ResolvedLang,
+        };
+
+        // 1. Win32 LANGID mapping across all 5 locales + English fallback
+        assert_eq!(map_win32_langid(0x0804), ResolvedLang::ZhCn); // zh-CN
+        assert_eq!(map_win32_langid(0x1004), ResolvedLang::ZhCn); // zh-SG
+        assert_eq!(map_win32_langid(0x0404), ResolvedLang::ZhTw); // zh-TW
+        assert_eq!(map_win32_langid(0x0C04), ResolvedLang::ZhTw); // zh-HK
+        assert_eq!(map_win32_langid(0x0409), ResolvedLang::En); // en-US
+        assert_eq!(map_win32_langid(0x0411), ResolvedLang::Ja); // ja-JP
+        assert_eq!(map_win32_langid(0x0412), ResolvedLang::Ko); // ko-KR
+        assert_eq!(map_win32_langid(0x040C), ResolvedLang::En); // fr-FR -> En fallback
+
+        // 2. Native autonyms never get translated away (users can always switch back)
+        for &lang in &[ResolvedLang::ZhTw, ResolvedLang::En, ResolvedLang::Ja, ResolvedLang::Ko] {
+            for &app_lang in &AppLanguage::ALL {
+                let auto_lbl = app_lang.autonym();
+                assert_eq!(
+                    translate_ui_text_for(auto_lbl, lang).as_ref(),
+                    auto_lbl,
+                    "autonym {auto_lbl} must stay invariant under {lang:?}"
+                );
+            }
+        }
+
+        // 3. Exact UI dictionary & parameterized templates across all 4 non-ZhCn locales
+        assert_eq!(translate_ui_text_for("设置", ResolvedLang::En), "Settings");
+        assert_eq!(translate_ui_text_for("设置", ResolvedLang::ZhTw), "設定");
+        assert_eq!(translate_ui_text_for("设置", ResolvedLang::Ja), "設定");
+        assert_eq!(translate_ui_text_for("设置", ResolvedLang::Ko), "설정");
+        assert_eq!(
+            translate_ui_text_for("待播清单 (12)", ResolvedLang::En),
+            "Up Next (12)"
+        );
+        assert_eq!(
+            translate_ui_text_for("前往艺人 · 周杰伦", ResolvedLang::En),
+            "Go to Artist · 周杰伦"
+        );
+        assert_eq!(
+            translate_ui_text_for("前往艺人 · 周杰伦", ResolvedLang::Ja),
+            "アーティストへ · 周杰伦"
+        );
+        assert_eq!(
+            translate_ui_text_for("当前屏幕 144 Hz · 目标刷新率：自适应 72Hz", ResolvedLang::En),
+            "Display 144 Hz · Target: Adaptive 72Hz"
+        );
+        assert_eq!(
+            translate_ui_text_for("源歌单：「深夜电台」 · 共 25 首歌曲", ResolvedLang::En),
+            "Source: \"深夜电台\" · 25 tracks"
+        );
+        assert_eq!(
+            translate_ui_text_for("界面语言已切换为：English", ResolvedLang::En),
+            "Language switched to: English"
+        );
+
+        // 4. User media metadata safety: Chinese song titles, artist names, album titles stay untouched!
+        for sample in ["晴天", "周杰伦", "七里香", "夜曲", "突然好想你", "Bohemian Rhapsody"] {
+            for &lang in &[
+                ResolvedLang::ZhCn,
+                ResolvedLang::ZhTw,
+                ResolvedLang::En,
+                ResolvedLang::Ja,
+                ResolvedLang::Ko,
+            ] {
+                assert_eq!(
+                    translate_ui_text_for(sample, lang).as_ref(),
+                    sample,
+                    "media metadata '{sample}' must NEVER be altered under {lang:?}"
+                );
+            }
+        }
+
+        // 5. Settings serialization & UiAction::SetAppLanguage immediate live switch
+        let parsed: AppSettings = serde_json::from_str(r#"{"language":"Ja"}"#).expect("serde lang");
+        assert_eq!(parsed.language, AppLanguage::Ja);
+
+        let mut ui = AppUi::new(0);
+        ui.execute_action(UiAction::SetAppLanguage(AppLanguage::En));
+        assert_eq!(ui.settings.language, AppLanguage::En);
+        assert_eq!(active_resolved_language(), ResolvedLang::En);
+        assert_eq!(am_light_lib::i18n::am_api_locale(), "en-US");
+
+        ui.execute_action(UiAction::SetAppLanguage(AppLanguage::Ko));
+        assert_eq!(active_resolved_language(), ResolvedLang::Ko);
+        assert_eq!(am_light_lib::i18n::am_api_locale(), "ko-KR");
+
+        // Reset global atomic back to Auto cleanly
+        set_active_language(AppLanguage::Auto);
+    }
+
+    #[test]
+    fn test_volume_persistence_across_startup_and_backend_switches() {
+        use am_light_lib::am_agent;
+        use am_light_lib::app_ui::{AppSettings, AppUi, UiAction};
+        use am_light_lib::backends::PlaybackBackend;
+        use am_light_lib::native_player;
+        use am_light_lib::smtc::SmtcState;
+        use am_light_lib::web_am_player;
+
+        // 1. Settings JSON roundtrip preserves custom playback_volume & defaults legacy JSON to 0.75
+        let legacy: AppSettings = serde_json::from_str(r#"{"storefront":"us"}"#).expect("legacy");
+        assert!((legacy.playback_volume - 0.75).abs() < 1e-6);
+
+        let custom: AppSettings =
+            serde_json::from_str(r#"{"playback_volume":0.34}"#).expect("custom vol");
+        assert!((custom.playback_volume - 0.34).abs() < 1e-6);
+
+        // 2. Setting volume updates UI, settings, and ALL playback backend engines simultaneously
+        let mut ui = AppUi::new(0);
+        ui.execute_action(UiAction::SetVolumeRatio(0.28));
+        assert!((ui.settings.playback_volume - 0.28).abs() < 1e-6);
+        assert_eq!(ui.smtc.volume, Some(0.28));
+        assert!((am_agent::get_saved_volume() - 0.28).abs() < 1e-6);
+        assert!((native_player::get_saved_volume() - 0.28).abs() < 1e-6);
+        assert!((web_am_player::get_saved_volume() - 0.28).abs() < 1e-5);
+
+        // 3. Switching across ALL playback backends must NEVER reset volume back to 0.75!
+        for next in [
+            PlaybackBackend::NetEase,
+            PlaybackBackend::QQMusic,
+            PlaybackBackend::AppleMusicWeb,
+            PlaybackBackend::ExternalSmtc,
+            PlaybackBackend::AppleMusicNative,
+        ] {
+            ui.switch_playback_backend(next);
+            assert!(
+                (ui.settings.playback_volume - 0.28).abs() < 1e-6,
+                "settings.playback_volume drifted after switch to {next:?}"
+            );
+            assert_eq!(
+                ui.smtc.volume,
+                Some(0.28),
+                "smtc.volume must stay 0.28 (not None/0.75) after switch to {next:?}"
+            );
+            assert!((am_agent::get_saved_volume() - 0.28).abs() < 1e-6);
+            assert!((native_player::get_saved_volume() - 0.28).abs() < 1e-6);
+            assert!((web_am_player::get_saved_volume() - 0.28).abs() < 1e-5);
+        }
+
+        // 4. Incoming playback update with `volume: None` preserves saved volume
+        let st_no_vol = SmtcState {
+            active: true,
+            title: "Test Track".to_string(),
+            status: "Playing".to_string(),
+            backend_mode: "agent".to_string(),
+            volume: None,
+            ..Default::default()
+        };
+        ui.on_playback_state_changed(st_no_vol);
+        assert_eq!(ui.smtc.volume, Some(0.28));
+    }
+
+    #[test]
+    #[ignore]
+    fn generate_readme_screenshots() {
+        use am_light_lib::am_api;
+        use am_light_lib::app_ui::{AppUi, PageRoute, UiAction};
+        use am_light_lib::audio_viz::{
+            self, AudioOutputDevice, ForensicAccumulator, StreamAudioSpecs,
+        };
+        use am_light_lib::backends::PlaybackBackend;
+        use am_light_lib::d2d_renderer::D2DRenderer;
+        use am_light_lib::drm_fix::DrmDiagReport;
+        use am_light_lib::i18n::{set_active_language, AppLanguage};
+        use am_light_lib::lyrics::parse_ttml_lyrics;
+        use am_light_lib::smtc::SmtcState;
+        use am_light_lib::visualizers::VizStyle;
+        use std::path::PathBuf;
+        use windows::core::{w, PCWSTR};
+        use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, CS_HREDRAW, CS_VREDRAW,
+            WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP, WS_POPUP,
+        };
+
+        unsafe extern "system" fn shot_wnd_proc(
+            h: HWND,
+            m: u32,
+            w: WPARAM,
+            l: LPARAM,
+        ) -> LRESULT {
+            DefWindowProcW(h, m, w, l)
+        }
+
+        let out_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("docs")
+            .join("screenshots");
+        std::fs::create_dir_all(&out_dir).expect("create docs/screenshots");
+
+        // Create an invisible offscreen Win32 HWND sized for crisp 1280x760 @ 1.5x (1920x1140)
+        let w_px: u32 = 1920;
+        let h_px: u32 = 1140;
+        let dpi_scale: f32 = 1.5;
+
+        let hwnd = unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let hinst: HINSTANCE = GetModuleHandleW(None).unwrap_or_default().into();
+            let cls = w!("AMLightScreenshotHost");
+            let wc = WNDCLASSW {
+                style: CS_HREDRAW | CS_VREDRAW,
+                lpfnWndProc: Some(shot_wnd_proc),
+                hInstance: hinst,
+                lpszClassName: cls,
+                ..Default::default()
+            };
+            let _ = RegisterClassW(&wc);
+            CreateWindowExW(
+                WS_EX_NOREDIRECTIONBITMAP,
+                cls,
+                PCWSTR(w!("AM Light Capture").as_ptr()),
+                WS_POPUP,
+                0,
+                0,
+                w_px as i32,
+                h_px as i32,
+                None,
+                None,
+                Some(hinst),
+                None,
+            )
+            .expect("CreateWindowExW")
+        };
+
+        let mut renderer = D2DRenderer::new(hwnd, w_px, h_px, dpi_scale).expect("D2DRenderer::new");
+        let rt = tokio::runtime::Runtime::new().expect("tokio rt");
+
+        // Fetch real public Apple Music editorial shelves (zero user token, 100% public catalog!)
+        set_active_language(AppLanguage::ZhCn);
+        let shelves = rt
+            .block_on(am_api::fetch_home_editorial_shelves("cn", None))
+            .unwrap_or_default();
+        assert!(!shelves.is_empty(), "public Apple Music shelves must load");
+
+        // Fetch & decode artwork for top visible cards so Home is richly populated with real covers
+        let mut art_urls: Vec<(String, bool)> = Vec::new();
+        for (si, shelf) in shelves.iter().take(4).enumerate() {
+            for item in shelf.items.iter().take(8) {
+                if !item.artwork_url.is_empty() {
+                    art_urls.push((item.artwork_url.clone(), si == 0));
+                }
+            }
+        }
+        let fetched_arts: Vec<(String, bool, Vec<u8>)> = rt.block_on(async {
+            let mut futs = Vec::new();
+            for (u, hero) in art_urls {
+                futs.push(async move {
+                    let bytes = am_api::fetch_artwork_bytes(&u, hero).await.ok()?;
+                    Some((u, hero, bytes))
+                });
+            }
+            let mut out = Vec::new();
+            for f in futs {
+                if let Some(v) = f.await {
+                    out.push(v);
+                }
+            }
+            out
+        });
+        for (u, hero, bytes) in &fetched_arts {
+            let _ = renderer.insert_artwork_bytes(u.clone(), bytes, *hero);
+        }
+
+        // Pick a richly illustrated public track from the live shelves for MiniPlayer & Lyrics
+        let hero_item = shelves
+            .iter()
+            .flat_map(|s| s.items.iter())
+            .find(|it| {
+                !it.artwork_url.is_empty()
+                    && (renderer.has_artwork(&it.artwork_url, false)
+                        || renderer.has_artwork(&it.artwork_url, true))
+            })
+            .cloned();
+        let hero_art_url = hero_item
+            .as_ref()
+            .map(|it| it.artwork_url.clone())
+            .filter(|s| !s.is_empty());
+        if let Some(ref u) = hero_art_url {
+            if let Some((_, _, bytes)) = fetched_arts.iter().find(|(k, _, _)| k == u) {
+                let _ = renderer.insert_artwork_bytes(u.clone(), bytes, true);
+            }
+        }
+
+        // Build clean privacy-free AppUi (zero personal Apple ID / cookies / tokens / device names)
+        let mut ui = AppUi::new(0);
+        ui.settings.language = AppLanguage::ZhCn;
+        ui.settings.storefront = "cn".to_string();
+        ui.settings.user_token.clear();
+        ui.settings.playback_backend = PlaybackBackend::AppleMusicNative;
+        ui.settings.liquid_glass_enabled = false;
+        ui.settings.window_corner_radius = 14.0;
+        ui.settings.lyrics_immersive_mode = false;
+        ui.settings.lyrics_auto_emphasis = true;
+        ui.settings.lyrics_frontier_wave = true;
+        ui.settings.lyrics_end_hold_glow = true;
+        ui.official_account = Default::default();
+        ui.drm_diag = DrmDiagReport {
+            checked: true,
+            healthy: true,
+            adi_dir_exists: true,
+            adi_file_count: 1,
+            unwritable_files: Vec::new(),
+            sc_info_unwritable: false,
+            hklm_redirections: Vec::new(),
+            summary: "DRM 授权状态正常（1 个 ADI 身份文件均可正常读写）".to_string(),
+            detail: "若原版 Apple Music 仍遇到点歌秒切、0:00 无声，可点击「一键修复」重置设备身份（自动备份）"
+                .to_string(),
+        };
+        ui.devices = vec![AudioOutputDevice {
+            id: "studio-dac".to_string(),
+            name: "Studio DAC USB Audio".to_string(),
+            is_default: true,
+            sample_rate: 96_000,
+            bit_depth: 24,
+            channels: 2,
+            format_tag: "PCM".to_string(),
+            spatial_audio_active: false,
+        }];
+        ui.current_monitor_hz = 144;
+        ui.home_shelves = shelves;
+
+        let demo_specs = StreamAudioSpecs {
+            codec: "alac".to_string(),
+            codec_label: "ALAC".to_string(),
+            tier_label: "高解析度无损".to_string(),
+            sample_rate_hz: 96_000,
+            bit_depth: Some(24),
+            channels: "2ch".to_string(),
+            bitrate_kbps: 3210,
+            peak_bitrate_kbps: 3680,
+            uncompressed_pcm_kbps: Some(4608),
+            compression_ratio_pct: Some(69.7),
+            atmos_fallback_reason: None,
+            hires_catalog_trait: true,
+            available_variants: Vec::new(),
+        };
+
+        let demo_track_title = hero_item
+            .as_ref()
+            .map(|x| x.title.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Midnight Resonance".to_string());
+        let demo_track_artist = hero_item
+            .as_ref()
+            .map(|x| x.subtitle.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Apple Music".to_string());
+
+        let base_smtc = SmtcState {
+            active: true,
+            app_id: "AMPLibraryAgent.exe".to_string(),
+            title: demo_track_title.clone(),
+            artist: demo_track_artist.clone(),
+            album: "Spatial & Hi-Res Showcase".to_string(),
+            status: "Playing".to_string(),
+            position_sec: 74.0,
+            duration_sec: 238.0,
+            thumbnail_base64: None,
+            artwork_url: hero_art_url.clone(),
+            backend_mode: "agent".to_string(),
+            audio_quality: Some("高解析度无损 · 24-bit / 96kHz".to_string()),
+            volume: Some(0.72),
+            agent_pid: None,
+            adam_id: Some("1000001".to_string()),
+            stream_specs: Some(demo_specs.clone()),
+            sampled_at: Some(std::time::Instant::now()),
+            timeline_updated_univ: 0,
+            position_is_calibrated: true,
+        };
+        ui.on_playback_state_changed(base_smtc.clone());
+
+        // ====================================================================
+        // SHOT 1: Home Editorial Showcase (Simplified Chinese + Liquid Glass)
+        // ====================================================================
+        set_active_language(AppLanguage::ZhCn);
+        ui.execute_action(UiAction::Navigate(PageRoute::Home));
+        ui.show_lyrics_overlay = false;
+        ui.scroll_y = 0.0;
+        ui.scroll_target_y = 0.0;
+        for _ in 0..24 {
+            ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, true);
+        }
+        renderer.pending_capture_path = Some(out_dir.join("home.png"));
+        ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, true);
+        assert!(out_dir.join("home.png").exists(), "home.png must be written");
+
+        // ====================================================================
+        // SHOT 2: Full-Screen LyricsBlossom Aurora + Glowing Synced Word Lyrics
+        // ====================================================================
+        // Pick a rich colorful cover (prefer shelf 0 item #1 or #0) so aurora mesh blooms vibrantly!
+        let lyrics_art_url = ui
+            .home_shelves
+            .first()
+            .and_then(|s| s.items.get(1).or_else(|| s.items.first()))
+            .map(|it| it.artwork_url.clone())
+            .filter(|u| !u.is_empty())
+            .or_else(|| hero_art_url.clone());
+        if let Some(ref u) = lyrics_art_url {
+            if let Some((_, _, bytes)) = fetched_arts.iter().find(|(k, _, _)| k == u) {
+                let _ = renderer.insert_artwork_bytes(u.clone(), bytes, true);
+            }
+        }
+        let sample_ttml = concat!(
+            r#"<tt xmlns="http://www.w3.org/ns/ttml" xmlns:itunes="http://music.apple.com/lyric-ttml-internal" xmlns:ttm="http://www.w3.org/ns/ttml#metadata">"#,
+            r#"<head><metadata><iTunesMetadata><translations><translation xml:lang="zh-Hans-CN">"#,
+            r#"<text for="L1">霓虹折射在午夜微凉的雨幕里</text>"#,
+            r#"<text for="L2">每一道声波都在玻璃上缓缓绽放</text>"#,
+            r#"<text for="L3">听见星海在无损高频间轻声回响</text>"#,
+            r#"<text for="L4">让光影与旋律在此刻停留成永恒</text>"#,
+            r#"<text for="L5">穿越云端与城市沉默的霓虹灯火</text>"#,
+            r#"<text for="L6">闭上双眼感受律动在指尖轻轻起伏</text>"#,
+            r#"</translation></translations></iTunesMetadata></metadata></head><body><div>"#,
+            r#"<p begin="00:08.000" end="00:13.200" itunes:key="L1"><span begin="00:08.000" end="00:08.900">Neon</span> <span begin="00:08.900" end="00:09.800">lights</span> <span begin="00:09.800" end="00:10.700">dissolve</span> <span begin="00:10.700" end="00:11.600">across</span> <span begin="00:11.600" end="00:13.200">midnight rain</span></p>"#,
+            r#"<p begin="00:13.600" end="00:19.200" itunes:key="L2"><span begin="00:13.600" end="00:14.400">Every</span> <span begin="00:14.400" end="00:15.300">wave</span> <span begin="00:15.300" end="00:16.200">unfolds</span> <span begin="00:16.200" end="00:17.200">in</span> <span begin="00:17.200" end="00:19.200" itunes:emphasis="true">liquid glass</span></p>"#,
+            r#"<p begin="00:19.600" end="00:26.200" itunes:key="L3"><span begin="00:19.600" end="00:20.400">Hear</span> <span begin="00:20.400" end="00:21.100">the</span> <span begin="00:21.100" end="00:22.400" itunes:emphasis="true">starlight</span> <span begin="00:22.400" end="00:23.800" itunes:emphasis="true">shimmering</span> <span begin="00:23.800" end="00:25.000">through</span> <span begin="00:25.000" end="00:26.200">the air</span></p>"#,
+            r#"<p begin="00:26.600" end="00:32.400" itunes:key="L4"><span begin="00:26.600" end="00:27.500">Hold</span> <span begin="00:27.500" end="00:28.400">this</span> <span begin="00:28.400" end="00:29.800" itunes:emphasis="true">melody</span> <span begin="00:29.800" end="00:31.000">inside</span> <span begin="00:31.000" end="00:32.400">the glow</span></p>"#,
+            r#"<p begin="00:32.800" end="00:38.500" itunes:key="L5"><span begin="00:32.800" end="00:34.100">Drifting</span> <span begin="00:34.100" end="00:35.500">softly</span> <span begin="00:35.500" end="00:36.900">past</span> <span begin="00:36.900" end="00:38.500">the quiet sky</span></p>"#,
+            r#"<p begin="00:38.900" end="00:44.500" itunes:key="L6"><span begin="00:38.900" end="00:40.200">Close</span> <span begin="00:40.200" end="00:41.500">your</span> <span begin="00:41.500" end="00:43.000">eyes</span> <span begin="00:43.000" end="00:44.500">and float</span></p>"#,
+            r#"</div></body></tt>"#,
+        );
+        let parsed_lyr = parse_ttml_lyrics(sample_ttml, "Apple Music TTML").expect("sample ttml");
+        let mut lyr_smtc = base_smtc.clone();
+        lyr_smtc.title = "Midnight Resonance".to_string();
+        lyr_smtc.artist = "Aurora Synth Ensemble".to_string();
+        lyr_smtc.album = "Liquid Glass Sessions (Hi-Res Master)".to_string();
+        lyr_smtc.artwork_url = lyrics_art_url.clone();
+        lyr_smtc.position_sec = 22.40;
+        lyr_smtc.duration_sec = 238.0;
+        ui.on_playback_state_changed(lyr_smtc);
+        ui.current_lyrics_key = "demo:lyrics-showcase".to_string();
+        ui.current_lyrics = Some(parsed_lyr);
+        ui.lyrics_loading = false;
+        ui.lyrics_view.show_translation = true;
+        ui.lyrics_view.music_free_blur = false;
+        ui.show_lyrics_overlay = true;
+        for f in 0..60 {
+            ui.smtc.position_sec = 22.35 + (f as f64) * 0.015;
+            ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, true);
+        }
+        renderer.pending_capture_path = Some(out_dir.join("lyrics.png"));
+        ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, true);
+        assert!(out_dir.join("lyrics.png").exists(), "lyrics.png must be written");
+
+        // ====================================================================
+        // SHOT 3: WASAPI Audio Visualizer (Audio Inspector + Spectrogram + Soundstage)
+        // ====================================================================
+        ui.show_lyrics_overlay = false;
+        ui.execute_action(UiAction::Navigate(PageRoute::Visualizer));
+        ui.viz_state.style = VizStyle::AudioInspector;
+        ui.viz_state.soundstage_multicolor = true;
+        let mut viz_smtc = base_smtc.clone();
+        viz_smtc.title = "Midnight Resonance".to_string();
+        viz_smtc.artist = "Aurora Synth Ensemble".to_string();
+        viz_smtc.artwork_url = lyrics_art_url.clone();
+        viz_smtc.position_sec = 92.4;
+        ui.on_playback_state_changed(viz_smtc);
+        // Keep the host WASAPI loopback thread parked so real host DAC sample-rate/silence never races our synthetic capture signal!
+        audio_viz::set_viz_subscribed(false);
+
+        // Synthesize 460 frames of genuine zero-mean broadband 96 kHz / 24-bit studio stereo audio
+        // (smooth 1/f pink musical bed across 20 Hz..38 kHz + stereo chordal harmonics -> 0% MDCT holes,
+        // full edge-to-edge waterfall spectrogram, lush 5-band stereo Soundstage fan, & lively oscilloscope!)
+        let sr = 96_000u32;
+        let mut accum = ForensicAccumulator::new(sr);
+        let block_len = 1600usize;
+        let mut phase_acc = 0.0f64;
+        let pi2 = std::f64::consts::TAU;
+        let mut pcm_block = vec![[0.0f32; 2]; block_len];
+        let mut rng_l: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut rng_r: u64 = 0xD1B5_4A32_D192_ED03;
+        let mut pink_l = [0.0f32; 5];
+        let mut pink_r = [0.0f32; 5];
+        let mut lp_l = 0.0f32;
+        let mut lp_r = 0.0f32;
+
+        for frame_i in 0..460 {
+            let fi = frame_i as f32;
+            let phrase_env = 0.58 + 0.42 * (fi * 0.045).sin().abs();
+            let beat_kick = (fi * 0.24).sin().max(0.0).powf(2.6);
+            let air_swell = 0.55 + 0.45 * (fi * 0.065 + 0.8).cos().abs();
+            let chord_idx = (frame_i / 90) % 4;
+            let (f_root, f_third, f_fifth, f_lead) = match chord_idx {
+                0 => (130.81, 329.63, 392.00, 1046.50), // Cmaj7
+                1 => (110.00, 261.63, 329.63, 880.00),  // Am7
+                2 => (87.31, 220.00, 261.63, 1318.51),  // Fmaj7
+                _ => (98.00, 246.94, 293.66, 1174.66),  // G6
+            };
+            for s in 0..block_len {
+                let t = phase_acc / (sr as f64);
+                // True zero-mean white noise (-1.0 .. +1.0)
+                rng_l = rng_l.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                rng_r = rng_r.wrapping_mul(6364136223846793005).wrapping_add(2876543210987654321);
+                let wl = (((rng_l >> 32) as f32) / (u32::MAX as f32)) * 2.0 - 1.0;
+                let wr = (((rng_r >> 32) as f32) / (u32::MAX as f32)) * 2.0 - 1.0;
+
+                // Paul Kellet pink filter (zero-mean continuous musical spectral bed)
+                pink_l[0] = 0.996 * pink_l[0] + wl * 0.028;
+                pink_l[1] = 0.982 * pink_l[1] + wl * 0.035;
+                pink_l[2] = 0.945 * pink_l[2] + wl * 0.052;
+                pink_l[3] = 0.840 * pink_l[3] + wl * 0.092;
+                pink_l[4] = 0.500 * pink_l[4] + wl * 0.135;
+                let pl = pink_l[0] + pink_l[1] + pink_l[2] + pink_l[3] + pink_l[4] + wl * 0.075 * air_swell;
+
+                pink_r[0] = 0.996 * pink_r[0] + wr * 0.028;
+                pink_r[1] = 0.982 * pink_r[1] + wr * 0.035;
+                pink_r[2] = 0.945 * pink_r[2] + wr * 0.052;
+                pink_r[3] = 0.840 * pink_r[3] + wr * 0.092;
+                pink_r[4] = 0.500 * pink_r[4] + wr * 0.135;
+                let pr = pink_r[0] + pink_r[1] + pink_r[2] + pink_r[3] + pink_r[4] + wr * 0.075 * air_swell;
+
+                // Rich mid + wide decorrelated stereo sides + warm musical harmonic stack
+                let mid_n = 0.5 * (pl + pr);
+                let side_n = 0.5 * (pl - pr) * 1.65;
+                let bass = (pi2 * (f_root * 0.5) * t).sin() as f32 * (0.16 + 0.18 * beat_kick)
+                    + (pi2 * f_root * t).sin() as f32 * 0.12;
+                let pad_l = (pi2 * f_third * t).sin() as f32 * 0.10
+                    + (pi2 * f_fifth * 2.0 * t + 0.35).sin() as f32 * 0.07
+                    + (pi2 * f_lead * t).sin() as f32 * 0.055
+                    + (pi2 * 4400.0 * t + 0.2).sin() as f32 * 0.032 * air_swell
+                    + (pi2 * 12400.0 * t).sin() as f32 * 0.022 * air_swell;
+                let pad_r = (pi2 * f_fifth * t + 0.9).sin() as f32 * 0.10
+                    + (pi2 * f_third * 2.0 * t + 1.4).sin() as f32 * 0.07
+                    + (pi2 * f_lead * 1.5 * t + 0.6).sin() as f32 * 0.055
+                    + (pi2 * 6200.0 * t + 1.1).sin() as f32 * 0.032 * air_swell
+                    + (pi2 * 16800.0 * t + 0.5).sin() as f32 * 0.020 * air_swell;
+
+                let raw_l = (mid_n + side_n) * 0.34 * phrase_env + bass + pad_l * phrase_env;
+                let raw_r = (mid_n - side_n) * 0.34 * phrase_env + bass + pad_r * phrase_env;
+                // Gentle ultrasonic air roll-off around ~38 kHz
+                lp_l += (raw_l - lp_l) * 0.72;
+                lp_r += (raw_r - lp_r) * 0.72;
+                pcm_block[s] = [lp_l.clamp(-0.92, 0.92), lp_r.clamp(-0.92, 0.92)];
+                phase_acc += 1.0;
+            }
+            audio_viz::feed_synthetic_stereo_for_capture(
+                "Studio DAC USB Audio",
+                sr,
+                24,
+                &pcm_block,
+                &mut accum,
+            );
+            // Advance 0.045s per frame (~4.14 waterfall cols/frame) so 420px spectrogram fills 100% edge-to-edge!
+            let step_dt = if frame_i < 420 { 0.045 } else { 1.0 / 60.0 };
+            ui.step_and_render_ex(&mut renderer, step_dt, true);
+            audio_viz::set_viz_subscribed(false);
+        }
+        renderer.pending_capture_path = Some(out_dir.join("visualizer.png"));
+        ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, true);
+        assert!(
+            out_dir.join("visualizer.png").exists(),
+            "visualizer.png must be written"
+        );
+
+        // ====================================================================
+        // SHOT 4: Multi-Backend & Multi-Language Settings (English UI Showcase!)
+        // ====================================================================
+        ui.execute_action(UiAction::SetAppLanguage(AppLanguage::En));
+        ui.execute_action(UiAction::Navigate(PageRoute::Settings));
+        ui.show_lyrics_overlay = false;
+        ui.scroll_y = 0.0;
+        ui.scroll_target_y = 0.0;
+        ui.banner_text = None;
+        for _ in 0..30 {
+            ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, true);
+        }
+        renderer.pending_capture_path = Some(out_dir.join("settings-en.png"));
+        ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, true);
+        assert!(
+            out_dir.join("settings-en.png").exists(),
+            "settings-en.png must be written"
+        );
+
+        set_active_language(AppLanguage::Auto);
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+    }
 }

@@ -312,6 +312,7 @@ pub struct D2DRenderer {
     lyrics_trans_w: u32,
     lyrics_trans_h: u32,
     in_lyrics_transition_sheet: bool,
+    pub pending_capture_path: Option<std::path::PathBuf>,
 }
 
 #[inline]
@@ -655,6 +656,7 @@ impl D2DRenderer {
                 lyrics_trans_w: 0,
                 lyrics_trans_h: 0,
                 in_lyrics_transition_sheet: false,
+                pending_capture_path: None,
             };
             renderer.recreate_backbuffer_target()?;
             Ok(renderer)
@@ -905,6 +907,11 @@ impl D2DRenderer {
             }
 
             let hr_end = self.dc.EndDraw(None, None);
+            if hr_end.is_ok() {
+                if let Some(cap_path) = self.pending_capture_path.take() {
+                    let _ = self.save_backbuffer_to_png(&cap_path);
+                }
+            }
             self.glass_snapshot_active = false;
             self.frame_counter = self.frame_counter.wrapping_add(1);
             if self.frame_counter % 60 == 0 && !self.motion_textures.is_empty() {
@@ -922,6 +929,148 @@ impl D2DRenderer {
             if hr_end.is_err() || hr_pres.is_err() {
                 let _ = self.recreate_backbuffer_target();
             }
+        }
+    }
+
+    /// Reads back the finished DXGI swapchain backbuffer via a D3D11 staging texture and writes a
+    /// lossless 32-bit BGRA PNG (un-premultiplying alpha for crisp transparent rounded corners).
+    pub fn save_backbuffer_to_png(&self, out_path: &std::path::Path) -> Result<(), String> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::GENERIC_WRITE;
+        use windows::Win32::Graphics::Direct3D11::{
+            ID3D11Resource, ID3D11Texture2D, D3D11_CPU_ACCESS_READ, D3D11_MAPPED_SUBRESOURCE,
+            D3D11_MAP_READ, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+        };
+        use windows::Win32::Graphics::Imaging::{GUID_ContainerFormatPng, WICBitmapEncoderNoCache};
+
+        if let Some(parent) = out_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        unsafe {
+            let backbuf: ID3D11Texture2D = self
+                .swap_chain
+                .GetBuffer(0)
+                .map_err(|e| format!("GetBuffer(0): {e}"))?;
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            backbuf.GetDesc(&mut desc);
+            let w = desc.Width;
+            let h = desc.Height;
+            if w == 0 || h == 0 {
+                return Err("zero backbuffer size".to_string());
+            }
+
+            desc.Usage = D3D11_USAGE_STAGING;
+            desc.BindFlags = 0;
+            desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+            desc.MiscFlags = 0;
+
+            let d3d_dev: ID3D11Device = self
+                .dxgi_device
+                .cast()
+                .map_err(|e| format!("dxgi->d3d11 cast: {e}"))?;
+            let d3d_ctx = d3d_dev
+                .GetImmediateContext()
+                .map_err(|e| format!("GetImmediateContext: {e}"))?;
+            let mut staging_opt: Option<ID3D11Texture2D> = None;
+            d3d_dev
+                .CreateTexture2D(&desc, None, Some(&mut staging_opt))
+                .map_err(|e| format!("CreateTexture2D staging: {e}"))?;
+            let staging = staging_opt.ok_or_else(|| "staging texture null".to_string())?;
+
+            let dst_res: ID3D11Resource = staging.cast().map_err(|e| format!("dst cast: {e}"))?;
+            let src_res: ID3D11Resource = backbuf.cast().map_err(|e| format!("src cast: {e}"))?;
+            d3d_ctx.CopyResource(&dst_res, &src_res);
+
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            d3d_ctx
+                .Map(&dst_res, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .map_err(|e| format!("Map staging: {e}"))?;
+
+            let stride = (w as usize) * 4;
+            let mut bgra = vec![0u8; stride * (h as usize)];
+            let src_base = mapped.pData as *const u8;
+            let row_pitch = mapped.RowPitch as usize;
+            for y in 0..(h as usize) {
+                let src_row = std::slice::from_raw_parts(src_base.add(y * row_pitch), stride);
+                let dst_row = &mut bgra[y * stride..(y + 1) * stride];
+                if self.premultiplied_swapchain {
+                    for x in 0..(w as usize) {
+                        let i = x * 4;
+                        let a = src_row[i + 3];
+                        if a == 255 {
+                            dst_row[i] = src_row[i];
+                            dst_row[i + 1] = src_row[i + 1];
+                            dst_row[i + 2] = src_row[i + 2];
+                            dst_row[i + 3] = 255;
+                        } else if a == 0 {
+                            dst_row[i] = 0;
+                            dst_row[i + 1] = 0;
+                            dst_row[i + 2] = 0;
+                            dst_row[i + 3] = 0;
+                        } else {
+                            let a16 = a as u16;
+                            dst_row[i] = (((src_row[i] as u16) * 255 + a16 / 2) / a16).min(255) as u8;
+                            dst_row[i + 1] = (((src_row[i + 1] as u16) * 255 + a16 / 2) / a16).min(255) as u8;
+                            dst_row[i + 2] = (((src_row[i + 2] as u16) * 255 + a16 / 2) / a16).min(255) as u8;
+                            dst_row[i + 3] = a;
+                        }
+                    }
+                } else {
+                    dst_row.copy_from_slice(src_row);
+                    for x in 0..(w as usize) {
+                        dst_row[x * 4 + 3] = 255;
+                    }
+                }
+            }
+            d3d_ctx.Unmap(&dst_res, 0);
+
+            let stream = self
+                .wic
+                .CreateStream()
+                .map_err(|e| format!("WIC CreateStream: {e}"))?;
+            let wide: Vec<u16> = out_path
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            stream
+                .InitializeFromFilename(PCWSTR(wide.as_ptr()), GENERIC_WRITE.0)
+                .map_err(|e| format!("WIC InitializeFromFilename: {e}"))?;
+
+            let encoder = self
+                .wic
+                .CreateEncoder(&GUID_ContainerFormatPng, std::ptr::null())
+                .map_err(|e| format!("WIC CreateEncoder: {e}"))?;
+            encoder
+                .Initialize(&stream, WICBitmapEncoderNoCache)
+                .map_err(|e| format!("WIC encoder.Initialize: {e}"))?;
+
+            let mut frame_opt = None;
+            let mut props_opt = None;
+            encoder
+                .CreateNewFrame(&mut frame_opt, &mut props_opt)
+                .map_err(|e| format!("WIC CreateNewFrame: {e}"))?;
+            let frame = frame_opt.ok_or_else(|| "WIC frame null".to_string())?;
+            frame
+                .Initialize(props_opt.as_ref())
+                .map_err(|e| format!("WIC frame.Initialize: {e}"))?;
+            frame
+                .SetSize(w, h)
+                .map_err(|e| format!("WIC frame.SetSize: {e}"))?;
+            let mut pixel_fmt = GUID_WICPixelFormat32bppBGRA;
+            frame
+                .SetPixelFormat(&mut pixel_fmt)
+                .map_err(|e| format!("WIC frame.SetPixelFormat: {e}"))?;
+            frame
+                .WritePixels(h, stride as u32, &bgra)
+                .map_err(|e| format!("WIC WritePixels: {e}"))?;
+            frame.Commit().map_err(|e| format!("WIC frame.Commit: {e}"))?;
+            encoder
+                .Commit()
+                .map_err(|e| format!("WIC encoder.Commit: {e}"))?;
+            Ok(())
         }
     }
 
@@ -2642,6 +2791,8 @@ impl D2DRenderer {
         if text.is_empty() || rect.w <= 1.0 || rect.h <= 1.0 || color.a <= 0.001 {
             return;
         }
+        let translated = crate::i18n::translate_ui_text(text);
+        let text = translated.as_ref();
         let size_tenths = (size * 10.0).round().clamp(60.0, 1200.0) as u16;
         let w_q = (rect.w * 2.0).round().clamp(2.0, 16_000.0) as u32;
         let h_q = (rect.h * 2.0).round().clamp(2.0, 8_000.0) as u32;

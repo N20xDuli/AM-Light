@@ -379,6 +379,22 @@ async fn find_am_tab_ws_url(port: u16) -> Result<String, String> {
     Err("未找到已打开的 Apple Music 网页标签".to_string())
 }
 
+static DESIRED_VOLUME_BITS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0x3f40_0000); // 0.75f32
+
+pub fn set_saved_volume(vol: f64) {
+    let v = if vol.is_finite() {
+        vol.clamp(0.0, 1.0) as f32
+    } else {
+        0.75f32
+    };
+    DESIRED_VOLUME_BITS.store(v.to_bits(), std::sync::atomic::Ordering::Release);
+}
+
+pub fn get_saved_volume() -> f64 {
+    f32::from_bits(DESIRED_VOLUME_BITS.load(std::sync::atomic::Ordering::Acquire)) as f64
+}
+
 pub async fn play_tracks(
     tracks: Vec<AgentTrackInput>,
     start_index: usize,
@@ -401,10 +417,12 @@ pub async fn play_tracks(
         return Err("未找到有效的 Apple Music 曲目 ID".to_string());
     }
     let ids_json = serde_json::to_string(&ids).unwrap_or_else(|_| "[]".to_string());
+    let desired_vol = get_saved_volume().clamp(0.0, 1.0);
     let js = format!(
         r#"(async () => {{
             const mk = window.MusicKit && window.MusicKit.getInstance ? window.MusicKit.getInstance() : null;
             if (!mk) return "NO_MK";
+            mk.volume = {desired_vol:.3};
             await mk.setQueue({{ songs: {ids_json}, startWith: {idx}, startPlaying: true }});
             if (mk.playbackState !== 2) {{
                 try {{ await mk.play(); }} catch (e) {{}}
@@ -434,11 +452,13 @@ pub async fn play_container(
     let port = ensure_started(storefront, !hide_window).await?;
     let ws = find_am_tab_ws_url(port).await?;
     let id_json = serde_json::to_string(id).unwrap_or_else(|_| "\"\"".to_string());
+    let desired_vol = get_saved_volume().clamp(0.0, 1.0);
     let js = if kind.contains("station") {
         format!(
             r#"(async () => {{
                 const mk = window.MusicKit && window.MusicKit.getInstance ? window.MusicKit.getInstance() : null;
                 if (!mk) return "NO_MK";
+                mk.volume = {desired_vol:.3};
                 if (typeof mk.setStationQueue === 'function') {{
                     await mk.setStationQueue({{ station: {id_json} }});
                 }} else {{
@@ -453,6 +473,7 @@ pub async fn play_container(
             r#"(async () => {{
                 const mk = window.MusicKit && window.MusicKit.getInstance ? window.MusicKit.getInstance() : null;
                 if (!mk) return "NO_MK";
+                mk.volume = {desired_vol:.3};
                 await mk.setQueue({{ playlist: {id_json}, startPlaying: true }});
                 try {{ await mk.play(); }} catch (e) {{}}
                 return "OK";
@@ -463,6 +484,7 @@ pub async fn play_container(
             r#"(async () => {{
                 const mk = window.MusicKit && window.MusicKit.getInstance ? window.MusicKit.getInstance() : null;
                 if (!mk) return "NO_MK";
+                mk.volume = {desired_vol:.3};
                 await mk.setQueue({{ album: {id_json}, startPlaying: true }});
                 try {{ await mk.play(); }} catch (e) {{}}
                 return "OK";
@@ -498,7 +520,8 @@ pub async fn control(action: &str, value: Option<f64>) -> Result<SmtcState, Stri
             format!("(async () => {{ const mk = MusicKit.getInstance(); await mk.seekToTime({s:.3}); return 'ok'; }})()")
         }
         "volume" => {
-            let v = value.unwrap_or(0.8).clamp(0.0, 1.0);
+            let v = value.unwrap_or_else(get_saved_volume).clamp(0.0, 1.0);
+            set_saved_volume(v);
             format!("(() => {{ const mk = MusicKit.getInstance(); mk.volume = {v:.3}; return 'ok'; }})()")
         }
         _ => "(() => 'ok')()".to_string(),
