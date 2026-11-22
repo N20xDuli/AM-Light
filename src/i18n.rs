@@ -774,6 +774,94 @@ static EXACT_TABLE: Lazy<HashMap<&'static str, [&'static str; 4]>> = Lazy::new(|
         ("已读取登录", ["已讀取登入", "Signed In", "ログイン済", "로그인됨"]),
         ("订阅有效（可直接播放）", ["訂閱有效（可直接播放）", "Active Subscription (Ready to Play)", "サブスクリプション有効（再生可）", "구독 활성 (재생 가능)"]),
         ("跟随系统", ["跟隨系統", "Auto (System)", "システムに従う", "시스템 자동"]),
+        ("一起听", ["一起聽", "Listen Together", "一緒に聴く", "함께 듣기"]),
+        ("网易云 · 一起听", ["網易雲 · 一起聽", "NetEase · Listen Together", "NetEase · 一緒に聴く", "넷이즈 · 함께 듣기"]),
+        ("创建一起听房间", ["建立一起聽房間", "Create Room", "ルーム作成", "방 만들기"]),
+        ("粘贴链接加入", ["貼上連結加入", "Paste Link to Join", "リンク貼付で参加", "링크 붙여넣기 참가"]),
+        ("同步手机当前房间", ["同步手機目前房間", "Sync Active Room", "進行中ルーム同期", "진행 중인 방 동기화"]),
+        ("私信一起听邀请", ["私訊一起聽邀請", "Inbox Invitations", "DM 招待一覧", "받은 초대 메시지"]),
+        ("刷新私信", ["重新整理私訊", "Refresh Inbox", "DM 更新", "새로고침"]),
+        ("加入房间", ["加入房間", "Join Room", "参加", "참가"]),
+        ("复制邀请链接", ["複製邀請連結", "Copy Invite Link", "招待リンクコピー", "초대 링크 복사"]),
+        ("同步房主歌单", ["同步房主歌單", "Sync Queue", "キュー同期", "재생목록 동기화"]),
+        ("立即校准进度", ["立即校準進度", "Resync Now", "再生位置同期", "지금 동기화"]),
+        ("退出 / 结束房间", ["退出 / 結束房間", "Leave / End Room", "退出 / 終了", "나가기 / 종료"]),
+        ("前往设置登录", ["前往設定登入", "Sign In in Settings", "設定でログイン", "설정에서 로그인"]),
+        ("使用网易云「一起听」需要先登录网易云账号（支持扫码或粘贴 Cookie）。", [
+            "使用網易雲「一起聽」需要先登入網易雲帳號（支援掃碼或貼上 Cookie）。",
+            "Sign in to your NetEase account (QR or Cookie in Settings) to use Listen Together.",
+            "一緒に聴くを使うには NetEase アカウントのログイン（QRまたはCookie）が必要です。",
+            "함께 듣기를 사용하려면 설정에서 넷이즈 계정에 로그인하세요."
+        ]),
+        ("提示：复制好友发来的网易云一起听链接后，直接按 Ctrl+V 或点击「粘贴链接加入」即可与手机端同步听歌。", [
+            "提示：複製好友發來的網易雲一起聽連結後，直接按 Ctrl+V 或點擊「貼上連結加入」即可與手機端同步聽歌。",
+            "Tip: Copy a friend's NetEase Listen Together link and press Ctrl+V or click Paste Link to sync with their phone.",
+            "ヒント：友達の一緒に聴くリンクをコピーして Ctrl+V または「リンク貼付で参加」でスマホと同期再生できます。",
+            "팁: 친구의 함께 듣기 링크를 복사한 뒤 Ctrl+V 또는 링크 붙여넣기 참가를 눌러 동기화하세요."
+        ]),
+        ("暂无私信邀请 · 可点击「创建一起听房间」生成邀请链接发给好友", [
+            "暫無私訊邀請 · 可點擊「建立一起聽房間」產生邀請連結發給好友",
+            "No inbox invites yet — click Create Room to generate a share link for friends",
+            "DM 招待はありません。「ルーム作成」で友達への招待リンクを作成できます",
+            "받은 초대가 없습니다. '방 만들기'로 초대 링크를 생성해 친구에게 공유하세요."
+        ]),
+        ("等待好友通过邀请链接加入房间...", [
+            "等待好友透過邀請連結加入房間...",
+            "Waiting for friends to join via invite link...",
+            "招待リンクからの友達の参加を待機中...",
+            "초대 링크로 친구가 입장하길 기다리는 중..."
+        ]),
+        ("在 AM Light 任意播放一首网易云歌曲，将自动同步到一起听房间队列。", [
+            "在 AM Light 任意播放一首網易雲歌曲，將自動同步到一起聽房間佇列。",
+            "Play any NetEase song in AM Light to sync it automatically with the room.",
+            "AM Light で任意の NetEase 楽曲を再生するとルームに自動同期されます。",
+            "AM Light에서 넷이즈 곡을 재생하면 방 대기열에 자동 동기화됩니다."
+        ]),
+        ("已复制一起听邀请链接，发给好友用网易云打开即可加入", [
+            "已複製一起聽邀請連結，發給好友用網易雲開啟即可加入",
+            "Invite link copied — send it to friends to join from the NetEase app",
+            "招待リンクをコピーしました。友達に送って参加してもらいましょう",
+            "초대 링크를 복사했습니다. 친구에게 보내 함께 들어보세요"
+        ]),
+        ("对方已结束网易云一起听房间", [
+            "對方已結束網易雲一起聽房間",
+            "Partner ended the Listen Together room",
+            "相手が一緒に聴くルームを終了しました",
+            "상대방이 함께 듣기 방을 종료했습니다"
+        ]),
+        ("已退出网易云一起听房间", [
+            "已退出網易雲一起聽房間",
+            "Left the Listen Together room",
+            "一緒に聴くルームを退出しました",
+            "함께 듣기 방에서 나갔습니다"
+        ]),
+        ("粘贴口令/链接加入", ["貼上口令/連結加入", "Paste Code / Link", "コード・リンク貼付", "초대 링크 붙여넣기"]),
+        ("创建房间与邀请互关", ["建立房間與邀請互關", "Room & Mutuals", "ルーム・相互フォロー", "방 만들기 · 맞팔 초대"]),
+        ("房间控制与互关邀请", ["房間控制與互關邀請", "Room & Mutuals", "ルーム管理・招待", "방 제어 · 맞팔 초대"]),
+        ("私信邀请", ["私訊邀請", "Inbox Invites", "DM 招待", "받은 초대"]),
+        ("刷新互关", ["重新整理互關", "Refresh Friends", "友達更新", "맞팔 새로고침"]),
+        ("邀请一起听", ["邀請一起聽", "Invite", "一緒に聴く招待", "함께 듣기 초대"]),
+        ("再次邀请", ["再次邀請", "Re-invite", "再招待", "다시 초대"]),
+        ("邀请", ["邀請", "Invite", "招待", "초대"]),
+        ("已邀请", ["已邀請", "Invited", "招待済", "초대됨"]),
+        ("互关好友", ["互關好友", "Mutual Friend", "相互フォロー", "맞팔 친구"]),
+        ("互关 · VIP", ["互關 · VIP", "Mutual · VIP", "相互 · VIP", "맞팔 · VIP"]),
+        ("关注 · VIP", ["關注 · VIP", "Following · VIP", "フォロー · VIP", "팔로잉 · VIP"]),
+        ("关注好友", ["關注好友", "Following", "フォロー中", "팔로잉"]),
+        ("黑胶 VIP", ["黑膠 VIP", "Vinyl VIP", "ブラックVIP", "바이닐 VIP"]),
+        ("黑胶 SVIP", ["黑膠 SVIP", "Vinyl SVIP", "ブラックSVIP", "바이닐 SVIP"]),
+        ("音乐包", ["音樂包", "Music Pack", "ミュージックパック", "뮤직 팩"]),
+        ("普通用户", ["普通使用者", "Free User", "一般ユーザー", "일반 사용자"]),
+        ("非 VIP", ["非 VIP", "Non-VIP", "非 VIP", "비 VIP"]),
+        ("播放进度已与对方同步", ["播放進度已與對方同步", "Playback is synced with partner", "再生位置を相手と同期しました", "재생 위치가 상대방과 동기화되었습니다"]),
+        ("已将进度校准至对方当前位置", ["已將進度校準至對方目前位置", "Synced playhead to partner", "相手の再生位置に合わせました", "상대방 재생 위치로 동기화했습니다"]),
+        ("正在解析网易云一起听短链...", ["正在解析網易雲一起聽短鏈...", "Resolving NetEase short link...", "短縮リンクを解析中...", "단축 링크 확인 중..."]),
+        ("支持网易云手机口令短链（如 https://163cn.tv/...）、完整分享链接或房间号，可直接按 Ctrl+V 加入。", [
+            "支援網易雲手機口令短鏈（如 https://163cn.tv/...）、完整分享連結或房間號，可直接按 Ctrl+V 加入。",
+            "Supports NetEase mobile short links (https://163cn.tv/...), full invite URLs, or room IDs. Press Ctrl+V to join.",
+            "スマホの短縮リンク (https://163cn.tv/...) や招待URL、ルームIDに対応。Ctrl+V ですぐ参加できます。",
+            "모바일 단축 링크(https://163cn.tv/...), 초대 URL, 방 ID를 지원합니다. Ctrl+V로 바로 참가하세요."
+        ]),
     ];
 
     let mut map = HashMap::with_capacity(entries.len() * 2);
@@ -825,6 +913,42 @@ pub fn translate_ui_text_for<'a>(input: &'a str, lang: ResolvedLang) -> Cow<'a, 
     }
     if let Some(rest) = input.strip_prefix("偏好设置 (") {
         let p = pick(lang, ["偏好設定 (", "Preferences (", "環境設定 (", "환경설정 ("]);
+        return Cow::Owned(format!("{p}{rest}"));
+    }
+    if let Some(rest) = input.strip_prefix("一起听 · ") {
+        let p = pick(lang, ["一起聽 · ", "Together · ", "一緒に聴く · ", "함께 듣기 · "]);
+        return Cow::Owned(format!("{p}{rest}"));
+    }
+    if let Some(rest) = input.strip_prefix("房间号：") {
+        let p = pick(lang, ["房間號：", "Room ID: ", "ルームID：", "방 ID: "]);
+        return Cow::Owned(format!("{p}{rest}"));
+    }
+    if let Some(rest) = input.strip_prefix("房间共享队列 (") {
+        let p = pick(lang, ["房間共享佇列 (", "Shared Queue (", "共有キュー (", "공유 대기열 ("]);
+        return Cow::Owned(format!("{p}{rest}"));
+    }
+    if let Some(rest) = input.strip_prefix("主动邀请互关好友 (") {
+        let p = pick(lang, ["主動邀請互關好友 (", "Invite Mutual Friends (", "相互フォローを招待 (", "맞팔 친구 초대 ("]);
+        return Cow::Owned(format!("{p}{rest}"));
+    }
+    if let Some(rest) = input.strip_prefix("邀请互关好友加入当前房间 (") {
+        let p = pick(lang, ["邀請互關好友加入目前房間 (", "Invite Friends to Room (", "友達をルームに招待 (", "현재 방에 맞팔 초대 ("]);
+        return Cow::Owned(format!("{p}{rest}"));
+    }
+    if let Some(rest) = input.strip_prefix("私信邀请 (") {
+        let p = pick(lang, ["私訊邀請 (", "Inbox Invites (", "DM 招待 (", "받은 초대 ("]);
+        return Cow::Owned(format!("{p}{rest}"));
+    }
+    if let Some(rest) = input.strip_prefix("黑胶 SVIP Lv.") {
+        let p = pick(lang, ["黑膠 SVIP Lv.", "SVIP Lv.", "SVIP Lv.", "SVIP Lv."]);
+        return Cow::Owned(format!("{p}{rest}"));
+    }
+    if let Some(rest) = input.strip_prefix("黑胶 VIP Lv.") {
+        let p = pick(lang, ["黑膠 VIP Lv.", "VIP Lv.", "VIP Lv.", "VIP Lv."]);
+        return Cow::Owned(format!("{p}{rest}"));
+    }
+    if let Some(rest) = input.strip_prefix("实时双向同步中 · ") {
+        let p = pick(lang, ["即時雙向同步中 · ", "Live Sync Active · ", "双方向同期中 · ", "실시간 동기화 중 · "]);
         return Cow::Owned(format!("{p}{rest}"));
     }
     if let Some(rest) = input.strip_prefix("播放音量  ") {

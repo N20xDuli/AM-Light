@@ -78,7 +78,7 @@
 | :--- | :--- | :--- |
 | **Apple Music 原生** | 本地微软商店版 `AMPLibraryAgent` | Hi-Res 无损 / ALAC 完整曲库、内置 DRM 一键修复、个人资料库同步 |
 | **Apple Music 网页版** | 本机 Edge 独立配置 + MusicKit JS | 免安装微软商店客户端、Widevine 完整播放、自动同步网页 Token |
-| **网易云音乐** | MediaFoundation + WASAPI 原生直出 | 内置原生 Direct2D 二维码扫码登录、精确曲目 ID 逐字歌词（YRC）与翻译 |
+| **网易云音乐** | MediaFoundation + WASAPI 原生直出 | 原生 Direct2D 扫码/Cookie 登录与 VIP 等级展示、**一起听（与手机端互通、口令短链加入、互关一键邀请）**、YRC 逐字歌词 |
 | **QQ 音乐** | MediaFoundation + WASAPI 原生直出 | 巅峰榜 / 新歌 / 电台浏览、Cookie 解锁高音质并在无权限时平滑降级 |
 | **外置 SMTC 接管** | Windows SMTC 系统媒体会话 | 零焦点抢占接管 Spotify / 浏览器 / 任意播放器，完整复用歌词与可视化 |
 
@@ -132,8 +132,8 @@
 
 ### 第二步：下载与安装
 
-1. 前往 [**GitHub Releases**](https://github.com/N20xDuli/AM-Light/releases) 下载最新的 Windows x64 安装包（如 `AM-Light-Setup-v0.2.9-x64.exe`）并运行安装。
-   - 静默安装：`AM-Light-Setup-v0.2.9-x64.exe --silent [--dir="C:\Path\To\AM-Light"]`
+1. 前往 [**GitHub Releases**](https://github.com/N20xDuli/AM-Light/releases) 下载最新的 Windows x64 安装包（如 `AM-Light-Setup-v0.2.10-x64.exe`）并运行安装。
+   - 静默安装：`AM-Light-Setup-v0.2.10-x64.exe --silent [--dir="C:\Path\To\AM-Light"]`
    - 卸载方式：通过 Windows「已安装的应用」或安装目录下的 `Uninstall-AM-Light.exe` 卸载。
 2. 启动 AM Light，在 **「设置」** 中可随时切换播放后端与界面语言。
 
@@ -165,7 +165,7 @@ cargo test --release --bin AM-Light -- --test-threads=1
 # 构建主程序（Release）
 cargo build --release --bin AM-Light
 
-# 打包 Windows 安装器（输出至 dist\AM-Light-Setup-v0.2.9-x64.exe）
+# 打包 Windows 安装器（输出至 dist\AM-Light-Setup-v0.2.10-x64.exe）
 $env:AM_LIGHT_BIN_PATH = "target\release\AM-Light.exe"
 cargo build --release --manifest-path installer\Cargo.toml
 ```

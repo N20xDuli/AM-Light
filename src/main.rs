@@ -4360,6 +4360,380 @@ lo48.m3u8\n";
     }
 
     #[test]
+    fn test_netease_listen_together_eapi_crypto_invite_parser_and_sync_engine() {
+        use am_light_lib::app_ui::{AppUi, UiAction};
+        use am_light_lib::listen_together::{
+            aes128_ecb_encrypt_pkcs7, build_share_url, eapi_encrypt_params,
+            evaluate_remote_sync_action, md5_hex, parse_invite_input, parse_status_json,
+            ListenTogetherStatus, RemoteSyncAction,
+        };
+        use serde_json::json;
+
+        // 1. RFC 1321 MD5 test vectors
+        assert_eq!(md5_hex(b""), "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(md5_hex(b"abc"), "900150983cd24fb0d6963f7d28e17f72");
+        assert_eq!(
+            md5_hex(b"message digest"),
+            "f96b697d7cb7938d525a2f31aaf161d0"
+        );
+
+        // 2. NIST FIPS-197 AES-128 block test vector (first 16 bytes of PKCS#7 encrypted 16-byte block)
+        let nist_key: [u8; 16] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
+        ];
+        let nist_pt: [u8; 16] = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
+        let nist_ct_expected: [u8; 16] = [
+            0x69, 0xc4, 0xe0, 0xd8, 0x6a, 0x7b, 0x04, 0x30, 0xd8, 0xcd, 0xb7, 0x80, 0x70, 0xb4,
+            0xc5, 0x5a,
+        ];
+        let ct = aes128_ecb_encrypt_pkcs7(&nist_key, &nist_pt);
+        assert_eq!(ct.len(), 32); // 16-byte input + full 16-byte PKCS#7 padding block
+        assert_eq!(&ct[..16], &nist_ct_expected);
+
+        // NetEase EAPI params encryption produces uppercase hex multiple of 32 chars
+        let eapi_hex = eapi_encrypt_params("/api/listen/together/room/create", r#"{"refer":"songplay_more"}"#);
+        assert!(!eapi_hex.is_empty() && eapi_hex.len() % 32 == 0);
+        assert!(eapi_hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase()));
+
+        // 3. Smart invite link & room ID parser across ALL formats
+        let share = build_share_url("MzA0NjY5_room", 32953014, Some("ne:186016"));
+        assert_eq!(
+            share,
+            "https://st.music.163.com/listen-together/share/?songId=186016&roomId=MzA0NjY5_room&inviterId=32953014"
+        );
+        let p1 = parse_invite_input(&format!("快来和我一起听歌吧 {share} (来自网易云)")).expect("parse share");
+        assert_eq!(p1.room_id, "MzA0NjY5_room");
+        assert_eq!(p1.inviter_id, Some(32953014));
+        assert_eq!(p1.song_id.as_deref(), Some("186016"));
+
+        let double_enc = "orpheus%253A%252F%252Flisten%253FroomId%253DROOM9988%2526inviterId%253D778899";
+        let p2 = parse_invite_input(double_enc).expect("parse double encoded nativeUrl");
+        assert_eq!(p2.room_id, "ROOM9988");
+        assert_eq!(p2.inviter_id, Some(778899));
+
+        let p3 = parse_invite_input("MYROOM123:556677").expect("parse pair");
+        assert_eq!(p3.room_id, "MYROOM123");
+        assert_eq!(p3.inviter_id, Some(556677));
+
+        // 4. Status JSON parser (active room + code 488 closed room)
+        let status_json = json!({
+            "code": 200,
+            "data": {
+                "inRoom": true,
+                "roomInfo": {
+                    "roomId": "R_777",
+                    "creatorId": 1001,
+                    "roomUsers": [
+                        {"userId": 1001, "nickname": "Alice", "avatarUrl": "http://p1.music.126.net/a.jpg"},
+                        {"userId": 2002, "nickname": "Bob", "avatarUrl": "https://p2.music.126.net/b.jpg"}
+                    ]
+                },
+                "playCommand": {
+                    "targetSongId": "186016",
+                    "playStatus": "PLAY",
+                    "progress": 42500,
+                    "clientSeq": 9
+                }
+            }
+        });
+        let st = parse_status_json(&status_json);
+        assert!(st.in_room && !st.room_closed && st.room_id == "R_777");
+        assert_eq!(st.users.len(), 2);
+        assert!(st.users[0].is_host && !st.users[1].is_host);
+        assert!(st.users[0].avatar_url.as_deref().unwrap().starts_with("https://"));
+        assert_eq!(st.remote_song_id.as_deref(), Some("186016"));
+        assert_eq!(st.remote_progress_ms, 42500);
+
+        let closed_st = parse_status_json(&json!({"code": 488, "message": "room closed"}));
+        assert!(closed_st.room_closed && !closed_st.in_room);
+
+        // 5. Anti-loop sync decision engine (including fresh partner seq & manual force resync!)
+        assert_eq!(
+            evaluate_remote_sync_action(Some("ne:111111"), true, 10_000, &st, 1.0, 9, 1001),
+            RemoteSyncAction::Noop,
+            "must suppress self-echo within 1.8s of local user command when seq unchanged"
+        );
+        assert_eq!(
+            evaluate_remote_sync_action(Some("ne:111111"), true, 10_000, &st, 5.0, 9, 1001),
+            RemoteSyncAction::SwitchTrack {
+                song_id: "186016".to_string(),
+                play: true,
+                progress_ms: 42500
+            }
+        );
+        assert_eq!(
+            evaluate_remote_sync_action(Some("ne:186016"), true, 41_500, &st, 5.0, 9, 1001),
+            RemoteSyncAction::Noop,
+            "1s drift must NOT cause audio stutter seek in steady state"
+        );
+        assert_eq!(
+            evaluate_remote_sync_action(Some("ne:186016"), true, 35_000, &st, 5.0, 9, 1001),
+            RemoteSyncAction::SeekTo { progress_ms: 42500 },
+            ">2.2s drift must resync playhead"
+        );
+        assert_eq!(
+            evaluate_remote_sync_action(Some("ne:186016"), false, 42_500, &st, 5.0, 9, 1001),
+            RemoteSyncAction::SetPlayPause {
+                play: true,
+                progress_ms: 42500
+            }
+        );
+        assert_eq!(
+            evaluate_remote_sync_action(Some("ne:186016"), true, 42_500, &closed_st, 5.0, 9, 1001),
+            RemoteSyncAction::RoomClosed
+        );
+        let empty_st = ListenTogetherStatus {
+            code: 200,
+            in_room: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate_remote_sync_action(Some("ne:186016"), true, 0, &empty_st, 5.0, 9, 1001),
+            RemoteSyncAction::RoomClosed
+        );
+
+        // 6. UI modal open/close wiring
+        let mut ui = AppUi::new(0);
+        ui.execute_action(UiAction::OpenListenTogetherModal);
+        assert!(ui.listen_together.modal_open);
+        ui.execute_action(UiAction::CloseListenTogetherModal);
+        assert!(!ui.listen_together.modal_open);
+    }
+
+    #[test]
+    fn test_listen_together_v2_shortlink_vip_sync_and_queue_scroll() {
+        use am_light_lib::app_ui::{AppUi, UiAction};
+        use am_light_lib::backends::PlaybackBackend;
+        use am_light_lib::listen_together::{
+            evaluate_remote_sync_action, extract_first_http_url, parse_invite_input,
+            parse_sync_playlist_json, ListenTogetherUser, RemoteSyncAction,
+        };
+        use am_light_lib::netease_api::parse_vip_info_json;
+        use am_light_lib::theme::RectF;
+        use serde_json::json;
+
+        // 1. Mobile oral copy with 163cn.tv short link
+        let oral_copy = "我的耳机分你一半，和我一起听歌吧～快点开看看 https://163cn.tv/blBIyEiR (@网易云音乐)";
+        assert!(
+            parse_invite_input(oral_copy).is_none(),
+            "unresolved 163cn.tv short link must NOT be misparsed as raw roomId"
+        );
+        assert_eq!(
+            extract_first_http_url(oral_copy).as_deref(),
+            Some("https://163cn.tv/blBIyEiR")
+        );
+
+        // 2. Authoritative `sync/playlist/get` parser + wall-clock play progress compensation
+        let now_ms = 1_750_000_005_000u64;
+        let sync_json = json!({
+            "code": 200,
+            "data": {
+                "serverTime": now_ms,
+                "playCommand": {
+                    "targetSongId": "2730282462",
+                    "formerSongId": "186016",
+                    "playStatus": "PLAY",
+                    "commandType": "GOTO",
+                    "progress": 20_000,
+                    "clientSeq": 18,
+                    "userId": 2002,
+                    "timestamp": now_ms - 3_000
+                },
+                "playlist": {
+                    "version": [{"userId": 2002, "version": 7}],
+                    "displayList": {
+                        "result": ["2730282462", "186016", "1901371647"]
+                    }
+                }
+            }
+        });
+        let st = parse_sync_playlist_json("ROOM_SYNC_1", &sync_json, now_ms);
+        assert!(st.in_room && !st.room_closed);
+        assert_eq!(st.remote_song_id.as_deref(), Some("2730282462"));
+        assert_eq!(st.remote_progress_ms, 23_000, "must compensate 3000ms elapsed while PLAY");
+        assert_eq!(st.remote_client_seq, 18);
+        assert_eq!(st.remote_list_version, 7);
+        assert_eq!(st.remote_cmd_user_id, 2002);
+        assert_eq!(st.remote_playlist_ids, vec![2730282462, 186016, 1901371647]);
+
+        // 3. Fresh partner command (seq 18 > last_applied 17, uid 2002 != my_uid 1001) bypasses local cooldown!
+        assert_eq!(
+            evaluate_remote_sync_action(Some("ne:186016"), true, 5_000, &st, 0.3, 17, 1001),
+            RemoteSyncAction::SwitchTrack {
+                song_id: "2730282462".to_string(),
+                play: true,
+                progress_ms: 23_000
+            }
+        );
+        // Same song, fresh partner seek by 1.2s reacts immediately!
+        assert_eq!(
+            evaluate_remote_sync_action(Some("ne:2730282462"), true, 21_500, &st, 0.4, 17, 1001),
+            RemoteSyncAction::SeekTo { progress_ms: 23_000 }
+        );
+        // Manual `force_resync` aligns even a 700ms offset!
+        let mut forced = st.clone();
+        forced.force_resync = true;
+        assert_eq!(
+            evaluate_remote_sync_action(Some("ne:2730282462"), true, 22_200, &forced, 0.2, 18, 1001),
+            RemoteSyncAction::SeekTo { progress_ms: 23_000 }
+        );
+
+        // 4. NetEase VIP tier & level parser
+        let (svip_ok, svip_lv, svip_lbl) = parse_vip_info_json(
+            &json!({"data": {"redVipLevel": 7, "redplus": {"rights": true}, "associator": {"rights": true}}}),
+            11,
+        );
+        assert!(svip_ok && svip_lv == 7 && svip_lbl == "黑胶 SVIP Lv.7");
+
+        let (vip_ok, vip_lv, vip_lbl) = parse_vip_info_json(
+            &json!({"data": {"redVipLevel": 5, "associator": {"rights": true}}}),
+            11,
+        );
+        assert!(vip_ok && vip_lv == 5 && vip_lbl == "黑胶 VIP Lv.5");
+
+        let (free_ok, free_lv, free_lbl) = parse_vip_info_json(&json!({"data": {}}), 0);
+        assert!(!free_ok && free_lv == 0 && free_lbl == "普通用户");
+
+        // 5. Queue popover scroll bounds via `on_wheel`
+        let mut ui = AppUi::new(0);
+        ui.show_queue_popover = true;
+        ui.queue_popover_rect = RectF::new(400.0, 200.0, 336.0, 368.0);
+        ui.queue_max_scroll_y = 600.0;
+        ui.queue_scroll_y = 0.0;
+        ui.mouse_pos = (520.0, 320.0);
+        ui.on_wheel(-1.0); // scroll down
+        assert!(ui.queue_scroll_y > 40.0 && ui.queue_scroll_y <= 600.0);
+        ui.on_wheel(10.0); // scroll back to top
+        assert_eq!(ui.queue_scroll_y, 0.0);
+
+        // 6. Listen Together modal scroll + tab switch + NetEase backend wiring
+        ui.switch_playback_backend(PlaybackBackend::NetEase);
+        ui.execute_action(UiAction::OpenListenTogetherModal);
+        ui.listen_together.modal_rect = RectF::new(200.0, 100.0, 584.0, 528.0);
+        ui.listen_together.modal_max_scroll_y = 320.0;
+        ui.mouse_pos = (400.0, 300.0);
+        ui.on_wheel(-1.0);
+        assert!(ui.listen_together.modal_scroll_y > 40.0);
+        ui.execute_action(UiAction::LtSetModalTab(1));
+        assert_eq!(ui.listen_together.modal_tab, 1);
+        assert_eq!(ui.listen_together.modal_scroll_y, 0.0);
+
+        // Verify VIP user parsing struct fields work cleanly
+        let non_vip_partner = ListenTogetherUser {
+            user_id: 2002,
+            nickname: "好友B".to_string(),
+            avatar_url: None,
+            is_host: false,
+            vip_type: 0,
+            is_vip: false,
+        };
+        assert!(!non_vip_partner.is_vip);
+    }
+
+    #[test]
+    fn test_netease_cookie_normalization_and_disk_persistence_roundtrip() {
+        use am_light_lib::app_ui::{AppSettings, AppUi, PageRoute, UiAction};
+        use am_light_lib::backends::PlaybackBackend;
+        use am_light_lib::netease_api::{has_music_u_cookie, normalize_netease_cookie};
+
+        // 1. DevTools `Cookie:` header prefix MUST NOT drop `MUSIC_U`!
+        let from_hdr =
+            normalize_netease_cookie("Cookie: MUSIC_U=deadbeef1234567890; __csrf=csrf_ok_99; NMTID=abc");
+        assert_eq!(from_hdr, "MUSIC_U=deadbeef1234567890; __csrf=csrf_ok_99");
+        assert!(has_music_u_cookie(&from_hdr));
+
+        // 2. Multi-line `Set-Cookie` with expired empty `MUSIC_U=` before real `MUSIC_U` keeps the real token
+        let from_set_cookie =
+            "Set-Cookie: MUSIC_U=; Max-Age=0; Path=/\r\nSet-Cookie: MUSIC_U=real_music_u_token_888; Path=/\r\nSet-Cookie: __csrf=csrf_real_777; Path=/";
+        assert_eq!(
+            normalize_netease_cookie(from_set_cookie),
+            "MUSIC_U=real_music_u_token_888; __csrf=csrf_real_777"
+        );
+
+        // 3. DevTools Application -> Cookies tab-separated row copy
+        let from_tab = "MUSIC_U\tabcdef0123456789abcdef0123456789abcdef0123456789\t.music.163.com\t/";
+        assert_eq!(
+            normalize_netease_cookie(from_tab),
+            "MUSIC_U=abcdef0123456789abcdef0123456789abcdef0123456789"
+        );
+
+        // 4. Bare >=40-char MUSIC_U token
+        let bare = "0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(normalize_netease_cookie(bare), format!("MUSIC_U={bare}"));
+
+        // 5. Non-cookie arbitrary text MUST return empty and MUST NEVER overwrite a saved cookie!
+        assert_eq!(normalize_netease_cookie("hello world"), "");
+        assert_eq!(
+            normalize_netease_cookie("https://163cn.tv/blBIyEiR"),
+            ""
+        );
+        let mut ui = AppUi::new(0);
+        ui.route = PageRoute::Settings;
+        ui.settings.playback_backend = PlaybackBackend::NetEase;
+        assert!(ui.apply_pasted_netease_cookie("Cookie: MUSIC_U=valid_cookie_9876543210; __csrf=aa11"));
+        assert_eq!(
+            ui.settings.netease_cookie,
+            "MUSIC_U=valid_cookie_9876543210; __csrf=aa11"
+        );
+        assert!(ui.netease_account.logged_in);
+        assert!(!ui.apply_pasted_netease_cookie("random clipboard text without cookie"));
+        assert_eq!(
+            ui.settings.netease_cookie,
+            "MUSIC_U=valid_cookie_9876543210; __csrf=aa11",
+            "invalid paste must never clobber an already saved NetEase cookie"
+        );
+
+        // 6. Real disk round-trip via isolated temp directory (simulating full client restart!)
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "am_light_cookie_persist_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
+        let primary_path = tmp_dir.join("roaming_settings_v2.json");
+        let backup_path = tmp_dir.join("local_settings_v2.json");
+        let paths = vec![primary_path.clone(), backup_path.clone()];
+
+        let mut saved = AppSettings::default();
+        saved.playback_backend = PlaybackBackend::NetEase;
+        saved.netease_cookie = "MUSIC_U=persisted_token_xyz123456789; __csrf=c999".to_string();
+        saved.netease_uid = 32953014;
+        saved.netease_nickname = "云村测试".to_string();
+        saved.netease_vip_label = "黑胶 VIP Lv.6".to_string();
+        saved.netease_vip_level = 6;
+        saved.netease_is_vip = true;
+        saved.save_to_paths(&paths);
+
+        let reloaded = AppSettings::load_from_paths(&paths).expect("reload settings from disk");
+        assert_eq!(reloaded.playback_backend, PlaybackBackend::NetEase);
+        assert_eq!(reloaded.netease_cookie, saved.netease_cookie);
+        assert_eq!(reloaded.netease_uid, 32953014);
+        assert_eq!(reloaded.netease_nickname, "云村测试");
+        assert_eq!(reloaded.netease_vip_label, "黑胶 VIP Lv.6");
+        assert_eq!(reloaded.netease_vip_level, 6);
+        assert!(reloaded.netease_is_vip);
+
+        // 7. Backup recovery: if primary file loses `netease_cookie`, backup mirror restores it!
+        let mut damaged = AppSettings::default();
+        damaged.playback_backend = PlaybackBackend::NetEase;
+        damaged.save_to_paths(&[primary_path.clone()]);
+        let recovered = AppSettings::load_from_paths(&paths).expect("recover from backup mirror");
+        assert_eq!(recovered.netease_cookie, saved.netease_cookie);
+        assert_eq!(recovered.netease_uid, 32953014);
+        assert_eq!(recovered.netease_vip_label, "黑胶 VIP Lv.6");
+
+        // 8. ClearNetEaseAuth inside unit-test AppUi(0) clears in-memory without touching real user files
+        ui.execute_action(UiAction::ClearNetEaseAuth);
+        assert!(ui.settings.netease_cookie.is_empty());
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
     #[ignore]
     fn generate_readme_screenshots() {
         use am_light_lib::am_api;

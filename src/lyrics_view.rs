@@ -31,6 +31,7 @@ pub enum LyricsHitAction {
     ToggleFreeBlur,
     ToggleImmersiveMode,
     OpenMoreMenu(RectF),
+    OpenListenTogether,
     NudgeLyricsOffset(f64),
     ResetLyricsOffset,
 }
@@ -250,6 +251,8 @@ pub struct LyricsViewState {
     pub immersive_mode: bool,
     pub immersive_corner_alphas: [f32; 4],
     pub immersive_corner_targets: [f32; 4],
+    /// Permanent top-right NetEase Listen Together pill `(in_room, label)` when NetEase backend is active
+    pub listen_together_pill: Option<(bool, String)>,
     cached_layout_key: CachedLyricsLayoutKey,
     cached_line_layouts: Vec<CachedLyricLineLayout>,
 }
@@ -285,6 +288,7 @@ impl Default for LyricsViewState {
             immersive_mode: false,
             immersive_corner_alphas: [1.0, 1.0, 1.0, 1.0],
             immersive_corner_targets: [1.0, 1.0, 1.0, 1.0],
+            listen_together_pill: None,
             cached_layout_key: CachedLyricsLayoutKey::default(),
             cached_line_layouts: Vec::new(),
         }
@@ -593,17 +597,80 @@ impl LyricsViewState {
             }
         }
 
-        // Top-Right Unified Window Controls (`─`, `□`, `×`), pixel-identical to Main UI
+        // Top-Right Unified Window Controls (`─`, `□`, `×`) + permanent NetEase `一起听` pill
         let close_x = win_rect.right() - 18.0 - btn_h;
         let max_x = close_x - 8.0 - btn_h;
         let min_x = max_x - 8.0 - btn_h;
+        let lt_pill_w = match self.listen_together_pill {
+            Some((true, _)) => 126.0f32,
+            Some((false, _)) => 78.0f32,
+            None => 0.0f32,
+        };
+        let tr_left = if lt_pill_w > 0.0 {
+            min_x - 12.0 - lt_pill_w
+        } else {
+            min_x
+        };
         if a_tr > 0.02 {
-            let tr_bounds = RectF::new(min_x - 14.0, top_y - 12.0, (close_x + btn_h - min_x) + 28.0, btn_h + 24.0);
+            let tr_bounds = RectF::new(
+                tr_left - 14.0,
+                top_y - 12.0,
+                (close_x + btn_h - tr_left) + 28.0,
+                btn_h + 24.0,
+            );
             let pushed_tr = if a_tr < 0.995 {
                 r.push_opacity_layer(tr_bounds, a_tr)
             } else {
                 false
             };
+            if let Some((lt_active, ref lt_lbl)) = self.listen_together_pill.clone() {
+                let lt_r = RectF::new(min_x - 12.0 - lt_pill_w, top_y, lt_pill_w, btn_h);
+                let lt_hov = lt_r.contains(hovered_pt.0, hovered_pt.1);
+                r.draw_liquid_glass_floating_button(
+                    lt_r,
+                    btn_r,
+                    if lt_active {
+                        GlassBtnVariant::Tinted(Color::rgb(236, 65, 65))
+                    } else {
+                        GlassBtnVariant::Regular
+                    },
+                    lt_hov,
+                    mouse_down,
+                    hovered_pt,
+                    glass_off,
+                );
+                if lt_active {
+                    r.fill_circle(lt_r.x + 13.0, lt_r.center_y(), 3.6, Theme::SIGNAL_GREEN);
+                    r.draw_text(
+                        lt_lbl,
+                        RectF::new(lt_r.x + 21.0, lt_r.y, lt_r.w - 27.0, lt_r.h),
+                        12.0,
+                        600,
+                        Theme::TEXT_PRIMARY,
+                        TextAlign::Left,
+                        true,
+                        false,
+                    );
+                } else {
+                    r.draw_text(
+                        lt_lbl,
+                        lt_r.inset(6.0, 0.0),
+                        12.2,
+                        if lt_hov { 600 } else { 500 },
+                        Theme::TEXT_PRIMARY,
+                        TextAlign::Center,
+                        true,
+                        false,
+                    );
+                }
+                if a_tr > 0.20 {
+                    self.hit_zones.push(LyricsHitZone {
+                        rect: lt_r,
+                        action: LyricsHitAction::OpenListenTogether,
+                        line_idx: None,
+                    });
+                }
+            }
             for (wx, wic, wact, is_cls) in [
                 (min_x, SfIcon::WinMinimize, LyricsHitAction::WinMinimize, false),
                 (

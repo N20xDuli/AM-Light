@@ -27,6 +27,12 @@ pub struct NetEaseAccountInfo {
     pub uid: u64,
     pub nickname: String,
     pub vip_type: i64,
+    #[serde(default)]
+    pub vip_level: i64,
+    #[serde(default)]
+    pub vip_label: String,
+    #[serde(default)]
+    pub is_vip: bool,
     pub message: String,
 }
 
@@ -70,29 +76,121 @@ pub struct NetEaseQrPollResult {
     pub cookie: Option<String>,
 }
 
+/// Returns true if the cookie string contains a non-empty `MUSIC_U=` credential.
+pub fn has_music_u_cookie(cookie: &str) -> bool {
+    for seg in cookie.split(';') {
+        if let Some(val) = seg.trim().strip_prefix("MUSIC_U=") {
+            if !val.trim().is_empty() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Normalizes ANY pasted NetEase cookie format into canonical `"MUSIC_U=<val>"` (plus optional
+/// `"; __csrf=<val>"`), returning an empty string if no valid `MUSIC_U` credential is present.
+/// Supports:
+/// - Full browser cookie strings (`foo=1; MUSIC_U=...; __csrf=...`)
+/// - DevTools Request/Response Headers (`Cookie: MUSIC_U=...`, multi-line `Set-Cookie: MUSIC_U=...`)
+/// - DevTools Cookie table copy (`MUSIC_U\t<value>` or `MUSIC_U: <value>`)
+/// - Bare `MUSIC_U` token values (>= 40 chars without whitespace or `=`)
 pub fn normalize_netease_cookie(raw: &str) -> String {
-    let trimmed = raw.trim();
+    let trimmed = raw
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'' || c == '`')
+        .trim();
     if trimmed.is_empty() {
         return String::new();
     }
-    if trimmed.contains("MUSIC_U=") {
-        // Keep MUSIC_U and optional __csrf cleanly
-        let mut parts = Vec::new();
-        for seg in trimmed.split(';') {
-            let s = seg.trim();
-            if s.starts_with("MUSIC_U=") || s.starts_with("__csrf=") {
-                parts.push(s.to_string());
+
+    let mut music_u = String::new();
+    let mut csrf = String::new();
+
+    for line in trimmed.lines() {
+        let mut l = line.trim();
+        if l.is_empty() {
+            continue;
+        }
+        // Strip leading `Cookie:` or `Set-Cookie:` header prefix (case-insensitive)
+        let low = l.to_ascii_lowercase();
+        if low.starts_with("set-cookie:") {
+            l = l[11..].trim();
+        } else if low.starts_with("cookie:") {
+            l = l[7..].trim();
+        }
+
+        // Handle DevTools Application -> Cookies row copy: `MUSIC_U\t<value>\t.music.163.com...`
+        if l.contains('\t') {
+            let cols: Vec<&str> = l.split('\t').map(str::trim).filter(|s| !s.is_empty()).collect();
+            if cols.len() >= 2 {
+                if cols[0].eq_ignore_ascii_case("MUSIC_U") && !cols[1].is_empty() {
+                    music_u = cols[1].trim_matches('"').to_string();
+                    continue;
+                }
+                if cols[0].eq_ignore_ascii_case("__csrf") && !cols[1].is_empty() {
+                    csrf = cols[1].trim_matches('"').to_string();
+                    continue;
+                }
             }
         }
-        if !parts.is_empty() {
-            return parts.join("; ");
+
+        // Handle `MUSIC_U: <value>` colon format
+        if let Some((k, v)) = l.split_once(':') {
+            let kt = k.trim();
+            let vt = v.trim().split(';').next().unwrap_or("").trim().trim_matches('"');
+            if kt.eq_ignore_ascii_case("MUSIC_U") && !vt.is_empty() && !vt.contains('=') {
+                music_u = vt.to_string();
+                continue;
+            }
+            if kt.eq_ignore_ascii_case("__csrf") && !vt.is_empty() && !vt.contains('=') {
+                csrf = vt.to_string();
+                continue;
+            }
+        }
+
+        for seg in l.split(';') {
+            let mut s = seg.trim();
+            let slow = s.to_ascii_lowercase();
+            if slow.starts_with("set-cookie:") {
+                s = s[11..].trim();
+            } else if slow.starts_with("cookie:") {
+                s = s[7..].trim();
+            }
+            if let Some((k, v)) = s.split_once('=') {
+                let kt = k.trim();
+                let vt = v.trim().trim_matches('"').trim();
+                if kt.eq_ignore_ascii_case("MUSIC_U") && !vt.is_empty() {
+                    music_u = vt.to_string();
+                } else if kt.eq_ignore_ascii_case("__csrf") && !vt.is_empty() {
+                    csrf = vt.to_string();
+                }
+            }
         }
     }
-    // If user pasted bare MUSIC_U value without prefix
-    if trimmed.len() >= 40 && !trimmed.contains(' ') && !trimmed.contains('=') {
+
+    if !music_u.is_empty() {
+        return if csrf.is_empty() {
+            format!("MUSIC_U={music_u}")
+        } else {
+            format!("MUSIC_U={music_u}; __csrf={csrf}")
+        };
+    }
+
+    // Bare MUSIC_U value pasted directly without `MUSIC_U=` prefix
+    if trimmed.len() >= 40
+        && !trimmed.contains(char::is_whitespace)
+        && !trimmed.contains('=')
+        && !trimmed.contains(':')
+        && !trimmed.contains('/')
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+' | '~'))
+    {
         return format!("MUSIC_U={trimmed}");
     }
-    trimmed.to_string()
+
+    String::new()
 }
 
 pub fn build_cookie_header(user_cookie: Option<&str>) -> String {
@@ -298,22 +396,22 @@ pub async fn poll_qr_login(unikey: &str) -> Result<NetEaseQrPollResult, String> 
         .await
         .map_err(|e| format!("轮询扫码状态失败: {e}"))?;
 
-    // Extract MUSIC_U & __csrf cookies from Set-Cookie headers on login success
-    let mut cookie_parts = Vec::new();
+    // Extract MUSIC_U & __csrf cookies from Set-Cookie headers AND JSON `cookie` field on login success
+    let mut raw_cookie_lines = Vec::new();
     for val in resp.headers().get_all(reqwest::header::SET_COOKIE) {
         if let Ok(s) = val.to_str() {
-            if let Some(first) = s.split(';').next() {
-                let f = first.trim();
-                if f.starts_with("MUSIC_U=") || f.starts_with("__csrf=") {
-                    cookie_parts.push(f.to_string());
-                }
-            }
+            raw_cookie_lines.push(s.to_string());
         }
     }
     let json = resp
         .json::<Value>()
         .await
         .map_err(|e| format!("解析扫码响应失败: {e}"))?;
+    if let Some(jc) = json.get("cookie").and_then(Value::as_str) {
+        if !jc.trim().is_empty() {
+            raw_cookie_lines.push(jc.to_string());
+        }
+    }
     let code = json.get("code").and_then(Value::as_i64).unwrap_or(0);
     let msg = json
         .get("message")
@@ -327,8 +425,9 @@ pub async fn poll_qr_login(unikey: &str) -> Result<NetEaseQrPollResult, String> 
         })
         .to_string();
 
-    let cookie = if code == 803 && !cookie_parts.is_empty() {
-        Some(cookie_parts.join("; "))
+    let normalized_cookie = normalize_netease_cookie(&raw_cookie_lines.join("\n"));
+    let cookie = if code == 803 && has_music_u_cookie(&normalized_cookie) {
+        Some(normalized_cookie)
     } else {
         None
     };
@@ -340,32 +439,130 @@ pub async fn poll_qr_login(unikey: &str) -> Result<NetEaseQrPollResult, String> 
     })
 }
 
+pub fn parse_vip_info_json(vip_json: &Value, fallback_vip_type: i64) -> (bool, i64, String) {
+    let data = vip_json.get("data").unwrap_or(vip_json);
+    let red_lvl = data
+        .get("redVipLevel")
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        .max(0);
+    let redplus_rights = data
+        .pointer("/redplus/rights")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let assoc_rights = data
+        .pointer("/associator/rights")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let pkg_rights = data
+        .pointer("/musicPackage/rights")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let assoc_code = data
+        .pointer("/associator/vipCode")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let is_vip = redplus_rights || assoc_rights || pkg_rights || fallback_vip_type >= 11;
+
+    let base_name = if redplus_rights {
+        "黑胶 SVIP"
+    } else if assoc_rights || fallback_vip_type >= 11 || assoc_code >= 100 {
+        "黑胶 VIP"
+    } else if pkg_rights || fallback_vip_type > 0 {
+        "音乐包"
+    } else {
+        "普通用户"
+    };
+    let label = if red_lvl > 0 && is_vip {
+        format!("{base_name} Lv.{red_lvl}")
+    } else if red_lvl > 0 {
+        format!("{base_name} (CVIP Lv.{red_lvl})")
+    } else {
+        base_name.to_string()
+    };
+    (is_vip, red_lvl, label)
+}
+
 pub async fn verify_account(cookie: &str) -> Result<NetEaseAccountInfo, String> {
     let norm = normalize_netease_cookie(cookie);
-    if norm.is_empty() {
+    if !has_music_u_cookie(&norm) {
         return Ok(NetEaseAccountInfo {
             logged_in: false,
             message: "未登录网易云账号（游客模式仍可浏览全部榜单并试听免费曲目）".to_string(),
             ..Default::default()
         });
     }
-    let json = ne_get_json("https://music.163.com/api/nuser/account/get", Some(&norm)).await?;
+    let (acct_res, vip_res) = tokio::join!(
+        ne_get_json("https://music.163.com/api/nuser/account/get", Some(&norm)),
+        ne_get_json(
+            "https://music.163.com/api/music-vip-membership/front/vip/info",
+            Some(&norm)
+        ),
+    );
+    let mut json = match acct_res {
+        Ok(v) if v.get("profile").is_some_and(Value::is_object) => v,
+        _ => match crate::listen_together::fetch_account_eapi(&norm).await {
+            Ok(ev) => ev,
+            Err(e) => return Err(e),
+        },
+    };
+    let code = json.get("code").and_then(Value::as_i64).unwrap_or(200);
+    if code != 200 && code != 301 {
+        // Retry once via EAPI if direct GET hit transient risk-control (-460 / 5xx)
+        if let Ok(ev) = crate::listen_together::fetch_account_eapi(&norm).await {
+            json = ev;
+        } else {
+            return Err(format!("网易云账号状态校验暂时受限 (code {code})"));
+        }
+    }
+    let final_code = json.get("code").and_then(Value::as_i64).unwrap_or(200);
+    if final_code != 200 && final_code != 301 {
+        return Err(format!("网易云账号状态校验暂时受限 (code {final_code})"));
+    }
+
     let profile = json.get("profile").filter(|v| v.is_object());
-    if let Some(p) = profile {
-        let uid = p.get("userId").and_then(Value::as_u64).unwrap_or(0);
-        let nickname = p
-            .get("nickname")
-            .and_then(Value::as_str)
+    let account = json.get("account").filter(|v| v.is_object());
+    let is_anon = account
+        .and_then(|a| a.get("anonimousUser"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let uid = profile
+        .and_then(|p| p.get("userId").and_then(Value::as_u64))
+        .or_else(|| {
+            if !is_anon {
+                account.and_then(|a| a.get("id").and_then(Value::as_u64))
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+
+    if uid > 0 {
+        let nickname = profile
+            .and_then(|p| p.get("nickname").and_then(Value::as_str))
+            .or_else(|| account.and_then(|a| a.get("userName").and_then(Value::as_str)))
             .unwrap_or("网易云用户")
             .to_string();
-        let vip_type = p.get("vipType").and_then(Value::as_i64).unwrap_or(0);
-        let vip_str = if vip_type > 0 { "黑胶 VIP" } else { "普通账号" };
+        let vip_type = profile
+            .and_then(|p| p.get("vipType").and_then(Value::as_i64))
+            .or_else(|| account.and_then(|a| a.get("vipType").and_then(Value::as_i64)))
+            .unwrap_or(0);
+        let mut vip_json = vip_res.unwrap_or(Value::Null);
+        if vip_json.get("data").filter(|v| v.is_object()).is_none() {
+            if let Ok(eapi_vip) = crate::listen_together::fetch_vip_info_eapi(uid, &norm).await {
+                vip_json = eapi_vip;
+            }
+        }
+        let (is_vip, vip_level, vip_label) = parse_vip_info_json(&vip_json, vip_type);
         Ok(NetEaseAccountInfo {
-            logged_in: uid > 0,
+            logged_in: true,
             uid,
             nickname: nickname.clone(),
             vip_type,
-            message: format!("已登录：{nickname} (UID {uid} · {vip_str})"),
+            vip_level,
+            vip_label: vip_label.clone(),
+            is_vip,
+            message: format!("已登录：{nickname} · {vip_label} (UID {uid})"),
         })
     } else {
         Ok(NetEaseAccountInfo {
@@ -875,7 +1072,7 @@ pub async fn search_catalog(
     Ok((albums, playlists, songs))
 }
 
-async fn fetch_songs_detail_batch(ids: &[i64], cookie: Option<&str>) -> Result<Vec<AgentTrackInput>, String> {
+pub async fn fetch_songs_detail_batch(ids: &[i64], cookie: Option<&str>) -> Result<Vec<AgentTrackInput>, String> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }

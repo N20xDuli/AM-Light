@@ -78,7 +78,7 @@ Switch seamlessly between **5 playback backends** under **Settings → Playback 
 | :--- | :--- | :--- |
 | **Apple Music Native** | Official Store `AMPLibraryAgent` IPC | Hi-Res Lossless / ALAC playback, built-in 1-Click DRM repair, cloud library sync |
 | **Apple Music Web** | Isolated Edge + MusicKit JS | No Store client required, Widevine playback, 1-click Web Token sync |
-| **NetEase Cloud** | Native MediaFoundation + WASAPI | Built-in Direct2D QR login, exact track-ID YRC word-level lyrics & translations |
+| **NetEase Cloud** | Native MediaFoundation + WASAPI | Built-in Direct2D QR/Cookie login & VIP badge, **Listen Together (phone cross-sync, short-link join, mutual friend invites)**, YRC word lyrics |
 | **QQ Music** | Native MediaFoundation + WASAPI | Top Charts / Radio / Search, browser Cookie unlock with graceful quality fallback |
 | **External SMTC** | Windows System Media Transport | Non-intrusive bridge for Spotify, browsers, or any player with full lyrics & visualizer |
 
@@ -132,8 +132,8 @@ If third-party iOS signing tools (e.g., Sideloadly) or broken folder ACLs cause 
 
 ### Step 2: Download & Install
 
-1. Download the latest Windows x64 installer (e.g., `AM-Light-Setup-v0.2.9-x64.exe`) from [**GitHub Releases**](https://github.com/N20xDuli/AM-Light/releases).
-   - Silent install: `AM-Light-Setup-v0.2.9-x64.exe --silent [--dir="C:\Path\To\AM-Light"]`
+1. Download the latest Windows x64 installer (e.g., `AM-Light-Setup-v0.2.10-x64.exe`) from [**GitHub Releases**](https://github.com/N20xDuli/AM-Light/releases).
+   - Silent install: `AM-Light-Setup-v0.2.10-x64.exe --silent [--dir="C:\Path\To\AM-Light"]`
    - Uninstall via Windows **Installed Apps** or `Uninstall-AM-Light.exe` inside the install folder.
 2. Launch AM Light and configure your preferred playback backend and UI language under **Settings**.
 
@@ -165,7 +165,7 @@ cargo test --release --bin AM-Light -- --test-threads=1
 # Build main executable (Release)
 cargo build --release --bin AM-Light
 
-# Build Windows installer (outputs to dist\AM-Light-Setup-v0.2.9-x64.exe)
+# Build Windows installer (outputs to dist\AM-Light-Setup-v0.2.10-x64.exe)
 $env:AM_LIGHT_BIN_PATH = "target\release\AM-Light.exe"
 cargo build --release --manifest-path installer\Cargo.toml
 ```

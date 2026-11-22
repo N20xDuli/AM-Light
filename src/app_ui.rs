@@ -12,6 +12,10 @@ use crate::d2d_renderer::{D2DRenderer, GlassBtnVariant, SfIcon, TextAlign};
 use crate::downloads::{self, DownloadsOverview};
 use crate::drm_fix::{self, DrmDiagReport};
 use crate::i18n::{self, AppLanguage};
+use crate::listen_together::{
+    self, ListenTogetherFriend, ListenTogetherInvite, ListenTogetherStatus, ListenTogetherUser,
+    ParsedListenInvite, RemoteSyncAction,
+};
 use crate::lyrics::{self, NonEmphasisLyricsEffect, ParsedLyrics};
 use crate::lyrics_view::{LyricsHitAction, LyricsViewState};
 use crate::motion_art::MotionArtManager;
@@ -287,6 +291,12 @@ pub struct AppSettings {
     #[serde(default)]
     pub netease_nickname: String,
     #[serde(default)]
+    pub netease_vip_label: String,
+    #[serde(default)]
+    pub netease_vip_level: i64,
+    #[serde(default)]
+    pub netease_is_vip: bool,
+    #[serde(default)]
     pub netease_quality: NetEaseQuality,
     #[serde(default)]
     pub qq_cookie: String,
@@ -353,6 +363,9 @@ impl Default for AppSettings {
             netease_cookie: String::new(),
             netease_uid: 0,
             netease_nickname: String::new(),
+            netease_vip_label: String::new(),
+            netease_vip_level: 0,
+            netease_is_vip: false,
             netease_quality: NetEaseQuality::ExHigh,
             qq_cookie: String::new(),
             qq_uin: String::new(),
@@ -407,7 +420,10 @@ impl AppSettings {
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let tmp_path = path.with_extension("json.tmp");
+        static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp_name = format!("settings_v2.{}.{seq}.tmp", std::process::id());
+        let tmp_path = path.with_file_name(tmp_name);
         let wrote_tmp = (|| -> std::io::Result<()> {
             use std::io::Write;
             let mut f = fs::File::create(&tmp_path)?;
@@ -415,30 +431,95 @@ impl AppSettings {
             f.sync_all()?;
             Ok(())
         })();
-        if wrote_tmp.is_ok() && fs::rename(&tmp_path, path).is_ok() {
-            return;
+        if wrote_tmp.is_ok() {
+            if fs::rename(&tmp_path, path).is_ok() {
+                return;
+            }
+            // Retry once briefly if antivirus/indexer briefly holds the target handle on Windows
+            std::thread::sleep(std::time::Duration::from_millis(18));
+            if fs::rename(&tmp_path, path).is_ok() {
+                return;
+            }
         }
         let _ = fs::remove_file(&tmp_path);
-        let _ = fs::write(path, content);
+        if fs::write(path, content).is_err() {
+            std::thread::sleep(std::time::Duration::from_millis(24));
+            let _ = fs::write(path, content);
+        }
     }
 
-    pub fn load_with_official() -> (Self, am_api::OfficialClientAccountInfo) {
-        let mut loaded: Option<Self> = None;
-        for p in Self::config_paths() {
-            if let Ok(txt) = fs::read_to_string(&p) {
+    pub fn load_from_paths(paths: &[PathBuf]) -> Option<Self> {
+        let mut parsed_list: Vec<(std::time::SystemTime, Self)> = Vec::new();
+        for p in paths {
+            if let Ok(txt) = fs::read_to_string(p) {
                 if let Ok(mut s) = serde_json::from_str::<Self>(&txt) {
                     s.user_token = am_api::normalize_user_token(&s.user_token);
-                    if loaded.is_none()
-                        || (loaded.as_ref().is_some_and(|prev| prev.user_token.is_empty())
-                            && !s.user_token.is_empty())
-                    {
-                        loaded = Some(s);
+                    if !s.netease_cookie.trim().is_empty() {
+                        let norm_ne = netease_api::normalize_netease_cookie(&s.netease_cookie);
+                        if netease_api::has_music_u_cookie(&norm_ne) {
+                            s.netease_cookie = norm_ne;
+                        }
                     }
+                    let mtime = fs::metadata(p)
+                        .and_then(|m| m.modified())
+                        .unwrap_or(std::time::UNIX_EPOCH);
+                    parsed_list.push((mtime, s));
                 }
             }
         }
+        if parsed_list.is_empty() {
+            return None;
+        }
+        // Prefer the most recently modified valid settings file, while recovering missing
+        // credentials from any mirror copy (APPDATA <-> LOCALAPPDATA) if one write was interrupted!
+        parsed_list.sort_by(|a, b| b.0.cmp(&a.0));
+        let mut primary = parsed_list.remove(0).1;
+        for (_, other) in parsed_list {
+            if primary.user_token.is_empty()
+                && !primary.token_cleared_by_user
+                && !other.user_token.is_empty()
+            {
+                primary.user_token = other.user_token;
+            }
+            if !netease_api::has_music_u_cookie(&primary.netease_cookie)
+                && netease_api::has_music_u_cookie(&other.netease_cookie)
+            {
+                primary.netease_cookie = other.netease_cookie;
+                if primary.netease_uid == 0 {
+                    primary.netease_uid = other.netease_uid;
+                }
+                if primary.netease_nickname.is_empty() {
+                    primary.netease_nickname = other.netease_nickname;
+                }
+                if primary.netease_vip_label.is_empty() {
+                    primary.netease_vip_label = other.netease_vip_label;
+                    primary.netease_vip_level = other.netease_vip_level;
+                    primary.netease_is_vip = other.netease_is_vip;
+                }
+            }
+            if primary.qq_cookie.is_empty() && !other.qq_cookie.is_empty() {
+                primary.qq_cookie = other.qq_cookie;
+                if primary.qq_uin.is_empty() {
+                    primary.qq_uin = other.qq_uin;
+                }
+                if primary.qq_nickname.is_empty() {
+                    primary.qq_nickname = other.qq_nickname;
+                }
+            }
+        }
+        Some(primary)
+    }
 
-        let mut s = loaded.unwrap_or_default();
+    pub fn save_to_paths(&self, paths: &[PathBuf]) {
+        if let Ok(txt) = serde_json::to_string_pretty(self) {
+            for p in paths {
+                Self::write_file_atomically(p, &txt);
+            }
+        }
+    }
+
+    pub fn load_with_official() -> (Self, am_api::OfficialClientAccountInfo) {
+        let mut s = Self::load_from_paths(&Self::config_paths()).unwrap_or_default();
         s.window_corner_radius = s.window_corner_radius.clamp(0.0, 28.0);
         s.viz_custom_fps = s.viz_custom_fps.clamp(30, 360);
         s.lyrics_custom_fps = s.lyrics_custom_fps.clamp(30, 360);
@@ -496,11 +577,7 @@ impl AppSettings {
         am_agent::set_active_storefront(&self.storefront);
         i18n::set_active_language(self.language);
         sync_backend_runtime_globals(self);
-        if let Ok(txt) = serde_json::to_string_pretty(self) {
-            for p in Self::config_paths() {
-                Self::write_file_atomically(&p, &txt);
-            }
-        }
+        self.save_to_paths(&Self::config_paths());
     }
 }
 
@@ -721,6 +798,19 @@ pub enum AsyncMsg {
         created_playlist_id: Option<String>,
         matched_tracks: Vec<AgentTrackInput>,
     },
+    ListenTogetherCreated(Result<ListenTogetherStatus, String>),
+    ListenTogetherJoined(Result<(ListenTogetherStatus, Vec<AgentTrackInput>), String>),
+    ListenTogetherStatusPolled(Result<ListenTogetherStatus, String>),
+    ListenTogetherPlaylistLoaded(Result<Vec<AgentTrackInput>, String>),
+    ListenTogetherInvitesLoaded(Result<Vec<ListenTogetherInvite>, String>),
+    ListenTogetherMutualFriendsLoaded(Result<Vec<ListenTogetherFriend>, String>),
+    ListenTogetherFriendInvited {
+        friend_uid: u64,
+        friend_name: String,
+        res: Result<Option<ListenTogetherStatus>, String>,
+    },
+    ListenTogetherShortLinkResolved(Result<ParsedListenInvite, String>),
+    ListenTogetherEnded(Result<bool, String>),
 }
 
 #[derive(Clone, Debug)]
@@ -898,6 +988,27 @@ pub enum UiAction {
     SelectTransferTarget(PlaybackBackend),
     StartPlaylistTransfer,
     PlayTransferMatchedTracks,
+    OpenListenTogetherModal,
+    CloseListenTogetherModal,
+    LtCreateRoom,
+    LtJoinFromClipboard,
+    LtJoinInvite {
+        room_id: String,
+        inviter_id: Option<u64>,
+    },
+    LtRefreshStatus,
+    LtForceResync,
+    LtFetchInboxInvites,
+    LtFetchMutualFriends,
+    LtInviteFriend {
+        friend_uid: u64,
+        friend_name: String,
+    },
+    LtSetModalTab(u8),
+    LtCopyShareUrl,
+    LtSyncRoomPlaylist,
+    LtPlayRoomTrack(usize),
+    LtEndOrLeaveRoom,
     ImportLocalLyricsFromMenu,
     CheckForUpdates,
     OpenUrl(String),
@@ -1107,8 +1218,73 @@ pub struct AppUi {
     // Unified `•••` Liquid Glass Context Menu + Cross-Platform Playlist Transfer Modal + Play Next Queue
     pub context_menu: Option<ContextMenuState>,
     pub transfer_modal: Option<PlaylistTransferState>,
+    pub listen_together: ListenTogetherUiState,
+    pub queue_popover_rect: RectF,
+    pub queue_scroll_y: f32,
+    pub queue_max_scroll_y: f32,
     pub play_next_queue: std::collections::VecDeque<AgentTrackInput>,
     pub last_mouse_move_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+pub struct ListenTogetherUiState {
+    pub modal_open: bool,
+    pub modal_tab: u8, // 0 = 房间与互关邀请, 1 = 私信邀请
+    pub modal_rect: RectF,
+    pub modal_scroll_y: f32,
+    pub modal_max_scroll_y: f32,
+    pub in_room: bool,
+    pub busy: bool,
+    pub room_id: String,
+    pub creator_id: u64,
+    pub share_url: String,
+    pub users: Vec<ListenTogetherUser>,
+    pub room_tracks: Vec<AgentTrackInput>,
+    pub inbox_invites: Vec<ListenTogetherInvite>,
+    pub mutual_friends: Vec<ListenTogetherFriend>,
+    pub invited_friend_ids: HashSet<u64>,
+    pub vip_warning: Option<String>,
+    pub last_vip_warned_song_id: String,
+    pub status_text: String,
+    pub client_seq: i64,
+    pub last_applied_remote_seq: i64,
+    pub list_version: i64,
+    pub last_local_cmd_at: Instant,
+    pub last_synced_song_id: String,
+    pub pending_local_track_broadcast: bool,
+    pub poller_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl Default for ListenTogetherUiState {
+    fn default() -> Self {
+        Self {
+            modal_open: false,
+            modal_tab: 0,
+            modal_rect: RectF::default(),
+            modal_scroll_y: 0.0,
+            modal_max_scroll_y: 0.0,
+            in_room: false,
+            busy: false,
+            room_id: String::new(),
+            creator_id: 0,
+            share_url: String::new(),
+            users: Vec::new(),
+            room_tracks: Vec::new(),
+            inbox_invites: Vec::new(),
+            mutual_friends: Vec::new(),
+            invited_friend_ids: HashSet::new(),
+            vip_warning: None,
+            last_vip_warned_song_id: String::new(),
+            status_text: String::new(),
+            client_seq: 1,
+            last_applied_remote_seq: 0,
+            list_version: 1,
+            last_local_cmd_at: Instant::now() - std::time::Duration::from_secs(10),
+            last_synced_song_id: String::new(),
+            pending_local_track_broadcast: false,
+            poller_stop: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1425,13 +1601,26 @@ impl AppUi {
             .iter()
             .map(CachedPlaylistSummary::to_card)
             .collect();
+        let has_ne_cookie = netease_api::has_music_u_cookie(&settings.netease_cookie);
         let init_ne_account = netease_api::NetEaseAccountInfo {
-            logged_in: settings.netease_uid > 0 && !settings.netease_cookie.is_empty(),
+            logged_in: has_ne_cookie,
             uid: settings.netease_uid,
             nickname: settings.netease_nickname.clone(),
-            vip_type: 0,
-            message: if settings.netease_uid > 0 && !settings.netease_cookie.is_empty() {
-                format!("已保存登录：{} (UID {})", settings.netease_nickname, settings.netease_uid)
+            vip_type: if settings.netease_is_vip { 11 } else { 0 },
+            vip_level: settings.netease_vip_level,
+            vip_label: settings.netease_vip_label.clone(),
+            is_vip: settings.netease_is_vip,
+            message: if has_ne_cookie && settings.netease_uid > 0 {
+                if !settings.netease_vip_label.is_empty() {
+                    format!(
+                        "已保存登录：{} · {} (UID {})",
+                        settings.netease_nickname, settings.netease_vip_label, settings.netease_uid
+                    )
+                } else {
+                    format!("已保存登录：{} (UID {})", settings.netease_nickname, settings.netease_uid)
+                }
+            } else if has_ne_cookie {
+                "已保存网易云 Cookie，正在同步账号信息...".to_string()
             } else {
                 "未登录网易云账号（游客模式可浏览榜单并播放免费音源）".to_string()
             },
@@ -1612,6 +1801,10 @@ impl AppUi {
             pending_detail_motion_url: None,
             context_menu: None,
             transfer_modal: None,
+            listen_together: ListenTogetherUiState::default(),
+            queue_popover_rect: RectF::default(),
+            queue_scroll_y: 0.0,
+            queue_max_scroll_y: 0.0,
             play_next_queue: std::collections::VecDeque::new(),
             last_mouse_move_at: now,
         };
@@ -1668,10 +1861,29 @@ impl AppUi {
         }
     }
 
+    /// Updates active runtime globals immediately and persists `settings_v2.json` atomically to disk
+    /// (guarded on `wake_hwnd != 0` so unit tests running with `AppUi::new(0)` NEVER overwrite or wipe
+    /// the real user's saved NetEase/QQ/Apple credentials in `%APPDATA%\AMLight\settings_v2.json`!).
+    pub fn save_settings(&self) {
+        am_agent::set_active_storefront(&self.settings.storefront);
+        i18n::set_active_language(self.settings.language);
+        sync_backend_runtime_globals(&self.settings);
+        if self.wake_hwnd != 0 {
+            self.settings.save();
+        }
+    }
+
     pub fn fetch_initial_data(&mut self) {
         self.fetch_home_charts();
         self.refresh_devices_and_prefs(false);
         self.refresh_drm_health_async(false);
+        // Always refresh saved NetEase / QQ account info & VIP level on startup regardless of active backend!
+        if netease_api::has_music_u_cookie(&self.settings.netease_cookie) {
+            self.verify_netease_account_async(self.settings.netease_cookie.clone());
+        }
+        if !self.settings.qq_cookie.is_empty() {
+            self.verify_qq_account_async(self.settings.qq_cookie.clone());
+        }
         match self.settings.playback_backend {
             PlaybackBackend::AppleMusicNative | PlaybackBackend::AppleMusicWeb => {
                 if !self.settings.user_token.is_empty() {
@@ -1680,15 +1892,9 @@ impl AppUi {
             }
             PlaybackBackend::NetEase => {
                 self.fetch_sidebar_playlists();
-                if !self.settings.netease_cookie.is_empty() {
-                    self.verify_netease_account_async(self.settings.netease_cookie.clone());
-                }
             }
             PlaybackBackend::QQMusic => {
                 self.fetch_sidebar_playlists();
-                if !self.settings.qq_cookie.is_empty() {
-                    self.verify_qq_account_async(self.settings.qq_cookie.clone());
-                }
             }
             PlaybackBackend::ExternalSmtc => {}
         }
@@ -2037,6 +2243,9 @@ impl AppUi {
     /// and `WM_SETCURSOR` (for crisp pointer cursor feedback).
     pub fn is_interactive_at(&self, lx: f32, ly: f32) -> bool {
         if self.show_lyrics_overlay {
+            if self.context_menu.is_some() || self.listen_together.modal_open {
+                return true;
+            }
             return self
                 .lyrics_view
                 .hit_zones
@@ -2229,13 +2438,19 @@ impl AppUi {
                     if info.logged_in {
                         self.settings.netease_uid = info.uid;
                         self.settings.netease_nickname = info.nickname.clone();
-                        self.settings.save();
+                        self.settings.netease_vip_label = info.vip_label.clone();
+                        self.settings.netease_vip_level = info.vip_level;
+                        self.settings.netease_is_vip = info.is_vip;
+                        self.save_settings();
                         if self.settings.playback_backend == PlaybackBackend::NetEase {
                             self.fetch_sidebar_playlists();
                             self.fetch_home_charts();
                         }
                     }
                     self.netease_account = info;
+                    if self.listen_together.in_room {
+                        self.refresh_listen_together_vip_warning();
+                    }
                 }
                 AsyncMsg::NetEaseQrStarted(qr) => {
                     self.netease_qr = Some(qr);
@@ -2259,10 +2474,28 @@ impl AppUi {
                         self.netease_qr = None;
                         if let Some(ck) = cookie {
                             let norm = netease_api::normalize_netease_cookie(&ck);
-                            self.settings.netease_cookie = norm.clone();
-                            self.settings.save();
-                            self.verify_netease_account_async(norm);
-                            self.set_banner("网易云音乐扫码登录成功，正在同步个人歌单".to_string(), false);
+                            if netease_api::has_music_u_cookie(&norm) {
+                                self.settings.netease_cookie = norm.clone();
+                                self.netease_account.logged_in = true;
+                                self.netease_account.message =
+                                    "网易云扫码登录成功，正在同步账号信息...".to_string();
+                                self.save_settings();
+                                self.verify_netease_account_async(norm);
+                                self.set_banner(
+                                    "网易云音乐扫码登录成功，已自动保存登录状态".to_string(),
+                                    false,
+                                );
+                            } else {
+                                self.set_banner(
+                                    "扫码已确认但未收到有效 MUSIC_U Cookie，请重试或改用粘贴 Cookie".to_string(),
+                                    true,
+                                );
+                            }
+                        } else {
+                            self.set_banner(
+                                "扫码已确认但服务端未下发 Cookie，请重试或改用粘贴 Cookie".to_string(),
+                                true,
+                            );
                         }
                     }
                 }
@@ -2270,7 +2503,7 @@ impl AppUi {
                     if info.logged_in {
                         self.settings.qq_uin = info.uin.clone();
                         self.settings.qq_nickname = info.nickname.clone();
-                        self.settings.save();
+                        self.save_settings();
                         if self.settings.playback_backend == PlaybackBackend::QQMusic {
                             self.fetch_sidebar_playlists();
                         }
@@ -2368,6 +2601,12 @@ impl AppUi {
                     Err(e) => self.set_banner(e, true),
                 },
                 AsyncMsg::PlaybackUpdated(mut st) => {
+                    let prev_ne_id = self
+                        .smtc
+                        .adam_id
+                        .as_deref()
+                        .map(netease_api::strip_ne_id)
+                        .unwrap_or_default();
                     if st.artwork_url.is_none() {
                         if let Some(ref b64) = st.thumbnail_base64 {
                             let smtc_key = format!("smtc://{}\x1f{}", st.title, st.artist);
@@ -2384,6 +2623,37 @@ impl AppUi {
                         }
                     }
                     self.on_playback_state_changed(st);
+                    if self.settings.playback_backend == PlaybackBackend::NetEase
+                        && self.listen_together.in_room
+                    {
+                        let new_ne_id = self
+                            .smtc
+                            .adam_id
+                            .as_deref()
+                            .map(netease_api::strip_ne_id)
+                            .unwrap_or_default();
+                        if !new_ne_id.is_empty() && new_ne_id.chars().all(|c| c.is_ascii_digit()) {
+                            if new_ne_id != prev_ne_id
+                                && new_ne_id != self.listen_together.last_synced_song_id
+                                && (self.listen_together.pending_local_track_broadcast
+                                    || !prev_ne_id.is_empty())
+                            {
+                                self.listen_together.pending_local_track_broadcast = false;
+                                self.report_listen_together_local_track_switch(
+                                    &new_ne_id,
+                                    &prev_ne_id,
+                                );
+                            } else if self.listen_together.pending_local_track_broadcast
+                                && self.smtc.status == "Playing"
+                                && self.smtc.position_sec < 2.2
+                            {
+                                // Pressing Prev past 4s restarts the same track from 0:00 -> sync seek 0!
+                                self.listen_together.pending_local_track_broadcast = false;
+                                self.report_listen_together_local_control("seek", Some(0.0));
+                            }
+                        }
+                        self.refresh_listen_together_vip_warning();
+                    }
                 }
                 AsyncMsg::AgentStatusUpdated(st) => {
                     self.agent_status = st;
@@ -2411,7 +2681,7 @@ impl AppUi {
                         if let Some(ref det_sf) = res.detected_storefront {
                             if !det_sf.is_empty() && det_sf != &self.settings.storefront {
                                 self.settings.storefront = det_sf.clone();
-                                self.settings.save();
+                                self.save_settings();
                                 self.fetch_home_charts();
                             }
                         }
@@ -2617,6 +2887,298 @@ impl AppUi {
                         self.fetch_sidebar_playlists();
                     }
                     self.set_banner(message, !ok);
+                }
+                AsyncMsg::ListenTogetherCreated(res) => {
+                    self.listen_together.busy = false;
+                    match res {
+                        Ok(st) => {
+                            let inviter_id = if st.creator_id != 0 {
+                                st.creator_id
+                            } else {
+                                self.settings.netease_uid
+                            };
+                            let cur_sid = self.smtc.adam_id.as_deref();
+                            let share_url =
+                                listen_together::build_share_url(&st.room_id, inviter_id, cur_sid);
+                            self.listen_together.in_room = true;
+                            self.listen_together.room_id = st.room_id.clone();
+                            self.listen_together.creator_id = inviter_id;
+                            self.listen_together.share_url = share_url.clone();
+                            self.listen_together.users = st.users;
+                            self.listen_together.last_applied_remote_seq = 0;
+                            self.listen_together.invited_friend_ids.clear();
+                            self.listen_together.vip_warning = None;
+                            self.listen_together.last_vip_warned_song_id.clear();
+                            self.listen_together.modal_tab = 0;
+                            self.listen_together.status_text =
+                                format!("房间已创建 ({}) · 等待好友加入", st.room_id);
+                            self.listen_together.last_local_cmd_at = Instant::now();
+                            let copied = write_clipboard_unicode_text(&share_url);
+                            self.start_listen_together_poller();
+                            // If already playing a NetEase track, immediately push current queue & song to the new room
+                            let cur_q = native_player::get_queue_tracks();
+                            if !cur_q.is_empty() {
+                                let cur_id = self.smtc.adam_id.clone().unwrap_or_default();
+                                let idx = cur_q
+                                    .iter()
+                                    .position(|t| {
+                                        netease_api::strip_ne_id(&t.effective_adam_id())
+                                            == netease_api::strip_ne_id(&cur_id)
+                                    })
+                                    .unwrap_or(0);
+                                self.report_listen_together_local_play(&cur_q, idx);
+                            }
+                            self.refresh_listen_together_vip_warning();
+                            self.set_banner(
+                                if copied {
+                                    "已创建一起听房间，邀请链接已自动复制到剪贴板！".to_string()
+                                } else {
+                                    format!("已创建一起听房间：{}", st.room_id)
+                                },
+                                false,
+                            );
+                        }
+                        Err(e) => {
+                            self.listen_together.status_text = e.clone();
+                            self.set_banner(e, true);
+                        }
+                    }
+                }
+                AsyncMsg::ListenTogetherJoined(res) => {
+                    self.listen_together.busy = false;
+                    match res {
+                        Ok((st, room_tracks)) => {
+                            for u in &st.users {
+                                if let Some(ref av) = u.avatar_url {
+                                    self.request_artwork(renderer, av, false);
+                                }
+                            }
+                            let inviter_id = if st.creator_id != 0 {
+                                st.creator_id
+                            } else {
+                                self.settings.netease_uid
+                            };
+                            let share_url = listen_together::build_share_url(
+                                &st.room_id,
+                                inviter_id,
+                                st.remote_song_id.as_deref(),
+                            );
+                            self.listen_together.in_room = true;
+                            self.listen_together.room_id = st.room_id.clone();
+                            self.listen_together.creator_id = inviter_id;
+                            self.listen_together.share_url = share_url;
+                            self.listen_together.users = st.users.clone();
+                            self.listen_together.room_tracks = room_tracks;
+                            self.listen_together.last_applied_remote_seq = 0;
+                            self.listen_together.vip_warning = None;
+                            self.listen_together.last_vip_warned_song_id.clear();
+                            self.listen_together.modal_tab = 0;
+                            self.listen_together.status_text =
+                                format!("已加入一起听房间 · {} 人在线", self.listen_together.users.len().max(1));
+                            // Allow immediate initial sync to partner's current track
+                            self.listen_together.last_local_cmd_at =
+                                Instant::now() - std::time::Duration::from_secs(10);
+                            self.start_listen_together_poller();
+                            self.apply_listen_together_remote_status(st, renderer);
+                            self.set_banner("已加入网易云「一起听」房间，正在同步播放状态".to_string(), false);
+                        }
+                        Err(e) => {
+                            self.listen_together.status_text = e.clone();
+                            self.set_banner(e, true);
+                        }
+                    }
+                }
+                AsyncMsg::ListenTogetherStatusPolled(res) => {
+                    self.listen_together.busy = false;
+                    match res {
+                        Ok(st) => {
+                            if !self.listen_together.in_room && st.in_room && !st.room_id.is_empty() {
+                                // Discovered an existing active room (e.g. started on phone!)
+                                let inviter_id = if st.creator_id != 0 {
+                                    st.creator_id
+                                } else {
+                                    self.settings.netease_uid
+                                };
+                                self.listen_together.in_room = true;
+                                self.listen_together.room_id = st.room_id.clone();
+                                self.listen_together.creator_id = inviter_id;
+                                self.listen_together.share_url = listen_together::build_share_url(
+                                    &st.room_id,
+                                    inviter_id,
+                                    st.remote_song_id.as_deref(),
+                                );
+                                self.listen_together.last_applied_remote_seq = 0;
+                                self.listen_together.last_local_cmd_at =
+                                    Instant::now() - std::time::Duration::from_secs(10);
+                                self.start_listen_together_poller();
+                                self.execute_action(UiAction::LtSyncRoomPlaylist);
+                                self.set_banner("已同步你当前活跃的一起听房间".to_string(), false);
+                            }
+                            if self.listen_together.in_room {
+                                self.apply_listen_together_remote_status(st, renderer);
+                            } else {
+                                self.listen_together.status_text =
+                                    "当前未在任何一起听房间中".to_string();
+                            }
+                        }
+                        Err(e) => {
+                            if self.listen_together.modal_open {
+                                self.listen_together.status_text = e;
+                            }
+                        }
+                    }
+                }
+                AsyncMsg::ListenTogetherPlaylistLoaded(res) => {
+                    self.listen_together.busy = false;
+                    match res {
+                        Ok(tracks) => {
+                            let n = tracks.len();
+                            self.listen_together.room_tracks = tracks;
+                            self.refresh_listen_together_vip_warning();
+                            if n > 0 {
+                                self.set_banner(format!("已同步一起听房间歌单（共 {n} 首）"), false);
+                            }
+                        }
+                        Err(e) => {
+                            self.set_banner(e, true);
+                        }
+                    }
+                }
+                AsyncMsg::ListenTogetherInvitesLoaded(res) => {
+                    self.listen_together.busy = false;
+                    match res {
+                        Ok(invites) => {
+                            for inv in &invites {
+                                if let Some(ref av) = inv.inviter_avatar {
+                                    self.request_artwork(renderer, av, false);
+                                }
+                            }
+                            let n = invites.len();
+                            self.listen_together.inbox_invites = invites;
+                            if !self.listen_together.in_room {
+                                self.listen_together.status_text = if n > 0 {
+                                    format!("在私信中发现 {n} 条一起听邀请")
+                                } else {
+                                    "暂未发现新的私信一起听邀请（可直接粘贴口令/短链或邀请互关好友）".to_string()
+                                };
+                            }
+                        }
+                        Err(e) => {
+                            if !self.listen_together.in_room {
+                                self.listen_together.status_text = e;
+                            }
+                        }
+                    }
+                }
+                AsyncMsg::ListenTogetherMutualFriendsLoaded(res) => {
+                    match res {
+                        Ok(friends) => {
+                            for f in &friends {
+                                if let Some(ref av) = f.avatar_url {
+                                    self.request_artwork(renderer, av, false);
+                                }
+                            }
+                            self.listen_together.mutual_friends = friends;
+                        }
+                        Err(e) => {
+                            if self.listen_together.mutual_friends.is_empty()
+                                && self.listen_together.modal_open
+                                && !self.listen_together.in_room
+                            {
+                                self.listen_together.status_text = e;
+                            }
+                        }
+                    }
+                }
+                AsyncMsg::ListenTogetherFriendInvited {
+                    friend_uid,
+                    friend_name,
+                    res,
+                } => {
+                    self.listen_together.busy = false;
+                    match res {
+                        Ok(created_room_opt) => {
+                            if let Some(st) = created_room_opt {
+                                let inviter_id = if st.creator_id != 0 {
+                                    st.creator_id
+                                } else {
+                                    self.settings.netease_uid
+                                };
+                                let cur_sid = self.smtc.adam_id.as_deref();
+                                let share_url = listen_together::build_share_url(
+                                    &st.room_id,
+                                    inviter_id,
+                                    cur_sid,
+                                );
+                                self.listen_together.in_room = true;
+                                self.listen_together.room_id = st.room_id.clone();
+                                self.listen_together.creator_id = inviter_id;
+                                self.listen_together.share_url = share_url;
+                                self.listen_together.users = st.users;
+                                self.listen_together.last_applied_remote_seq = 0;
+                                self.listen_together.vip_warning = None;
+                                self.listen_together.last_vip_warned_song_id.clear();
+                                self.listen_together.last_local_cmd_at = Instant::now();
+                                self.start_listen_together_poller();
+                                let cur_q = native_player::get_queue_tracks();
+                                if !cur_q.is_empty() {
+                                    let cur_id = self.smtc.adam_id.clone().unwrap_or_default();
+                                    let idx = cur_q
+                                        .iter()
+                                        .position(|t| {
+                                            netease_api::strip_ne_id(&t.effective_adam_id())
+                                                == netease_api::strip_ne_id(&cur_id)
+                                        })
+                                        .unwrap_or(0);
+                                    self.report_listen_together_local_play(&cur_q, idx);
+                                }
+                            }
+                            self.listen_together.invited_friend_ids.insert(friend_uid);
+                            self.listen_together.status_text =
+                                format!("已向「{friend_name}」发送一起听私信邀请");
+                            self.set_banner(
+                                format!("已向互关好友「{friend_name}」发送一起听私信邀请"),
+                                false,
+                            );
+                            self.refresh_listen_together_vip_warning();
+                        }
+                        Err(e) => {
+                            self.listen_together.status_text = e.clone();
+                            self.set_banner(e, true);
+                        }
+                    }
+                }
+                AsyncMsg::ListenTogetherShortLinkResolved(res) => {
+                    self.listen_together.busy = false;
+                    match res {
+                        Ok(parsed) => {
+                            self.execute_action(UiAction::LtJoinInvite {
+                                room_id: parsed.room_id,
+                                inviter_id: parsed.inviter_id,
+                            });
+                        }
+                        Err(e) => {
+                            self.listen_together.status_text = e.clone();
+                            self.set_banner(e, true);
+                        }
+                    }
+                }
+                AsyncMsg::ListenTogetherEnded(_res) => {
+                    self.listen_together.busy = false;
+                    self.stop_listen_together_poller();
+                    self.listen_together.in_room = false;
+                    self.listen_together.room_id.clear();
+                    self.listen_together.share_url.clear();
+                    self.listen_together.users.clear();
+                    self.listen_together.room_tracks.clear();
+                    self.listen_together.invited_friend_ids.clear();
+                    self.listen_together.vip_warning = None;
+                    self.listen_together.last_vip_warned_song_id.clear();
+                    self.listen_together.last_applied_remote_seq = 0;
+                    self.listen_together.pending_local_track_broadcast = false;
+                    self.listen_together.last_synced_song_id.clear();
+                    self.listen_together.status_text = "已退出一起听房间".to_string();
+                    self.set_banner("已退出网易云一起听房间".to_string(), false);
                 }
             }
         }
@@ -3442,6 +4004,9 @@ impl AppUi {
         // state never hijacks or deadlocks controls on the newly selected backend!
         match prev {
             PlaybackBackend::NetEase | PlaybackBackend::QQMusic => {
+                if prev == PlaybackBackend::NetEase && self.listen_together.in_room {
+                    self.stop_listen_together_poller();
+                }
                 native_player::stop_and_clear();
             }
             PlaybackBackend::AppleMusicWeb => {
@@ -3464,7 +4029,7 @@ impl AppUi {
         self.settings.playback_backend = next;
         sync_backend_runtime_globals(&self.settings);
         if self.wake_hwnd != 0 {
-            self.settings.save();
+            self.save_settings();
         }
         am_agent::set_saved_volume(saved_vol);
         native_player::set_saved_volume(saved_vol);
@@ -3579,11 +4144,13 @@ impl AppUi {
 
     pub fn apply_pasted_netease_cookie(&mut self, raw: &str) -> bool {
         let norm = netease_api::normalize_netease_cookie(raw);
-        if norm.is_empty() {
+        if !netease_api::has_music_u_cookie(&norm) {
             return false;
         }
         self.settings.netease_cookie = norm.clone();
-        self.settings.save();
+        self.netease_account.logged_in = true;
+        self.netease_account.message = "已保存网易云 Cookie，正在验证账号并同步歌单...".to_string();
+        self.save_settings();
         self.netease_qr = None;
         self.verify_netease_account_async(norm);
         self.set_banner("已保存网易云 Cookie，正在验证账号并同步歌单...".to_string(), false);
@@ -3603,7 +4170,7 @@ impl AppUi {
         if !uin.is_empty() {
             self.settings.qq_uin = uin;
         }
-        self.settings.save();
+        self.save_settings();
         self.verify_qq_account_async(trimmed.to_string());
         self.set_banner("已保存 QQ 音乐 Cookie，正在同步个人歌单...".to_string(), false);
         true
@@ -5013,6 +5580,17 @@ impl AppUi {
         }
         let px = delta_notches * 84.0 * self.wheel_streak;
 
+        if self.listen_together.modal_open {
+            if self
+                .listen_together
+                .modal_rect
+                .contains(self.mouse_pos.0, self.mouse_pos.1)
+            {
+                self.listen_together.modal_scroll_y = (self.listen_together.modal_scroll_y - px)
+                    .clamp(0.0, self.listen_together.modal_max_scroll_y);
+            }
+            return;
+        }
         if self.show_lyrics_overlay {
             if self
                 .lyrics_view
@@ -5021,6 +5599,15 @@ impl AppUi {
             {
                 self.lyrics_view.animator.on_user_wheel(px);
             }
+            return;
+        }
+        if self.show_queue_popover
+            && self.queue_popover_rect.w > 0.0
+            && self
+                .queue_popover_rect
+                .contains(self.mouse_pos.0, self.mouse_pos.1)
+        {
+            self.queue_scroll_y = (self.queue_scroll_y - px).clamp(0.0, self.queue_max_scroll_y);
             return;
         }
         if self.sidebar_nav_rect.w > 0.0
@@ -5399,7 +5986,7 @@ impl AppUi {
         }
         self.settings.user_token = norm.clone();
         self.settings.token_cleared_by_user = false;
-        self.settings.save();
+        self.save_settings();
         self.token_box_focused = false;
 
         let cur_route = self.route.clone();
@@ -5439,6 +6026,11 @@ impl AppUi {
     }
 
     pub fn on_paste_text(&mut self, pasted: &str) -> bool {
+        if self.listen_together.modal_open && !self.listen_together.in_room {
+            if self.join_listen_together_from_text(pasted) {
+                return true;
+            }
+        }
         if self.show_lyrics_overlay {
             let trimmed = pasted.trim().trim_matches('"');
             let p = std::path::Path::new(trimmed);
@@ -5539,7 +6131,7 @@ impl AppUi {
         self.active_drag = None;
 
         if self.show_lyrics_overlay {
-            if self.context_menu.is_some() {
+            if self.context_menu.is_some() || self.listen_together.modal_open {
                 return true;
             }
             if let Some(hz) = self
@@ -5664,7 +6256,7 @@ impl AppUi {
         }
 
         if self.show_lyrics_overlay {
-            if self.context_menu.is_some() {
+            if self.context_menu.is_some() || self.listen_together.modal_open {
                 let hit = self
                     .hit_regions
                     .iter()
@@ -5675,6 +6267,7 @@ impl AppUi {
                     self.execute_action(act);
                 } else {
                     self.context_menu = None;
+                    self.listen_together.modal_open = false;
                 }
                 return true;
             }
@@ -5699,6 +6292,7 @@ impl AppUi {
             && !self.show_more_popover
             && self.context_menu.is_none()
             && self.transfer_modal.is_none()
+            && !self.listen_together.modal_open
         {
             let vhit = self
                 .viz_state
@@ -5765,7 +6359,7 @@ impl AppUi {
                     self.execute_action(UiAction::SetVolumeRatio(ratio));
                 }
                 if commit && self.wake_hwnd != 0 {
-                    self.settings.save();
+                    self.save_settings();
                 }
             }
             ActiveDrag::BinauralWidth(bar) => {
@@ -5791,7 +6385,7 @@ impl AppUi {
                 let rad = (t * 28.0).round();
                 self.settings.window_corner_radius = rad;
                 if commit && self.wake_hwnd != 0 {
-                    self.settings.save();
+                    self.save_settings();
                 }
             }
             ActiveDrag::VizCustomFps(bar) => {
@@ -5800,7 +6394,7 @@ impl AppUi {
                 self.settings.viz_custom_fps = fps.clamp(30, 360);
                 self.settings.viz_fps_cap = FpsCap::Custom;
                 if commit && self.wake_hwnd != 0 {
-                    self.settings.save();
+                    self.save_settings();
                 }
             }
             ActiveDrag::LyricsCustomFps(bar) => {
@@ -5809,7 +6403,7 @@ impl AppUi {
                 self.settings.lyrics_custom_fps = fps.clamp(30, 360);
                 self.settings.lyrics_fps_cap = FpsCap::Custom;
                 if commit && self.wake_hwnd != 0 {
-                    self.settings.save();
+                    self.save_settings();
                 }
             }
             ActiveDrag::SearchTextSelect => {
@@ -5908,7 +6502,7 @@ impl AppUi {
             LyricsHitAction::ToggleFreeBlur => {
                 self.lyrics_view.music_free_blur = !self.lyrics_view.music_free_blur;
                 self.settings.lyrics_free_blur = self.lyrics_view.music_free_blur;
-                self.settings.save();
+                self.save_settings();
             }
             LyricsHitAction::ToggleImmersiveMode => {
                 self.execute_action(UiAction::ToggleLyricsImmersiveMode);
@@ -5924,6 +6518,9 @@ impl AppUi {
                         from_lyrics: true,
                     });
                 }
+            }
+            LyricsHitAction::OpenListenTogether => {
+                self.execute_action(UiAction::OpenListenTogetherModal);
             }
             LyricsHitAction::ImportLocalLyrics => {
                 if let Some(path) = pick_local_lyrics_file_dialog(self.wake_hwnd) {
@@ -5965,7 +6562,7 @@ impl AppUi {
             VizHitAction::SelectStyle(st) => {
                 self.viz_state.style = st;
                 self.settings.viz_default_style = st;
-                self.settings.save();
+                self.save_settings();
             }
             VizHitAction::InspectorReset => {
                 audio_viz::trigger_inspector_reset();
@@ -6150,7 +6747,7 @@ impl AppUi {
                         1.0
                     };
                     if self.wake_hwnd != 0 {
-                        self.settings.save();
+                        self.save_settings();
                     }
                 }
             }
@@ -6171,7 +6768,7 @@ impl AppUi {
                     self.settings.hidden_sidebar_keys.push(k);
                 }
                 if self.wake_hwnd != 0 {
-                    self.settings.save();
+                    self.save_settings();
                 }
             }
             UiAction::ToggleSectionLibrary => {
@@ -6485,7 +7082,7 @@ impl AppUi {
                     Some(ActiveDrag::LyricsVolume(_) | ActiveDrag::PopoverVolume(_))
                 );
                 if self.wake_hwnd != 0 && !dragging_vol {
-                    self.settings.save();
+                    self.save_settings();
                 }
                 let backend = self.settings.playback_backend;
                 let tx = self.tx.clone();
@@ -6547,6 +7144,19 @@ impl AppUi {
             UiAction::ToggleQueuePopover => {
                 self.show_queue_popover = !self.show_queue_popover;
                 self.show_more_popover = false;
+                if self.show_queue_popover {
+                    let q = self.active_queue_tracks();
+                    let cur_idx = self
+                        .smtc
+                        .adam_id
+                        .as_deref()
+                        .and_then(|aid| q.iter().position(|t| t.effective_adam_id() == aid))
+                        .unwrap_or(0);
+                    let content_h = (q.len() as f32) * 40.0;
+                    let max_scroll = (content_h - 292.0).max(0.0);
+                    self.queue_max_scroll_y = max_scroll;
+                    self.queue_scroll_y = ((cur_idx as f32) * 40.0 - 108.0).clamp(0.0, max_scroll);
+                }
             }
             UiAction::ToggleMorePopover => {
                 self.show_more_popover = !self.show_more_popover;
@@ -6648,7 +7258,7 @@ impl AppUi {
             UiAction::ToggleWebAmWindow => {
                 let next_vis = !self.web_am_status.window_visible;
                 self.settings.web_am_hide_window = !next_vis;
-                self.settings.save();
+                self.save_settings();
                 web_am_player::set_window_visible(next_vis);
                 self.web_am_status = web_am_player::get_status();
             }
@@ -6722,13 +7332,24 @@ impl AppUi {
                 self.settings.netease_cookie.clear();
                 self.settings.netease_uid = 0;
                 self.settings.netease_nickname.clear();
-                self.settings.save();
+                self.settings.netease_vip_label.clear();
+                self.settings.netease_vip_level = 0;
+                self.settings.netease_is_vip = false;
+                self.save_settings();
                 self.netease_qr = None;
                 self.netease_account = netease_api::NetEaseAccountInfo {
                     logged_in: false,
                     message: "已退出网易云账号".to_string(),
                     ..Default::default()
                 };
+                self.stop_listen_together_poller();
+                self.listen_together.in_room = false;
+                self.listen_together.room_id.clear();
+                self.listen_together.users.clear();
+                self.listen_together.room_tracks.clear();
+                self.listen_together.mutual_friends.clear();
+                self.listen_together.inbox_invites.clear();
+                self.listen_together.vip_warning = None;
                 if self.settings.playback_backend == PlaybackBackend::NetEase {
                     self.sidebar_playlists.clear();
                 }
@@ -6736,7 +7357,7 @@ impl AppUi {
             }
             UiAction::SetNetEaseQuality(q) => {
                 self.settings.netease_quality = q;
-                self.settings.save();
+                self.save_settings();
                 self.set_banner(format!("网易云音质偏好已设为：{}", q.label()), false);
             }
             UiAction::OpenWebNetEase => {
@@ -6758,7 +7379,7 @@ impl AppUi {
                 self.settings.qq_cookie.clear();
                 self.settings.qq_uin.clear();
                 self.settings.qq_nickname.clear();
-                self.settings.save();
+                self.save_settings();
                 self.qq_account = qq_api::QQAccountInfo {
                     logged_in: false,
                     message: "已清除 QQ 音乐登录 Cookie".to_string(),
@@ -6771,13 +7392,13 @@ impl AppUi {
             }
             UiAction::SetQQQuality(q) => {
                 self.settings.qq_quality = q;
-                self.settings.save();
+                self.save_settings();
                 self.set_banner(format!("QQ 音乐音质偏好已设为：{}", q.label()), false);
             }
             UiAction::SetStorefront(sf) => {
                 self.settings.storefront = sf;
                 self.settings.storefront_customized = true;
-                self.settings.save();
+                self.save_settings();
                 self.fetch_home_charts();
             }
             UiAction::SyncOfficialClientAccount => {
@@ -6799,7 +7420,7 @@ impl AppUi {
                         synced_parts.push("已恢复资料库授权 Token".to_string());
                     }
                 }
-                self.settings.save();
+                self.save_settings();
                 self.fetch_home_charts();
                 if !self.settings.user_token.is_empty() {
                     self.dispatch_background_playlist_sync();
@@ -6884,7 +7505,7 @@ impl AppUi {
             UiAction::ClearUserToken => {
                 self.settings.user_token.clear();
                 self.settings.token_cleared_by_user = true;
-                self.settings.save();
+                self.save_settings();
                 self.sidebar_playlists.clear();
                 self.playlist_cache = PlaylistDiskCache::default();
                 if let Some(p) = PlaylistDiskCache::cache_path() {
@@ -6897,7 +7518,7 @@ impl AppUi {
             }
             UiAction::SetUseBuiltinService(v) => {
                 self.settings.use_builtin_service = v;
-                self.settings.save();
+                self.save_settings();
             }
             UiAction::DisconnectBuiltinService => {
                 let tx = self.tx.clone();
@@ -6968,20 +7589,20 @@ impl AppUi {
             UiAction::SetVizFpsCap(cap) => {
                 self.settings.viz_fps_cap = cap;
                 if self.wake_hwnd != 0 {
-                    self.settings.save();
+                    self.save_settings();
                 }
             }
             UiAction::SetLyricsFpsCap(cap) => {
                 self.settings.lyrics_fps_cap = cap;
                 if self.wake_hwnd != 0 {
-                    self.settings.save();
+                    self.save_settings();
                 }
             }
             UiAction::SetVizCustomFps(fps) => {
                 self.settings.viz_fps_cap = FpsCap::Custom;
                 self.settings.viz_custom_fps = fps.clamp(30, 360);
                 if self.wake_hwnd != 0 {
-                    self.settings.save();
+                    self.save_settings();
                 }
             }
             UiAction::ScrubVizCustomFps(bar) => {
@@ -6989,14 +7610,14 @@ impl AppUi {
                 self.settings.viz_fps_cap = FpsCap::Custom;
                 self.settings.viz_custom_fps = ((30.0 + t * 330.0).round() as u32).clamp(30, 360);
                 if self.wake_hwnd != 0 {
-                    self.settings.save();
+                    self.save_settings();
                 }
             }
             UiAction::SetLyricsCustomFps(fps) => {
                 self.settings.lyrics_fps_cap = FpsCap::Custom;
                 self.settings.lyrics_custom_fps = fps.clamp(30, 360);
                 if self.wake_hwnd != 0 {
-                    self.settings.save();
+                    self.save_settings();
                 }
             }
             UiAction::ScrubLyricsCustomFps(bar) => {
@@ -7004,69 +7625,69 @@ impl AppUi {
                 self.settings.lyrics_fps_cap = FpsCap::Custom;
                 self.settings.lyrics_custom_fps = ((30.0 + t * 330.0).round() as u32).clamp(30, 360);
                 if self.wake_hwnd != 0 {
-                    self.settings.save();
+                    self.save_settings();
                 }
             }
             UiAction::ToggleLyricsLimitUnfocusedFps => {
                 self.settings.lyrics_limit_unfocused_fps = !self.settings.lyrics_limit_unfocused_fps;
                 if self.wake_hwnd != 0 {
-                    self.settings.save();
+                    self.save_settings();
                 }
             }
             UiAction::SetWindowCornerRadius(rad) => {
                 self.settings.window_corner_radius = rad.clamp(0.0, 28.0).round();
                 if self.wake_hwnd != 0 {
-                    self.settings.save();
+                    self.save_settings();
                 }
             }
             UiAction::ScrubWindowCornerRadius(bar) => {
                 let t = ((self.mouse_pos.0 - bar.x) / bar.w.max(1.0)).clamp(0.0, 1.0);
                 self.settings.window_corner_radius = (t * 28.0).round();
                 if self.wake_hwnd != 0 {
-                    self.settings.save();
+                    self.save_settings();
                 }
             }
             UiAction::ToggleLiquidGlass => {
                 self.settings.liquid_glass_enabled = !self.settings.liquid_glass_enabled;
                 if self.wake_hwnd != 0 {
-                    self.settings.save();
+                    self.save_settings();
                 }
             }
             UiAction::ToggleLyricsLatinByWord => {
                 self.settings.lyrics_latin_by_word = !self.settings.lyrics_latin_by_word;
                 self.lyrics_view.animator.latin_by_word = self.settings.lyrics_latin_by_word;
                 if self.wake_hwnd != 0 {
-                    self.settings.save();
+                    self.save_settings();
                 }
             }
             UiAction::SetLyricsNonEmphasisEffect(fx) => {
                 self.settings.lyrics_non_emphasis_effect = fx;
                 if self.wake_hwnd != 0 {
-                    self.settings.save();
+                    self.save_settings();
                 }
             }
             UiAction::ToggleLyricsAutoEmphasis => {
                 self.settings.lyrics_auto_emphasis = !self.settings.lyrics_auto_emphasis;
                 if self.wake_hwnd != 0 {
-                    self.settings.save();
+                    self.save_settings();
                 }
             }
             UiAction::ToggleLyricsFrontierWave => {
                 self.settings.lyrics_frontier_wave = !self.settings.lyrics_frontier_wave;
                 if self.wake_hwnd != 0 {
-                    self.settings.save();
+                    self.save_settings();
                 }
             }
             UiAction::ToggleLyricsEndHoldGlow => {
                 self.settings.lyrics_end_hold_glow = !self.settings.lyrics_end_hold_glow;
                 if self.wake_hwnd != 0 {
-                    self.settings.save();
+                    self.save_settings();
                 }
             }
             UiAction::ToggleLyricsBlurDownsample => {
                 self.settings.lyrics_blur_downsample = !self.settings.lyrics_blur_downsample;
                 if self.wake_hwnd != 0 {
-                    self.settings.save();
+                    self.save_settings();
                 }
             }
             UiAction::ToggleMotionArtwork => {
@@ -7104,7 +7725,7 @@ impl AppUi {
                     }
                 }
                 if self.wake_hwnd != 0 {
-                    self.settings.save();
+                    self.save_settings();
                 }
             }
             UiAction::CheckForUpdates => {
@@ -7181,20 +7802,20 @@ impl AppUi {
                 self.settings.live_eq_icon_spectrum = !self.settings.live_eq_icon_spectrum;
                 self.update_viz_subscription();
                 if self.wake_hwnd != 0 {
-                    self.settings.save();
+                    self.save_settings();
                 }
             }
             UiAction::ToggleAggressiveMemoryRelease => {
                 self.settings.aggressive_memory_release = !self.settings.aggressive_memory_release;
                 self.pending_route_mem_trim = true;
                 if self.wake_hwnd != 0 {
-                    self.settings.save();
+                    self.save_settings();
                 }
             }
             UiAction::ToggleLyricsBlurMode => {
                 self.settings.lyrics_free_blur = !self.settings.lyrics_free_blur;
                 self.lyrics_view.music_free_blur = self.settings.lyrics_free_blur;
-                self.settings.save();
+                self.save_settings();
             }
             UiAction::ToggleLyricsImmersiveMode => {
                 self.settings.lyrics_immersive_mode = !self.settings.lyrics_immersive_mode;
@@ -7202,7 +7823,7 @@ impl AppUi {
                 self.last_mouse_move_at = Instant::now();
                 self.context_menu = None;
                 if self.wake_hwnd != 0 {
-                    self.settings.save();
+                    self.save_settings();
                 }
                 self.set_banner(
                     if self.settings.lyrics_immersive_mode {
@@ -7217,7 +7838,7 @@ impl AppUi {
                 self.settings.language = lang;
                 i18n::set_active_language(lang);
                 if self.wake_hwnd != 0 {
-                    self.settings.save();
+                    self.save_settings();
                     if self.settings.playback_backend.is_apple_music() {
                         // Invalidate cached localized Apple Music editorial shelves so next visit refetches in new locale
                         self.home_shelves.clear();
@@ -7661,6 +8282,272 @@ impl AppUi {
                     }
                 }
             }
+            UiAction::OpenListenTogetherModal => {
+                self.context_menu = None;
+                self.show_more_popover = false;
+                self.show_queue_popover = false;
+                self.listen_together.modal_open = true;
+                self.listen_together.modal_scroll_y = 0.0;
+                if self.netease_account.logged_in && !self.settings.netease_cookie.is_empty() {
+                    self.execute_action(UiAction::LtFetchInboxInvites);
+                    if self.listen_together.mutual_friends.is_empty() {
+                        self.execute_action(UiAction::LtFetchMutualFriends);
+                    }
+                    self.execute_action(UiAction::LtRefreshStatus);
+                }
+            }
+            UiAction::CloseListenTogetherModal => {
+                self.listen_together.modal_open = false;
+            }
+            UiAction::LtCreateRoom => {
+                if self.settings.netease_cookie.trim().is_empty() {
+                    self.set_banner("请先在「设置 -> 网易云音乐」登录账号后再开启一起听".to_string(), true);
+                    return;
+                }
+                self.listen_together.busy = true;
+                self.listen_together.status_text = "正在创建一起听房间...".to_string();
+                let cookie = self.settings.netease_cookie.clone();
+                let tx = self.tx.clone();
+                let hwnd = self.wake_hwnd;
+                self.rt.spawn(async move {
+                    let res = listen_together::create_room(&cookie).await;
+                    let _ = tx.send(AsyncMsg::ListenTogetherCreated(res));
+                    Self::post_ui_wake(hwnd);
+                });
+            }
+            UiAction::LtJoinFromClipboard => {
+                let Some(clip) = read_clipboard_unicode_text() else {
+                    self.set_banner("剪贴板为空，请先复制好友发来的网易云「一起听」邀请口令或链接".to_string(), true);
+                    return;
+                };
+                if !self.join_listen_together_from_text(&clip) {
+                    self.set_banner(
+                        "未在剪贴板中识别到一起听邀请口令或房间号（支持 https://163cn.tv/...、完整分享链接或 房间号:邀请者ID）".to_string(),
+                        true,
+                    );
+                }
+            }
+            UiAction::LtJoinInvite {
+                room_id,
+                inviter_id,
+            } => {
+                if self.settings.netease_cookie.trim().is_empty() {
+                    self.set_banner("请先在「设置 -> 网易云音乐」登录账号后再加入房间".to_string(), true);
+                    return;
+                }
+                self.listen_together.busy = true;
+                self.listen_together.status_text = format!("正在加入房间 {room_id}...");
+                let cookie = self.settings.netease_cookie.clone();
+                let tx = self.tx.clone();
+                let hwnd = self.wake_hwnd;
+                self.rt.spawn(async move {
+                    let res = async {
+                        let st = listen_together::accept_invitation(&room_id, inviter_id, &cookie).await?;
+                        let tracks = listen_together::fetch_room_playlist(&st.room_id, &cookie)
+                            .await
+                            .unwrap_or_default();
+                        Ok::<_, String>((st, tracks))
+                    }
+                    .await;
+                    let _ = tx.send(AsyncMsg::ListenTogetherJoined(res));
+                    Self::post_ui_wake(hwnd);
+                });
+            }
+            UiAction::LtRefreshStatus => {
+                if self.settings.netease_cookie.trim().is_empty() {
+                    return;
+                }
+                let cookie = self.settings.netease_cookie.clone();
+                let tx = self.tx.clone();
+                let hwnd = self.wake_hwnd;
+                self.rt.spawn(async move {
+                    let res = listen_together::fetch_status(&cookie).await;
+                    let _ = tx.send(AsyncMsg::ListenTogetherStatusPolled(res));
+                    Self::post_ui_wake(hwnd);
+                });
+            }
+            UiAction::LtForceResync => {
+                if self.settings.netease_cookie.trim().is_empty() {
+                    return;
+                }
+                if !self.listen_together.in_room || self.listen_together.room_id.is_empty() {
+                    self.execute_action(UiAction::LtRefreshStatus);
+                    return;
+                }
+                self.listen_together.busy = true;
+                self.listen_together.status_text = "正在与对方校准播放进度...".to_string();
+                let room_id = self.listen_together.room_id.clone();
+                let cookie = self.settings.netease_cookie.clone();
+                let snap = native_player::get_playback_state();
+                let sid = snap.adam_id.unwrap_or_else(|| "0".to_string());
+                let play_st = if snap.status == "Playing" { "PLAY" } else { "PAUSE" };
+                let prog_ms = (snap.position_sec.max(0.0) * 1000.0).round() as i64;
+                let tx = self.tx.clone();
+                let hwnd = self.wake_hwnd;
+                self.rt.spawn(async move {
+                    let res = listen_together::poll_room_sync(
+                        &room_id,
+                        &sid,
+                        play_st,
+                        prog_ms,
+                        true,
+                        true,
+                        &cookie,
+                    )
+                    .await;
+                    let _ = tx.send(AsyncMsg::ListenTogetherStatusPolled(res));
+                    Self::post_ui_wake(hwnd);
+                });
+            }
+            UiAction::LtFetchInboxInvites => {
+                if self.settings.netease_cookie.trim().is_empty() {
+                    return;
+                }
+                self.listen_together.busy = true;
+                let cookie = self.settings.netease_cookie.clone();
+                let tx = self.tx.clone();
+                let hwnd = self.wake_hwnd;
+                self.rt.spawn(async move {
+                    let res = listen_together::fetch_inbox_invites(&cookie).await;
+                    let _ = tx.send(AsyncMsg::ListenTogetherInvitesLoaded(res));
+                    Self::post_ui_wake(hwnd);
+                });
+            }
+            UiAction::LtFetchMutualFriends => {
+                if self.settings.netease_cookie.trim().is_empty() || self.settings.netease_uid == 0 {
+                    return;
+                }
+                let uid = self.settings.netease_uid;
+                let cookie = self.settings.netease_cookie.clone();
+                let tx = self.tx.clone();
+                let hwnd = self.wake_hwnd;
+                self.rt.spawn(async move {
+                    let res = listen_together::fetch_mutual_friends(uid, &cookie).await;
+                    let _ = tx.send(AsyncMsg::ListenTogetherMutualFriendsLoaded(res));
+                    Self::post_ui_wake(hwnd);
+                });
+            }
+            UiAction::LtInviteFriend {
+                friend_uid,
+                friend_name,
+            } => {
+                if self.settings.netease_cookie.trim().is_empty() {
+                    self.set_banner("请先在「设置 -> 网易云音乐」登录账号后再邀请好友".to_string(), true);
+                    return;
+                }
+                self.listen_together.busy = true;
+                self.listen_together.status_text = format!("正在邀请「{friend_name}」一起听...");
+                let in_room = self.listen_together.in_room && !self.listen_together.room_id.is_empty();
+                let existing_room_id = self.listen_together.room_id.clone();
+                let my_uid = self.listen_together.creator_id.max(self.settings.netease_uid);
+                let cur_sid = self.smtc.adam_id.clone();
+                let cookie = self.settings.netease_cookie.clone();
+                let tx = self.tx.clone();
+                let hwnd = self.wake_hwnd;
+                self.rt.spawn(async move {
+                    let res = if in_room {
+                        listen_together::send_room_invite_to_friend(
+                            friend_uid,
+                            &existing_room_id,
+                            my_uid,
+                            cur_sid.as_deref(),
+                            &cookie,
+                        )
+                        .await
+                        .map(|_| None)
+                    } else {
+                        async {
+                            let st = listen_together::create_room(&cookie).await?;
+                            let inviter = if st.creator_id != 0 {
+                                st.creator_id
+                            } else {
+                                my_uid
+                            };
+                            listen_together::send_room_invite_to_friend(
+                                friend_uid,
+                                &st.room_id,
+                                inviter,
+                                cur_sid.as_deref(),
+                                &cookie,
+                            )
+                            .await?;
+                            Ok::<_, String>(Some(st))
+                        }
+                        .await
+                    };
+                    let _ = tx.send(AsyncMsg::ListenTogetherFriendInvited {
+                        friend_uid,
+                        friend_name,
+                        res,
+                    });
+                    Self::post_ui_wake(hwnd);
+                });
+            }
+            UiAction::LtSetModalTab(tab) => {
+                self.listen_together.modal_tab = tab;
+                self.listen_together.modal_scroll_y = 0.0;
+                if tab == 1 && self.listen_together.inbox_invites.is_empty() {
+                    self.execute_action(UiAction::LtFetchInboxInvites);
+                } else if tab == 0 && self.listen_together.mutual_friends.is_empty() {
+                    self.execute_action(UiAction::LtFetchMutualFriends);
+                }
+            }
+            UiAction::LtCopyShareUrl => {
+                if !self.listen_together.room_id.is_empty() {
+                    let url = listen_together::build_share_url(
+                        &self.listen_together.room_id,
+                        self.listen_together.creator_id.max(self.settings.netease_uid),
+                        self.smtc.adam_id.as_deref(),
+                    );
+                    self.listen_together.share_url = url.clone();
+                    if write_clipboard_unicode_text(&url) {
+                        self.set_banner("已复制一起听邀请链接，发给好友用网易云打开即可加入".to_string(), false);
+                    } else {
+                        self.set_banner("复制失败，请重试".to_string(), true);
+                    }
+                }
+            }
+            UiAction::LtSyncRoomPlaylist => {
+                if !self.listen_together.in_room || self.settings.netease_cookie.trim().is_empty() {
+                    return;
+                }
+                self.listen_together.busy = true;
+                let room_id = self.listen_together.room_id.clone();
+                let cookie = self.settings.netease_cookie.clone();
+                let tx = self.tx.clone();
+                let hwnd = self.wake_hwnd;
+                self.rt.spawn(async move {
+                    let res = listen_together::fetch_room_playlist(&room_id, &cookie).await;
+                    let _ = tx.send(AsyncMsg::ListenTogetherPlaylistLoaded(res));
+                    Self::post_ui_wake(hwnd);
+                });
+            }
+            UiAction::LtPlayRoomTrack(idx) => {
+                let tracks = self.listen_together.room_tracks.clone();
+                if idx < tracks.len() {
+                    self.play_tracks_async(tracks, idx);
+                }
+            }
+            UiAction::LtEndOrLeaveRoom => {
+                let room_id = self.listen_together.room_id.clone();
+                let cookie = self.settings.netease_cookie.clone();
+                self.stop_listen_together_poller();
+                if room_id.is_empty() || cookie.trim().is_empty() {
+                    self.listen_together.in_room = false;
+                    self.listen_together.room_id.clear();
+                    self.listen_together.users.clear();
+                    self.listen_together.room_tracks.clear();
+                    return;
+                }
+                self.listen_together.busy = true;
+                let tx = self.tx.clone();
+                let hwnd = self.wake_hwnd;
+                self.rt.spawn(async move {
+                    let res = listen_together::end_room(&room_id, &cookie).await;
+                    let _ = tx.send(AsyncMsg::ListenTogetherEnded(res));
+                    Self::post_ui_wake(hwnd);
+                });
+            }
             UiAction::ImportLocalLyricsFromMenu => {
                 self.context_menu = None;
                 if let Some(path) = pick_local_lyrics_file_dialog(self.wake_hwnd) {
@@ -7669,11 +8556,11 @@ impl AppUi {
             }
             UiAction::ToggleReduceMotion => {
                 self.settings.reduce_motion = !self.settings.reduce_motion;
-                self.settings.save();
+                self.save_settings();
             }
             UiAction::ToggleReduceTransparency => {
                 self.settings.reduce_transparency = !self.settings.reduce_transparency;
-                self.settings.save();
+                self.save_settings();
             }
             UiAction::ToggleAdvancedSpatialDisclosure => {
                 self.show_advanced_spatial = !self.show_advanced_spatial;
@@ -7753,6 +8640,9 @@ impl AppUi {
         if is_ne || is_qq {
             let tag = if is_ne { "netease" } else { "qqmusic" }.to_string();
             let target_track = tracks[clamped_idx].clone();
+            if is_ne && self.listen_together.in_room {
+                self.report_listen_together_local_play(&tracks, clamped_idx);
+            }
             // Immediately stop outgoing WASAPI audio & lock playhead at 0:00 while resolving the new track!
             native_player::begin_track_transition();
             self.begin_optimistic_playback_loading(Some(&target_track), container_id);
@@ -7873,6 +8763,15 @@ impl AppUi {
                     self.playback_loading_track_id = None;
                     self.smtc.status = "Paused".to_string();
                 }
+            }
+        }
+        if backend == PlaybackBackend::NetEase && self.listen_together.in_room {
+            if action.eq_ignore_ascii_case("next") || action.eq_ignore_ascii_case("prev") {
+                // Defer broadcast until `native_player` transitions so we send the REAL new songId via `GOTO`!
+                self.listen_together.pending_local_track_broadcast = true;
+                self.listen_together.last_local_cmd_at = Instant::now();
+            } else {
+                self.report_listen_together_local_control(action, seek_sec);
             }
         }
         if self.wake_hwnd == 0
@@ -8478,6 +9377,9 @@ impl AppUi {
             );
         }
 
+        // Keep permanent top-right NetEase `一起听` pill synced into the Full-Screen Lyrics overlay too!
+        self.lyrics_view.listen_together_pill = self.build_listen_together_pill_info();
+
         // Fast path when Lyrics view is fully expanded (`lyr_open_t >= 0.996`)
         if lyr_open_t >= 0.996 {
             r.release_lyrics_transition_surfaces();
@@ -8516,6 +9418,9 @@ impl AppUi {
             );
             if self.context_menu.is_some() {
                 self.draw_context_menu(r, win_rect);
+            }
+            if self.listen_together.modal_open {
+                self.draw_listen_together_modal(r, win_rect);
             }
             if let Some((ref msg, is_err, _)) = self.banner_text.clone() {
                 self.draw_banner_toast(r, win_rect, msg, is_err);
@@ -8745,6 +9650,9 @@ impl AppUi {
         }
         if self.transfer_modal.is_some() {
             self.draw_playlist_transfer_modal(r, win_rect);
+        }
+        if self.listen_together.modal_open {
+            self.draw_listen_together_modal(r, win_rect);
         }
         if let Some((ref msg, is_err, _)) = self.banner_text.clone() {
             self.draw_banner_toast(r, content_area, msg, is_err);
@@ -9844,9 +10752,55 @@ impl AppUi {
             });
         }
 
-        // Top-right Unified Liquid Glass Functional Buttons (`刷新`, `偏好设置 •••`) — same 34x34 / r=17 centerline!
+        // Top-right Unified Liquid Glass Functional Buttons (`一起听` [NetEase], `刷新`, `偏好设置 •••`) — same 34px centerline!
         let more_r = RectF::new(min_r.x - 14.0 - bh, ty, bh, bh);
         let ref_r = RectF::new(more_r.x - 8.0 - bh, ty, bh, bh);
+        if let Some((lt_active, lt_lbl)) = self.build_listen_together_pill_info() {
+            let lt_w = if lt_active { 124.0f32 } else { 78.0f32 };
+            let lt_r = RectF::new(ref_r.x - 8.0 - lt_w, ty, lt_w, bh);
+            let lt_hov = lt_r.contains(self.mouse_pos.0, self.mouse_pos.1);
+            r.draw_liquid_glass_floating_button(
+                lt_r,
+                br,
+                if lt_active || self.listen_together.modal_open {
+                    GlassBtnVariant::Tinted(PlaybackBackend::NetEase.accent_color())
+                } else {
+                    GlassBtnVariant::Regular
+                },
+                lt_hov,
+                self.mouse_down,
+                self.mouse_pos,
+                self.glass_off(),
+            );
+            if lt_active {
+                r.fill_circle(lt_r.x + 13.0, lt_r.center_y(), 3.6, Theme::SIGNAL_GREEN);
+                r.draw_text(
+                    &lt_lbl,
+                    RectF::new(lt_r.x + 21.0, lt_r.y, lt_r.w - 27.0, lt_r.h),
+                    12.0,
+                    600,
+                    Theme::TEXT_PRIMARY,
+                    TextAlign::Left,
+                    true,
+                    false,
+                );
+            } else {
+                r.draw_text(
+                    &lt_lbl,
+                    lt_r.inset(6.0, 0.0),
+                    12.2,
+                    if lt_hov { 600 } else { 500 },
+                    Theme::TEXT_PRIMARY,
+                    TextAlign::Center,
+                    true,
+                    false,
+                );
+            }
+            self.hit_regions.push(HitRegion {
+                rect: lt_r,
+                action: UiAction::OpenListenTogetherModal,
+            });
+        }
         for (hr, ic, is_active, act) in [
             (ref_r, SfIcon::Refresh, false, UiAction::RefreshCurrentView),
             (
@@ -13384,15 +14338,15 @@ impl AppUi {
                 );
                 y += 26.0;
                 let has_qr = self.netease_qr.is_some();
-                let card_h = if has_qr { 324.0 } else { 156.0 };
+                let card_h = if has_qr { 346.0 } else { 176.0 };
                 let g_ne = RectF::new(x0, y, cw, card_h);
                 r.fill_rounded_rect(g_ne, 14.0, Theme::BG_ELEVATED);
                 r.stroke_rounded_rect(g_ne, 14.0, Theme::SEPARATOR, 1.0);
 
-                // Row 1: Account status + buttons
+                // Row 1a: Title + Action Buttons
                 r.draw_text(
                     "网易云账号",
-                    RectF::new(x0 + 18.0, y + 14.0, 96.0, 26.0),
+                    RectF::new(x0 + 18.0, y + 14.0, 120.0, 26.0),
                     14.0,
                     600,
                     Theme::TEXT_PRIMARY,
@@ -13400,26 +14354,18 @@ impl AppUi {
                     true,
                     false,
                 );
-                r.draw_text(
-                    &self.netease_account.message,
-                    RectF::new(x0 + 114.0, y + 14.0, cw - 418.0, 26.0),
-                    12.2,
-                    500,
-                    if self.netease_account.logged_in {
-                        Theme::SIGNAL_GREEN
-                    } else {
-                        Theme::TEXT_SECONDARY
-                    },
-                    TextAlign::Left,
-                    true,
-                    false,
-                );
                 let mut nx = x0 + cw - 18.0;
                 for (lbl, bw, tinted, act) in [
-                    ("退出", 52.0f32, false, UiAction::ClearNetEaseAuth),
-                    ("网页端", 60.0, false, UiAction::OpenWebNetEase),
-                    ("粘贴 Cookie", 88.0, false, UiAction::PasteNetEaseCookie),
-                    ("扫码登录", 80.0, true, UiAction::StartNetEaseQrLogin),
+                    ("退出", 48.0f32, false, UiAction::ClearNetEaseAuth),
+                    ("网页端", 56.0, false, UiAction::OpenWebNetEase),
+                    ("粘贴 Cookie", 84.0, false, UiAction::PasteNetEaseCookie),
+                    ("扫码登录", 74.0, true, UiAction::StartNetEaseQrLogin),
+                    (
+                        "一起听",
+                        62.0,
+                        self.listen_together.in_room,
+                        UiAction::OpenListenTogetherModal,
+                    ),
                 ] {
                     nx -= bw;
                     let br = RectF::new(nx, y + 13.0, bw, 28.0);
@@ -13452,11 +14398,70 @@ impl AppUi {
                     nx -= 6.0;
                 }
 
+                // Row 1b: VIP Tier/Level Badge + Live Account Status
+                let status_y = y + 46.0;
+                let mut status_x = x0 + 18.0;
+                if self.netease_account.logged_in {
+                    let vip_lbl = if self.netease_account.vip_label.trim().is_empty() {
+                        if self.netease_account.is_vip {
+                            "黑胶 VIP"
+                        } else {
+                            "普通用户"
+                        }
+                    } else {
+                        self.netease_account.vip_label.as_str()
+                    };
+                    let pill_w = (vip_lbl.chars().count() as f32 * 9.8 + 20.0).clamp(64.0, 148.0);
+                    let pill = RectF::new(status_x, status_y + 1.0, pill_w, 22.0);
+                    if self.netease_account.is_vip {
+                        r.fill_rounded_rect(pill, 11.0, Color::rgba(232, 178, 68, 0.22));
+                        r.stroke_rounded_rect(pill, 11.0, Color::rgba(246, 198, 96, 0.65), 1.0);
+                        r.draw_text(
+                            vip_lbl,
+                            pill,
+                            11.2,
+                            700,
+                            Color::rgb(252, 214, 124),
+                            TextAlign::Center,
+                            true,
+                            false,
+                        );
+                    } else {
+                        r.fill_rounded_rect(pill, 11.0, Color::rgba(255, 255, 255, 0.08));
+                        r.stroke_rounded_rect(pill, 11.0, Theme::SEPARATOR, 1.0);
+                        r.draw_text(
+                            vip_lbl,
+                            pill,
+                            11.2,
+                            500,
+                            Theme::TEXT_SECONDARY,
+                            TextAlign::Center,
+                            true,
+                            false,
+                        );
+                    }
+                    status_x = pill.right() + 10.0;
+                }
+                r.draw_text(
+                    &self.netease_account.message,
+                    RectF::new(status_x, status_y, (x0 + cw - 18.0 - status_x).max(120.0), 24.0),
+                    12.2,
+                    500,
+                    if self.netease_account.logged_in {
+                        Theme::SIGNAL_GREEN
+                    } else {
+                        Theme::TEXT_SECONDARY
+                    },
+                    TextAlign::Left,
+                    true,
+                    false,
+                );
+
                 // Inline Native Direct2D QR Code Login Panel!
-                let mut q_row_y = y + 60.0;
+                let mut q_row_y = y + 80.0;
                 if let Some(ref qr) = self.netease_qr {
-                    r.draw_line(x0 + 18.0, y + 52.0, x0 + cw - 18.0, y + 52.0, Theme::SEPARATOR, 1.0);
-                    let qr_box = RectF::new(x0 + 24.0, y + 64.0, 148.0, 148.0);
+                    r.draw_line(x0 + 18.0, y + 74.0, x0 + cw - 18.0, y + 74.0, Theme::SEPARATOR, 1.0);
+                    let qr_box = RectF::new(x0 + 24.0, y + 86.0, 148.0, 148.0);
                     r.fill_rounded_rect(qr_box, 10.0, Color::rgba(255, 255, 255, 0.98));
                     if qr.qr_width > 0 && qr.qr_modules.len() == qr.qr_width * qr.qr_width {
                         let quiet = 10.0;
@@ -13482,7 +14487,7 @@ impl AppUi {
                     let info_w = (x0 + cw - 18.0 - info_x).max(160.0);
                     r.draw_text(
                         "打开手机「网易云音乐」扫一扫",
-                        RectF::new(info_x, y + 72.0, info_w, 24.0),
+                        RectF::new(info_x, y + 94.0, info_w, 24.0),
                         15.0,
                         600,
                         Theme::TEXT_PRIMARY,
@@ -13492,7 +14497,7 @@ impl AppUi {
                     );
                     r.draw_text(
                         &qr.status_text,
-                        RectF::new(info_x, y + 102.0, info_w, 24.0),
+                        RectF::new(info_x, y + 124.0, info_w, 24.0),
                         13.0,
                         500,
                         if qr.status_code == 802 {
@@ -13508,7 +14513,7 @@ impl AppUi {
                     );
                     r.draw_text(
                         "扫码确认后自动获取 MUSIC_U 并同步你的自建/收藏歌单、每日推荐与 VIP 音质。",
-                        RectF::new(info_x, y + 130.0, info_w, 36.0),
+                        RectF::new(info_x, y + 152.0, info_w, 36.0),
                         11.6,
                         400,
                         Theme::TEXT_SECONDARY,
@@ -13516,19 +14521,19 @@ impl AppUi {
                         false,
                         true,
                     );
-                    let ref_btn = RectF::new(info_x, y + 178.0, 96.0, 28.0);
+                    let ref_btn = RectF::new(info_x, y + 200.0, 96.0, 28.0);
                     let ref_hov = ref_btn.contains(self.mouse_pos.0, self.mouse_pos.1);
                     r.draw_liquid_glass_button(ref_btn, 8.0, GlassBtnVariant::Regular, ref_hov, self.mouse_down, self.mouse_pos, self.glass_off());
                     r.draw_text("刷新二维码", ref_btn, 12.0, 500, Theme::TEXT_PRIMARY, TextAlign::Center, true, false);
                     self.hit_regions.push(HitRegion { rect: ref_btn, action: UiAction::StartNetEaseQrLogin });
 
-                    let cls_btn = RectF::new(ref_btn.right() + 8.0, y + 178.0, 68.0, 28.0);
+                    let cls_btn = RectF::new(ref_btn.right() + 8.0, y + 200.0, 68.0, 28.0);
                     let cls_hov = cls_btn.contains(self.mouse_pos.0, self.mouse_pos.1);
                     r.draw_liquid_glass_button(cls_btn, 8.0, GlassBtnVariant::Regular, cls_hov, self.mouse_down, self.mouse_pos, self.glass_off());
                     r.draw_text("收起", cls_btn, 12.0, 500, Theme::TEXT_SECONDARY, TextAlign::Center, true, false);
                     self.hit_regions.push(HitRegion { rect: cls_btn, action: UiAction::CancelNetEaseQrLogin });
 
-                    q_row_y = y + 226.0;
+                    q_row_y = y + 248.0;
                 }
 
                 r.draw_line(x0 + 18.0, q_row_y - 8.0, x0 + cw - 18.0, q_row_y - 8.0, Theme::SEPARATOR, 1.0);
@@ -15574,14 +16579,20 @@ impl AppUi {
     // ========================================================================
     fn draw_queue_popover(&mut self, r: &mut D2DRenderer, area: RectF) {
         let q = self.active_queue_tracks();
-        let pop_w = 320.0;
-        let pop_h = 340.0;
+        let pop_w = 336.0;
+        let pop_h = 368.0f32.min((area.h - 140.0).max(220.0));
         let pop = RectF::new(
-            (area.center_x() + Theme::MINI_PLAYER_MAX_WIDTH * 0.5 - pop_w).min(area.right() - pop_w - 18.0),
-            area.bottom() - Theme::MINI_PLAYER_HEIGHT - Theme::MINI_PLAYER_BOTTOM_MARGIN - pop_h - 10.0,
+            (area.center_x() + Theme::MINI_PLAYER_MAX_WIDTH * 0.5 - pop_w)
+                .min(area.right() - pop_w - 18.0),
+            area.bottom()
+                - Theme::MINI_PLAYER_HEIGHT
+                - Theme::MINI_PLAYER_BOTTOM_MARGIN
+                - pop_h
+                - 10.0,
             pop_w,
             pop_h,
         );
+        self.queue_popover_rect = pop;
         // Swallow background clicks on popover glass so they never click underlying rows!
         self.hit_regions.push(HitRegion {
             rect: pop,
@@ -15614,6 +16625,8 @@ impl AppUi {
         );
 
         if q.is_empty() {
+            self.queue_max_scroll_y = 0.0;
+            self.queue_scroll_y = 0.0;
             r.draw_text(
                 "当前待播列表为空",
                 RectF::new(pop.x + 16.0, pop.center_y() - 14.0, pop.w - 32.0, 28.0),
@@ -15627,9 +16640,23 @@ impl AppUi {
             return;
         }
 
-        let mut y = pop.y + 42.0;
-        for (idx, tr) in q.iter().enumerate().take(7) {
-            let row = RectF::new(pop.x + 10.0, y, pop.w - 20.0, 38.0);
+        let list_rect = RectF::new(pop.x + 6.0, pop.y + 40.0, pop.w - 12.0, pop.h - 48.0);
+        let row_stride = 40.0f32;
+        let total_h = (q.len() as f32) * row_stride;
+        self.queue_max_scroll_y = (total_h - list_rect.h).max(0.0);
+        self.queue_scroll_y = self.queue_scroll_y.clamp(0.0, self.queue_max_scroll_y);
+
+        let right_pad = if self.queue_max_scroll_y > 1.0 { 16.0 } else { 10.0 };
+        r.push_clip(list_rect);
+        for (idx, tr) in q.iter().enumerate() {
+            let y = list_rect.y + (idx as f32) * row_stride - self.queue_scroll_y;
+            if y + 38.0 < list_rect.y || y > list_rect.bottom() {
+                continue;
+            }
+            let row = RectF::new(pop.x + 10.0, y, pop.w - 10.0 - right_pad, 38.0);
+            let clip_y0 = row.y.max(list_rect.y);
+            let clip_y1 = row.bottom().min(list_rect.bottom());
+            let hit_r = RectF::new(row.x, clip_y0, row.w, (clip_y1 - clip_y0).max(0.0));
             let is_cur = self
                 .smtc
                 .adam_id
@@ -15637,12 +16664,26 @@ impl AppUi {
                 .is_some_and(|a| a == tr.effective_adam_id());
             if is_cur {
                 r.fill_rounded_rect(row, 8.0, Theme::ROW_ACTIVE);
-            } else if row.contains(self.mouse_pos.0, self.mouse_pos.1) {
+            } else if hit_r.h > 1.0 && hit_r.contains(self.mouse_pos.0, self.mouse_pos.1) {
                 r.fill_rounded_rect(row, 8.0, Theme::ROW_HOVER);
             }
             r.draw_text(
+                &format!("{}.", idx + 1),
+                RectF::new(row.x + 6.0, row.y + 3.0, 26.0, 18.0),
+                11.4,
+                if is_cur { 600 } else { 400 },
+                if is_cur {
+                    Theme::ACCENT_RED
+                } else {
+                    Theme::TEXT_MUTED
+                },
+                TextAlign::Right,
+                true,
+                false,
+            );
+            r.draw_text(
                 &tr.name,
-                RectF::new(row.x + 10.0, row.y + 3.0, row.w - 20.0, 18.0),
+                RectF::new(row.x + 38.0, row.y + 3.0, row.w - 46.0, 18.0),
                 13.0,
                 if is_cur { 600 } else { 400 },
                 if is_cur {
@@ -15656,7 +16697,7 @@ impl AppUi {
             );
             r.draw_text(
                 &tr.artist_name,
-                RectF::new(row.x + 10.0, row.y + 19.0, row.w - 20.0, 15.0),
+                RectF::new(row.x + 38.0, row.y + 19.0, row.w - 46.0, 15.0),
                 11.2,
                 400,
                 Theme::TEXT_SECONDARY,
@@ -15664,11 +16705,31 @@ impl AppUi {
                 true,
                 false,
             );
-            self.hit_regions.push(HitRegion {
-                rect: row,
-                action: UiAction::JumpQueueIndex(idx),
-            });
-            y += 40.0;
+            if hit_r.h > 2.0 {
+                self.hit_regions.push(HitRegion {
+                    rect: hit_r,
+                    action: UiAction::JumpQueueIndex(idx),
+                });
+            }
+        }
+        r.pop_clip();
+
+        // Translucent scrollbar indicator when queue exceeds viewport
+        if self.queue_max_scroll_y > 1.0 {
+            let track_h = (list_rect.h - 8.0).max(20.0);
+            let thumb_h = ((list_rect.h / total_h.max(1.0)) * track_h).clamp(24.0, track_h);
+            let frac = (self.queue_scroll_y / self.queue_max_scroll_y).clamp(0.0, 1.0);
+            let thumb_y = list_rect.y + 4.0 + frac * (track_h - thumb_h);
+            r.fill_rounded_rect(
+                RectF::new(pop.right() - 8.0, list_rect.y + 4.0, 3.5, track_h),
+                2.0,
+                Color::rgba(255, 255, 255, 0.08),
+            );
+            r.fill_rounded_rect(
+                RectF::new(pop.right() - 8.0, thumb_y, 3.5, thumb_h),
+                2.0,
+                Color::rgba(255, 255, 255, 0.36),
+            );
         }
     }
 
@@ -16400,6 +17461,1496 @@ impl AppUi {
         }
     }
 
+    // ========================================================================
+    // NetEase Listen Together (网易云「一起听」) Sync Engine & Modal UI
+    // ========================================================================
+
+    fn build_listen_together_pill_info(&self) -> Option<(bool, String)> {
+        if self.settings.playback_backend != PlaybackBackend::NetEase {
+            return None;
+        }
+        let lt_active = self.listen_together.in_room;
+        let lt_lbl = if lt_active {
+            let partner = self
+                .listen_together
+                .users
+                .iter()
+                .find(|u| u.user_id != self.settings.netease_uid && !u.nickname.is_empty())
+                .map(|u| u.nickname.as_str());
+            if let Some(name) = partner {
+                format!("一起听 · {name}")
+            } else {
+                format!("一起听 · {}人", self.listen_together.users.len().max(1))
+            }
+        } else {
+            "一起听".to_string()
+        };
+        Some((lt_active, lt_lbl))
+    }
+
+    pub fn stop_listen_together_poller(&mut self) {
+        if let Some(flag) = self.listen_together.poller_stop.take() {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    fn start_listen_together_poller(&mut self) {
+        self.stop_listen_together_poller();
+        if self.wake_hwnd == 0
+            || !self.listen_together.in_room
+            || self.listen_together.room_id.is_empty()
+            || self.settings.netease_cookie.trim().is_empty()
+        {
+            return;
+        }
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.listen_together.poller_stop = Some(stop.clone());
+        let room_id = self.listen_together.room_id.clone();
+        let cookie = self.settings.netease_cookie.clone();
+        let tx = self.tx.clone();
+        let hwnd = self.wake_hwnd;
+        self.rt.spawn(async move {
+            let mut tick: u64 = 0;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+                if stop.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                let snap = native_player::get_playback_state();
+                let sid = snap.adam_id.as_deref().unwrap_or("0");
+                let play_st = if snap.status == "Playing" { "PLAY" } else { "PAUSE" };
+                let prog_ms = (snap.position_sec.max(0.0) * 1000.0).round() as i64;
+                // Fetch roomUsers every 3rd tick (~2.25s) while polling authoritative `sync/playlist/get`
+                // + `heartbeat` in parallel every 750ms for crisp low-latency partner sync!
+                let fetch_users = tick % 3 == 0;
+                tick = tick.wrapping_add(1);
+                let st = listen_together::poll_room_sync(
+                    &room_id,
+                    sid,
+                    play_st,
+                    prog_ms,
+                    fetch_users,
+                    false,
+                    &cookie,
+                )
+                .await;
+                if stop.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                let closed = st
+                    .as_ref()
+                    .is_ok_and(|s| s.room_closed || (s.code == 200 && !s.in_room));
+                let _ = tx.send(AsyncMsg::ListenTogetherStatusPolled(st));
+                Self::post_ui_wake(hwnd);
+                if closed {
+                    break;
+                }
+            }
+        });
+    }
+
+    pub fn join_listen_together_from_text(&mut self, raw: &str) -> bool {
+        if let Some(parsed) = listen_together::parse_invite_input(raw) {
+            self.execute_action(UiAction::LtJoinInvite {
+                room_id: parsed.room_id,
+                inviter_id: parsed.inviter_id,
+            });
+            return true;
+        }
+        // Support NetEase mobile share copy containing short links like `https://163cn.tv/blBIyEiR`!
+        if listen_together::extract_first_http_url(raw).is_some() {
+            if self.settings.netease_cookie.trim().is_empty() {
+                self.set_banner("请先在「设置 -> 网易云音乐」登录账号后再加入房间".to_string(), true);
+                return true;
+            }
+            self.listen_together.busy = true;
+            self.listen_together.status_text = "正在解析网易云一起听短链...".to_string();
+            let raw_owned = raw.to_string();
+            let tx = self.tx.clone();
+            let hwnd = self.wake_hwnd;
+            self.rt.spawn(async move {
+                let res = listen_together::resolve_invite_input(&raw_owned).await;
+                let _ = tx.send(AsyncMsg::ListenTogetherShortLinkResolved(res));
+                Self::post_ui_wake(hwnd);
+            });
+            return true;
+        }
+        false
+    }
+
+    fn report_listen_together_local_play(
+        &mut self,
+        tracks: &[AgentTrackInput],
+        start_idx: usize,
+    ) {
+        if !self.listen_together.in_room
+            || self.listen_together.room_id.is_empty()
+            || self.settings.netease_cookie.trim().is_empty()
+        {
+            return;
+        }
+        let Some(target) = tracks.get(start_idx) else {
+            return;
+        };
+        let target_id = netease_api::strip_ne_id(&target.effective_adam_id());
+        if target_id.is_empty() || !target_id.chars().all(|c| c.is_ascii_digit()) {
+            return;
+        }
+        let former_id = self
+            .smtc
+            .adam_id
+            .as_deref()
+            .map(netease_api::strip_ne_id)
+            .unwrap_or_else(|| "-1".to_string());
+        self.listen_together.client_seq += 1;
+        self.listen_together.list_version += 1;
+        self.listen_together.last_local_cmd_at = Instant::now();
+        self.listen_together.last_synced_song_id = target_id.clone();
+        self.listen_together.pending_local_track_broadcast = false;
+
+        let room_id = self.listen_together.room_id.clone();
+        let uid = self.settings.netease_uid;
+        let seq = self.listen_together.client_seq;
+        let ver = self.listen_together.list_version;
+        let cookie = self.settings.netease_cookie.clone();
+        let ids: Vec<String> = tracks
+            .iter()
+            .map(|t| netease_api::strip_ne_id(&t.effective_adam_id()))
+            .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+            .collect();
+        self.listen_together.room_tracks = tracks.iter().take(60).cloned().collect();
+        if self.wake_hwnd == 0 {
+            return;
+        }
+        self.rt.spawn(async move {
+            let _ = listen_together::sync_list_command(&room_id, uid, ver, &ids, &cookie).await;
+            let _ = listen_together::send_play_command(
+                &room_id,
+                "GOTO",
+                &target_id,
+                &former_id,
+                "PLAY",
+                0,
+                seq,
+                &cookie,
+            )
+            .await;
+        });
+    }
+
+    fn report_listen_together_local_track_switch(&mut self, target_id: &str, former_id: &str) {
+        if !self.listen_together.in_room
+            || self.listen_together.room_id.is_empty()
+            || self.settings.netease_cookie.trim().is_empty()
+            || target_id.is_empty()
+            || !target_id.chars().all(|c| c.is_ascii_digit())
+        {
+            return;
+        }
+        self.listen_together.client_seq += 1;
+        self.listen_together.list_version += 1;
+        self.listen_together.last_local_cmd_at = Instant::now();
+        self.listen_together.last_synced_song_id = target_id.to_string();
+
+        let room_id = self.listen_together.room_id.clone();
+        let uid = self.settings.netease_uid;
+        let seq = self.listen_together.client_seq;
+        let ver = self.listen_together.list_version;
+        let cookie = self.settings.netease_cookie.clone();
+        let tgt = target_id.to_string();
+        let frm = if former_id.is_empty() || !former_id.chars().all(|c| c.is_ascii_digit()) {
+            "-1".to_string()
+        } else {
+            former_id.to_string()
+        };
+        let cur_q = native_player::get_queue_tracks();
+        let ids: Vec<String> = cur_q
+            .iter()
+            .map(|t| netease_api::strip_ne_id(&t.effective_adam_id()))
+            .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+            .collect();
+        if self.wake_hwnd == 0 {
+            return;
+        }
+        self.rt.spawn(async move {
+            if !ids.is_empty() {
+                let _ = listen_together::sync_list_command(&room_id, uid, ver, &ids, &cookie).await;
+            }
+            let _ = listen_together::send_play_command(
+                &room_id,
+                "GOTO",
+                &tgt,
+                &frm,
+                "PLAY",
+                0,
+                seq,
+                &cookie,
+            )
+            .await;
+        });
+    }
+
+    fn report_listen_together_local_control(&mut self, action: &str, seek_sec: Option<f64>) {
+        if !self.listen_together.in_room
+            || self.listen_together.room_id.is_empty()
+            || self.settings.netease_cookie.trim().is_empty()
+        {
+            return;
+        }
+        let cur_id = self
+            .smtc
+            .adam_id
+            .as_deref()
+            .map(netease_api::strip_ne_id)
+            .unwrap_or_default();
+        if cur_id.is_empty() || !cur_id.chars().all(|c| c.is_ascii_digit()) {
+            return;
+        }
+        let act_low = action.trim().to_ascii_lowercase();
+        let (cmd_type, play_status, prog_ms) = match act_low.as_str() {
+            "play" => ("PLAY", "PLAY", (self.smtc.position_sec.max(0.0) * 1000.0).round() as i64),
+            "pause" => ("PAUSE", "PAUSE", (self.smtc.position_sec.max(0.0) * 1000.0).round() as i64),
+            "toggle" => {
+                if self.smtc.status == "Playing" {
+                    ("PAUSE", "PAUSE", (self.smtc.position_sec.max(0.0) * 1000.0).round() as i64)
+                } else {
+                    ("PLAY", "PLAY", (self.smtc.position_sec.max(0.0) * 1000.0).round() as i64)
+                }
+            }
+            "seek" => {
+                let st = if self.smtc.status == "Playing" { "PLAY" } else { "PAUSE" };
+                let ms = (seek_sec.unwrap_or(self.smtc.position_sec).max(0.0) * 1000.0).round() as i64;
+                ("seek", st, ms)
+            }
+            "next" => ("NEXT", "PLAY", 0),
+            "prev" => ("PREV", "PLAY", 0),
+            _ => return,
+        };
+        self.listen_together.client_seq += 1;
+        self.listen_together.last_local_cmd_at = Instant::now();
+        let seq = self.listen_together.client_seq;
+        let room_id = self.listen_together.room_id.clone();
+        let cookie = self.settings.netease_cookie.clone();
+        let cmd_owned = cmd_type.to_string();
+        let ps_owned = play_status.to_string();
+        if self.wake_hwnd == 0 {
+            return;
+        }
+        self.rt.spawn(async move {
+            let _ = listen_together::send_play_command(
+                &room_id,
+                &cmd_owned,
+                &cur_id,
+                &cur_id,
+                &ps_owned,
+                prog_ms,
+                seq,
+                &cookie,
+            )
+            .await;
+        });
+    }
+
+    fn refresh_listen_together_vip_warning(&mut self) {
+        if !self.listen_together.in_room {
+            self.listen_together.vip_warning = None;
+            return;
+        }
+        let cur_sid = self
+            .smtc
+            .adam_id
+            .as_deref()
+            .map(netease_api::strip_ne_id)
+            .unwrap_or_default();
+        let is_trial_stream = self
+            .smtc
+            .audio_quality
+            .as_deref()
+            .is_some_and(|q| q.contains("试听") || q.contains("VIP 试听"));
+        let active_q = self.active_queue_tracks();
+        let track_has_vip_trait = !cur_sid.is_empty()
+            && self
+                .listen_together
+                .room_tracks
+                .iter()
+                .chain(active_q.iter())
+                .any(|t| {
+                    netease_api::strip_ne_id(&t.effective_adam_id()) == cur_sid
+                        && t.audio_traits.iter().any(|tr| tr.eq_ignore_ascii_case("vip"))
+                });
+        let song_needs_vip = is_trial_stream || track_has_vip_trait;
+
+        let self_is_vip = self.netease_account.is_vip || self.settings.netease_is_vip;
+        let non_vip_partners: Vec<String> = self
+            .listen_together
+            .users
+            .iter()
+            .filter(|u| u.user_id != self.settings.netease_uid && !u.is_vip)
+            .map(|u| u.nickname.clone())
+            .collect();
+
+        let warning = if is_trial_stream {
+            Some(
+                "VIP 权限提示：当前曲目为黑胶 VIP 歌曲，你的账号仅能播放试听片段，可能与对方进度不同步。"
+                    .to_string(),
+            )
+        } else if song_needs_vip && !self_is_vip && !non_vip_partners.is_empty() {
+            Some(format!(
+                "VIP 权限提示：当前为 VIP 歌曲，你与「{}」均无黑胶 VIP，双方可能仅能试听或进度偏差。",
+                non_vip_partners.join("、")
+            ))
+        } else if song_needs_vip && !non_vip_partners.is_empty() {
+            Some(format!(
+                "VIP 权限提示：当前为 VIP 歌曲，对方「{}」暂无黑胶 VIP，可能仅能试听导致进度不同步。",
+                non_vip_partners.join("、")
+            ))
+        } else if song_needs_vip && !self_is_vip {
+            Some(
+                "VIP 权限提示：当前为 VIP 歌曲，你的账号暂无黑胶 VIP，可能仅能试听片段导致进度不同步。"
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+
+        self.listen_together.vip_warning = warning.clone();
+        if let Some(warn_msg) = warning {
+            if !cur_sid.is_empty() && cur_sid != self.listen_together.last_vip_warned_song_id {
+                self.listen_together.last_vip_warned_song_id = cur_sid;
+                self.set_banner(warn_msg, true);
+            }
+        }
+    }
+
+    fn apply_listen_together_remote_status(
+        &mut self,
+        st: ListenTogetherStatus,
+        r: &mut D2DRenderer,
+    ) {
+        if !st.users.is_empty() {
+            for u in &st.users {
+                if let Some(ref av) = u.avatar_url {
+                    self.request_artwork(r, av, false);
+                }
+            }
+            self.listen_together.users = st.users.clone();
+        }
+        if st.creator_id != 0 {
+            self.listen_together.creator_id = st.creator_id;
+        }
+        // Adopt server's latest monotonic `clientSeq` & `list_version` so our next local command is NEVER dropped!
+        if st.remote_client_seq > self.listen_together.client_seq {
+            self.listen_together.client_seq = st.remote_client_seq;
+        }
+        if st.remote_list_version > self.listen_together.list_version {
+            self.listen_together.list_version = st.remote_list_version;
+        }
+        if !st.remote_playlist_ids.is_empty() && self.listen_together.room_tracks.is_empty() {
+            self.execute_action(UiAction::LtSyncRoomPlaylist);
+        }
+
+        let online_n = self.listen_together.users.len().max(1);
+        self.listen_together.status_text = format!("实时双向同步中 · {online_n} 人在线");
+
+        let since_local = self.listen_together.last_local_cmd_at.elapsed().as_secs_f32();
+        let local_playing = self.smtc.status == "Playing";
+        let local_ms = (self.smtc.position_sec.max(0.0) * 1000.0).round() as i64;
+        let act = listen_together::evaluate_remote_sync_action(
+            self.smtc.adam_id.as_deref(),
+            local_playing,
+            local_ms,
+            &st,
+            since_local,
+            self.listen_together.last_applied_remote_seq,
+            self.settings.netease_uid,
+        );
+        if st.remote_client_seq > self.listen_together.last_applied_remote_seq {
+            self.listen_together.last_applied_remote_seq = st.remote_client_seq;
+        }
+        match act {
+            RemoteSyncAction::Noop => {
+                if st.force_resync {
+                    self.set_banner("播放进度已与对方同步".to_string(), false);
+                }
+            }
+            RemoteSyncAction::RoomClosed => {
+                self.stop_listen_together_poller();
+                self.listen_together.in_room = false;
+                self.listen_together.room_id.clear();
+                self.listen_together.share_url.clear();
+                self.listen_together.users.clear();
+                self.listen_together.room_tracks.clear();
+                self.listen_together.vip_warning = None;
+                self.listen_together.last_vip_warned_song_id.clear();
+                self.listen_together.last_applied_remote_seq = 0;
+                self.listen_together.status_text = "对方已结束一起听房间".to_string();
+                self.set_banner("对方已结束网易云一起听房间".to_string(), false);
+            }
+            RemoteSyncAction::SwitchTrack {
+                song_id,
+                play,
+                progress_ms,
+            } => {
+                self.play_remote_listen_together_track(song_id, play, progress_ms);
+            }
+            RemoteSyncAction::SetPlayPause { play, progress_ms } => {
+                let cmd = if play { "play" } else { "pause" };
+                let target_sec = (progress_ms as f64 / 1000.0).max(0.0);
+                let drift_ms = (progress_ms - local_ms).abs();
+                let seek_opt = if progress_ms >= 0 && (st.force_resync || drift_ms > 900) {
+                    Some(target_sec)
+                } else {
+                    None
+                };
+                self.smtc.status = if play { "Playing" } else { "Paused" }.to_string();
+                if let Some(s) = seek_opt {
+                    self.smtc.position_sec = s;
+                    self.playhead_anchor_sec = s;
+                    self.playhead_anchor_inst = Instant::now();
+                }
+                let tx = self.tx.clone();
+                let hwnd = self.wake_hwnd;
+                self.rt.spawn(async move {
+                    let res = tokio::task::spawn_blocking(move || {
+                        if let Some(s) = seek_opt {
+                            let _ = native_player::control("seek", Some(s));
+                        }
+                        native_player::control(cmd, None)
+                    })
+                    .await;
+                    if let Ok(Ok(nst)) = res {
+                        let _ = tx.send(AsyncMsg::PlaybackUpdated(nst));
+                        Self::post_ui_wake(hwnd);
+                    }
+                });
+            }
+            RemoteSyncAction::SeekTo { progress_ms } => {
+                let target_sec = (progress_ms as f64 / 1000.0).max(0.0);
+                self.smtc.position_sec = target_sec;
+                self.playhead_anchor_sec = target_sec;
+                self.playhead_anchor_inst = Instant::now();
+                self.lyrics_view.animator.reset_word_clamps();
+                if st.force_resync {
+                    self.set_banner("已将进度校准至对方当前位置".to_string(), false);
+                }
+                let tx = self.tx.clone();
+                let hwnd = self.wake_hwnd;
+                self.rt.spawn(async move {
+                    if let Ok(Ok(nst)) = tokio::task::spawn_blocking(move || {
+                        native_player::control("seek", Some(target_sec))
+                    })
+                    .await
+                    {
+                        let _ = tx.send(AsyncMsg::PlaybackUpdated(nst));
+                        Self::post_ui_wake(hwnd);
+                    }
+                });
+            }
+        }
+        self.refresh_listen_together_vip_warning();
+    }
+
+    fn play_remote_listen_together_track(
+        &mut self,
+        song_id: String,
+        play: bool,
+        progress_ms: i64,
+    ) {
+        if song_id == self.listen_together.last_synced_song_id && self.playback_loading {
+            return;
+        }
+        self.listen_together.last_synced_song_id = song_id.clone();
+        self.listen_together.pending_local_track_broadcast = false;
+        let room_q = self.listen_together.room_tracks.clone();
+        let existing_idx = room_q
+            .iter()
+            .position(|t| netease_api::strip_ne_id(&t.effective_adam_id()) == song_id);
+        let cookie = self.settings.netease_cookie.clone();
+        let tx = self.tx.clone();
+        let hwnd = self.wake_hwnd;
+
+        native_player::begin_track_transition();
+        if let Some(idx) = existing_idx {
+            let tr = room_q[idx].clone();
+            self.begin_optimistic_playback_loading(Some(&tr), None);
+        }
+        self.rt.spawn(async move {
+            let resolved_queue = if let Some(idx) = existing_idx {
+                Some((room_q, idx))
+            } else if let Ok(id_num) = song_id.parse::<i64>() {
+                match netease_api::fetch_songs_detail_batch(&[id_num], Some(&cookie)).await {
+                    Ok(mut v) if !v.is_empty() => {
+                        let t = v.remove(0);
+                        Some((vec![t], 0))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let Some((q, idx)) = resolved_queue else {
+                return;
+            };
+            let target = q[idx].clone();
+            match resolve_and_start_native_track("netease", Some((q, idx)), None, &target).await {
+                Ok(mut st) => {
+                    if progress_ms > 800 {
+                        let s = progress_ms as f64 / 1000.0;
+                        if let Ok(Ok(sk_st)) =
+                            tokio::task::spawn_blocking(move || native_player::control("seek", Some(s)))
+                                .await
+                        {
+                            st = sk_st;
+                        }
+                    }
+                    if !play {
+                        if let Ok(Ok(p_st)) =
+                            tokio::task::spawn_blocking(|| native_player::control("pause", None))
+                                .await
+                        {
+                            st = p_st;
+                        }
+                    }
+                    let _ = tx.send(AsyncMsg::PlaybackUpdated(st));
+                }
+                Err(e) => {
+                    let _ = tx.send(AsyncMsg::BannerError(e));
+                }
+            }
+            Self::post_ui_wake(hwnd);
+        });
+    }
+
+    fn draw_listen_together_modal(&mut self, r: &mut D2DRenderer, win_rect: RectF) {
+        // Backdrop scrim (click outside to dismiss)
+        r.fill_rect(win_rect, Color::rgba(4, 6, 12, 0.56));
+        self.hit_regions.push(HitRegion {
+            rect: win_rect,
+            action: UiAction::CloseListenTogetherModal,
+        });
+
+        let mw = 584.0f32.min(win_rect.w - 40.0);
+        let mh = 528.0f32.min(win_rect.h - 40.0);
+        let modal = RectF::new(
+            win_rect.center_x() - mw * 0.5,
+            win_rect.center_y() - mh * 0.5,
+            mw,
+            mh,
+        );
+        self.listen_together.modal_rect = modal;
+        self.hit_regions.push(HitRegion {
+            rect: modal,
+            action: UiAction::SwallowClick,
+        });
+
+        r.fill_rounded_rect(
+            RectF::new(modal.x + 4.0, modal.y + 10.0, modal.w - 8.0, modal.h),
+            20.0,
+            Color::rgba(0, 0, 0, 0.52),
+        );
+        r.draw_liquid_glass(
+            modal,
+            20.0,
+            22.0,
+            Color::rgba(20, 22, 30, 0.88),
+            Theme::GLASS_RIM_LIGHT,
+            self.glass_off(),
+        );
+
+        let px = modal.x + 24.0;
+        let pw = modal.w - 48.0;
+        let accent = PlaybackBackend::NetEase.accent_color();
+
+        // Header row + signed-in user VIP level pill
+        r.draw_text(
+            "网易云 · 一起听",
+            RectF::new(px, modal.y + 18.0, 200.0, 28.0),
+            19.0,
+            700,
+            Theme::TEXT_PRIMARY,
+            TextAlign::Left,
+            true,
+            false,
+        );
+        let close_r = RectF::new(modal.right() - 48.0, modal.y + 16.0, 30.0, 30.0);
+        if self.netease_account.logged_in {
+            let vip_lbl = if self.netease_account.vip_label.trim().is_empty() {
+                if self.netease_account.is_vip {
+                    "黑胶 VIP"
+                } else {
+                    "普通用户"
+                }
+            } else {
+                self.netease_account.vip_label.as_str()
+            };
+            let vw = (vip_lbl.chars().count() as f32 * 9.8 + 20.0).clamp(64.0, 148.0);
+            let vr = RectF::new(close_r.x - 10.0 - vw, modal.y + 20.0, vw, 22.0);
+            if self.netease_account.is_vip {
+                r.fill_rounded_rect(vr, 11.0, Color::rgba(232, 178, 68, 0.22));
+                r.stroke_rounded_rect(vr, 11.0, Color::rgba(246, 198, 96, 0.65), 1.0);
+                r.draw_text(
+                    vip_lbl,
+                    vr,
+                    11.0,
+                    700,
+                    Color::rgb(252, 214, 124),
+                    TextAlign::Center,
+                    true,
+                    false,
+                );
+            } else {
+                r.fill_rounded_rect(vr, 11.0, Color::rgba(255, 255, 255, 0.08));
+                r.stroke_rounded_rect(vr, 11.0, Theme::SEPARATOR, 1.0);
+                r.draw_text(
+                    vip_lbl,
+                    vr,
+                    11.0,
+                    500,
+                    Theme::TEXT_SECONDARY,
+                    TextAlign::Center,
+                    true,
+                    false,
+                );
+            }
+        }
+        let close_hov = close_r.contains(self.mouse_pos.0, self.mouse_pos.1);
+        r.draw_liquid_glass_button(
+            close_r,
+            15.0,
+            GlassBtnVariant::Regular,
+            close_hov,
+            self.mouse_down,
+            self.mouse_pos,
+            self.glass_off(),
+        );
+        r.draw_icon(SfIcon::WinClose, close_r.inset(8.0, 8.0), Theme::TEXT_SECONDARY);
+        self.hit_regions.push(HitRegion {
+            rect: close_r,
+            action: UiAction::CloseListenTogetherModal,
+        });
+
+        let mut cy = modal.y + 52.0;
+
+        if !self.netease_account.logged_in || self.settings.netease_cookie.trim().is_empty() {
+            self.listen_together.modal_max_scroll_y = 0.0;
+            r.draw_text(
+                "使用网易云「一起听」需要先登录网易云账号（支持扫码或粘贴 Cookie）。",
+                RectF::new(px, cy + 28.0, pw, 42.0),
+                13.5,
+                500,
+                Theme::TEXT_SECONDARY,
+                TextAlign::Left,
+                false,
+                true,
+            );
+            let go_btn = RectF::new(px, cy + 86.0, 152.0, 36.0);
+            let go_hov = go_btn.contains(self.mouse_pos.0, self.mouse_pos.1);
+            r.draw_liquid_glass_button(
+                go_btn,
+                10.0,
+                GlassBtnVariant::Tinted(accent),
+                go_hov,
+                self.mouse_down,
+                self.mouse_pos,
+                self.glass_off(),
+            );
+            r.draw_text(
+                "前往设置登录",
+                go_btn,
+                13.0,
+                600,
+                Theme::TEXT_PRIMARY,
+                TextAlign::Center,
+                true,
+                false,
+            );
+            self.hit_regions.push(HitRegion {
+                rect: go_btn,
+                action: UiAction::Navigate(PageRoute::Settings),
+            });
+            return;
+        }
+
+        let lt = self.listen_together.clone();
+        if !lt.status_text.is_empty() {
+            r.draw_text(
+                &lt.status_text,
+                RectF::new(px, cy, pw, 20.0),
+                12.2,
+                500,
+                if lt.in_room {
+                    Theme::SIGNAL_GREEN
+                } else {
+                    Theme::TEXT_SECONDARY
+                },
+                TextAlign::Left,
+                true,
+                false,
+            );
+            cy += 24.0;
+        }
+
+        // VIP insufficiency warning alert strip (shown whenever playing a VIP song and self or partner lacks VIP!)
+        if let Some(ref warn) = lt.vip_warning {
+            let warn_box = RectF::new(px, cy, pw, 36.0);
+            r.fill_rounded_rect(warn_box, 10.0, Color::rgba(245, 166, 35, 0.16));
+            r.stroke_rounded_rect(warn_box, 10.0, Color::rgba(245, 166, 35, 0.55), 1.0);
+            r.draw_text(
+                warn,
+                warn_box.inset(12.0, 4.0),
+                11.6,
+                600,
+                Color::rgb(255, 210, 118),
+                TextAlign::Left,
+                false,
+                true,
+            );
+            cy += 44.0;
+        }
+
+        // 2-Tab Switcher (`房间与互关` | `私信邀请 (N)`)
+        let tab_bg = RectF::new(px, cy, pw, 32.0);
+        r.fill_rounded_rect(tab_bg, 10.0, Color::rgba(255, 255, 255, 0.05));
+        let tab_w = (pw - 6.0) * 0.5;
+        let t0_lbl = if lt.in_room {
+            "房间控制与互关邀请".to_string()
+        } else {
+            "创建房间与邀请互关".to_string()
+        };
+        let t1_lbl = if lt.inbox_invites.is_empty() {
+            "私信邀请".to_string()
+        } else {
+            format!("私信邀请 ({})", lt.inbox_invites.len())
+        };
+        for (ti, tlbl) in [(0u8, t0_lbl), (1u8, t1_lbl)] {
+            let tr = RectF::new(px + 3.0 + (ti as f32) * tab_w, cy + 3.0, tab_w, 26.0);
+            let sel = lt.modal_tab == ti;
+            let thov = tr.contains(self.mouse_pos.0, self.mouse_pos.1);
+            if sel {
+                r.fill_rounded_rect(tr, 8.0, accent.with_alpha(0.32));
+                r.stroke_rounded_rect(tr, 8.0, accent.with_alpha(0.65), 1.0);
+            } else if thov {
+                r.fill_rounded_rect(tr, 8.0, Color::rgba(255, 255, 255, 0.06));
+            }
+            r.draw_text(
+                &tlbl,
+                tr,
+                12.2,
+                if sel { 600 } else { 500 },
+                if sel {
+                    Theme::TEXT_PRIMARY
+                } else {
+                    Theme::TEXT_SECONDARY
+                },
+                TextAlign::Center,
+                true,
+                false,
+            );
+            self.hit_regions.push(HitRegion {
+                rect: tr,
+                action: UiAction::LtSetModalTab(ti),
+            });
+        }
+        cy += 42.0;
+
+        // Clipped scrollable body viewport
+        let body_rect = RectF::new(px - 2.0, cy, pw + 4.0, (modal.bottom() - 16.0 - cy).max(120.0));
+        let scroll_y = self
+            .listen_together
+            .modal_scroll_y
+            .clamp(0.0, self.listen_together.modal_max_scroll_y);
+        let content_start_y = body_rect.y - scroll_y;
+        let mut y = content_start_y;
+        let inner_w = pw - 8.0;
+
+        let push_clipped_hit = |hits: &mut Vec<HitRegion>, rect: RectF, action: UiAction| {
+            let y0 = rect.y.max(body_rect.y);
+            let y1 = rect.bottom().min(body_rect.bottom());
+            if y1 > y0 + 2.0 {
+                hits.push(HitRegion {
+                    rect: RectF::new(rect.x, y0, rect.w, y1 - y0),
+                    action,
+                });
+            }
+        };
+
+        r.push_clip(body_rect);
+        if lt.modal_tab == 1 {
+            // ================= TAB 1: INBOX INVITES =================
+            r.draw_text(
+                "私信一起听邀请",
+                RectF::new(px, y + 2.0, inner_w - 96.0, 24.0),
+                13.5,
+                600,
+                Theme::TEXT_PRIMARY,
+                TextAlign::Left,
+                true,
+                false,
+            );
+            let ref_btn = RectF::new(px + inner_w - 86.0, y, 86.0, 26.0);
+            let ref_hov = body_rect.contains(self.mouse_pos.0, self.mouse_pos.1)
+                && ref_btn.contains(self.mouse_pos.0, self.mouse_pos.1);
+            r.draw_liquid_glass_button(
+                ref_btn,
+                7.5,
+                GlassBtnVariant::Regular,
+                ref_hov,
+                self.mouse_down,
+                self.mouse_pos,
+                self.glass_off(),
+            );
+            r.draw_text(
+                "刷新私信",
+                ref_btn,
+                11.6,
+                500,
+                Theme::TEXT_PRIMARY,
+                TextAlign::Center,
+                true,
+                false,
+            );
+            push_clipped_hit(&mut self.hit_regions, ref_btn, UiAction::LtFetchInboxInvites);
+            y += 36.0;
+
+            if lt.inbox_invites.is_empty() {
+                let empty_card = RectF::new(px, y, inner_w, 84.0);
+                r.fill_rounded_rect(empty_card, 12.0, Color::rgba(255, 255, 255, 0.04));
+                r.stroke_rounded_rect(empty_card, 12.0, Theme::SEPARATOR, 1.0);
+                r.draw_text(
+                    "暂无私信邀请 · 可直接复制好友分享口令（如 https://163cn.tv/...）按 Ctrl+V 加入",
+                    empty_card.inset(16.0, 8.0),
+                    12.2,
+                    400,
+                    Theme::TEXT_MUTED,
+                    TextAlign::Center,
+                    false,
+                    true,
+                );
+                y += 94.0;
+            } else {
+                for inv in &lt.inbox_invites {
+                    let row = RectF::new(px, y, inner_w, 54.0);
+                    if row.bottom() >= body_rect.y && row.y <= body_rect.bottom() {
+                        r.fill_rounded_rect(row, 11.0, Color::rgba(255, 255, 255, 0.05));
+                        r.stroke_rounded_rect(row, 11.0, Theme::SEPARATOR, 1.0);
+                        let av_r = RectF::new(row.x + 10.0, row.y + 9.0, 36.0, 36.0);
+                        if let Some(ref av) = inv.inviter_avatar {
+                            r.draw_rounded_artwork(av, false, av_r, 18.0, 1.0);
+                        } else {
+                            r.fill_rounded_rect(av_r, 18.0, accent.with_alpha(0.35));
+                        }
+                        r.draw_text(
+                            &inv.inviter_name,
+                            RectF::new(av_r.right() + 12.0, row.y + 8.0, inner_w - 165.0, 20.0),
+                            13.5,
+                            600,
+                            Theme::TEXT_PRIMARY,
+                            TextAlign::Left,
+                            true,
+                            false,
+                        );
+                        r.draw_text(
+                            &format!("房间号：{}", inv.room_id),
+                            RectF::new(av_r.right() + 12.0, row.y + 29.0, inner_w - 165.0, 16.0),
+                            11.2,
+                            400,
+                            Theme::TEXT_MUTED,
+                            TextAlign::Left,
+                            true,
+                            false,
+                        );
+                        let join_btn = RectF::new(row.right() - 88.0, row.y + 12.0, 76.0, 30.0);
+                        let jhov = body_rect.contains(self.mouse_pos.0, self.mouse_pos.1)
+                            && join_btn.contains(self.mouse_pos.0, self.mouse_pos.1);
+                        r.draw_liquid_glass_button(
+                            join_btn,
+                            8.0,
+                            GlassBtnVariant::Tinted(accent),
+                            jhov,
+                            self.mouse_down,
+                            self.mouse_pos,
+                            self.glass_off(),
+                        );
+                        r.draw_text(
+                            "加入房间",
+                            join_btn,
+                            12.0,
+                            600,
+                            Theme::TEXT_PRIMARY,
+                            TextAlign::Center,
+                            true,
+                            false,
+                        );
+                        push_clipped_hit(
+                            &mut self.hit_regions,
+                            join_btn,
+                            UiAction::LtJoinInvite {
+                                room_id: inv.room_id.clone(),
+                                inviter_id: Some(inv.inviter_id),
+                            },
+                        );
+                    }
+                    y += 62.0;
+                }
+            }
+        } else if !lt.in_room {
+            // ================= TAB 0 (IDLE): CREATE / PASTE / INVITE MUTUAL FRIENDS =================
+            let gap = 8.0f32;
+            let bw = (inner_w - gap * 2.0) / 3.0;
+            for (i, (lbl, tinted, act)) in [
+                ("创建一起听房间", true, UiAction::LtCreateRoom),
+                ("粘贴口令/链接加入", false, UiAction::LtJoinFromClipboard),
+                ("同步手机当前房间", false, UiAction::LtRefreshStatus),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let br = RectF::new(px + (bw + gap) * (i as f32), y, bw, 36.0);
+                let bhov = body_rect.contains(self.mouse_pos.0, self.mouse_pos.1)
+                    && br.contains(self.mouse_pos.0, self.mouse_pos.1);
+                r.draw_liquid_glass_button(
+                    br,
+                    10.0,
+                    if tinted {
+                        GlassBtnVariant::Tinted(accent)
+                    } else {
+                        GlassBtnVariant::Regular
+                    },
+                    bhov,
+                    self.mouse_down,
+                    self.mouse_pos,
+                    self.glass_off(),
+                );
+                r.draw_text(
+                    lbl,
+                    br.inset(4.0, 0.0),
+                    12.2,
+                    if tinted || bhov { 600 } else { 500 },
+                    Theme::TEXT_PRIMARY,
+                    TextAlign::Center,
+                    true,
+                    false,
+                );
+                push_clipped_hit(&mut self.hit_regions, br, act);
+            }
+            y += 46.0;
+
+            r.draw_text(
+                "支持网易云手机口令短链（如 https://163cn.tv/...）、完整分享链接或房间号，可直接按 Ctrl+V 加入。",
+                RectF::new(px, y, inner_w, 32.0),
+                11.5,
+                400,
+                Theme::TEXT_MUTED,
+                TextAlign::Left,
+                false,
+                true,
+            );
+            y += 38.0;
+
+            r.draw_line(px, y, px + inner_w, y, Theme::SEPARATOR, 1.0);
+            y += 12.0;
+
+            // Mutual Friends 1-click invite list!
+            r.draw_text(
+                &format!("主动邀请互关好友 ({})", lt.mutual_friends.len()),
+                RectF::new(px, y + 2.0, inner_w - 96.0, 22.0),
+                13.4,
+                600,
+                Theme::TEXT_PRIMARY,
+                TextAlign::Left,
+                true,
+                false,
+            );
+            let rf_btn = RectF::new(px + inner_w - 84.0, y, 84.0, 26.0);
+            let rf_hov = body_rect.contains(self.mouse_pos.0, self.mouse_pos.1)
+                && rf_btn.contains(self.mouse_pos.0, self.mouse_pos.1);
+            r.draw_liquid_glass_button(
+                rf_btn,
+                7.5,
+                GlassBtnVariant::Regular,
+                rf_hov,
+                self.mouse_down,
+                self.mouse_pos,
+                self.glass_off(),
+            );
+            r.draw_text(
+                "刷新互关",
+                rf_btn,
+                11.5,
+                500,
+                Theme::TEXT_PRIMARY,
+                TextAlign::Center,
+                true,
+                false,
+            );
+            push_clipped_hit(&mut self.hit_regions, rf_btn, UiAction::LtFetchMutualFriends);
+            y += 34.0;
+
+            if lt.mutual_friends.is_empty() {
+                let empty_f = RectF::new(px, y, inner_w, 64.0);
+                r.fill_rounded_rect(empty_f, 11.0, Color::rgba(255, 255, 255, 0.04));
+                r.stroke_rounded_rect(empty_f, 11.0, Theme::SEPARATOR, 1.0);
+                r.draw_text(
+                    "暂未拉取到互关好友 · 点击右上角「刷新互关」或先创建房间复制链接发给好友",
+                    empty_f.inset(14.0, 6.0),
+                    12.0,
+                    400,
+                    Theme::TEXT_MUTED,
+                    TextAlign::Center,
+                    false,
+                    true,
+                );
+                y += 74.0;
+            } else {
+                for fr in &lt.mutual_friends {
+                    let row = RectF::new(px, y, inner_w, 48.0);
+                    if row.bottom() >= body_rect.y && row.y <= body_rect.bottom() {
+                        r.fill_rounded_rect(row, 10.0, Color::rgba(255, 255, 255, 0.045));
+                        r.stroke_rounded_rect(row, 10.0, Theme::SEPARATOR, 1.0);
+                        let av_r = RectF::new(row.x + 10.0, row.y + 8.0, 32.0, 32.0);
+                        if let Some(ref av) = fr.avatar_url {
+                            r.draw_rounded_artwork(av, false, av_r, 16.0, 1.0);
+                        } else {
+                            r.fill_rounded_rect(av_r, 16.0, accent.with_alpha(0.35));
+                        }
+                        let tag = match (fr.mutual, fr.is_vip) {
+                            (true, true) => "互关 · VIP",
+                            (true, false) => "互关好友",
+                            (false, true) => "关注 · VIP",
+                            (false, false) => "关注好友",
+                        };
+                        r.draw_text(
+                            &fr.nickname,
+                            RectF::new(av_r.right() + 10.0, row.y + 6.0, inner_w - 166.0, 19.0),
+                            13.0,
+                            600,
+                            Theme::TEXT_PRIMARY,
+                            TextAlign::Left,
+                            true,
+                            false,
+                        );
+                        r.draw_text(
+                            tag,
+                            RectF::new(av_r.right() + 10.0, row.y + 26.0, inner_w - 166.0, 15.0),
+                            11.0,
+                            400,
+                            if fr.is_vip {
+                                Color::rgb(252, 214, 124)
+                            } else {
+                                Theme::TEXT_MUTED
+                            },
+                            TextAlign::Left,
+                            true,
+                            false,
+                        );
+                        let invited = lt.invited_friend_ids.contains(&fr.user_id);
+                        let inv_btn = RectF::new(row.right() - 94.0, row.y + 10.0, 82.0, 28.0);
+                        let ihov = body_rect.contains(self.mouse_pos.0, self.mouse_pos.1)
+                            && inv_btn.contains(self.mouse_pos.0, self.mouse_pos.1);
+                        r.draw_liquid_glass_button(
+                            inv_btn,
+                            8.0,
+                            if invited {
+                                GlassBtnVariant::Regular
+                            } else {
+                                GlassBtnVariant::Tinted(accent)
+                            },
+                            ihov,
+                            self.mouse_down,
+                            self.mouse_pos,
+                            self.glass_off(),
+                        );
+                        r.draw_text(
+                            if invited { "再次邀请" } else { "邀请一起听" },
+                            inv_btn,
+                            11.6,
+                            600,
+                            if invited {
+                                Theme::SIGNAL_GREEN
+                            } else {
+                                Theme::TEXT_PRIMARY
+                            },
+                            TextAlign::Center,
+                            true,
+                            false,
+                        );
+                        push_clipped_hit(
+                            &mut self.hit_regions,
+                            inv_btn,
+                            UiAction::LtInviteFriend {
+                                friend_uid: fr.user_id,
+                                friend_name: fr.nickname.clone(),
+                            },
+                        );
+                    }
+                    y += 54.0;
+                }
+            }
+        } else {
+            // ================= TAB 0 (ACTIVE ROOM): INFO + CONTROLS + QUEUE + INVITE MUTUALS =================
+            let info_card = RectF::new(px, y, inner_w, 102.0);
+            r.fill_rounded_rect(info_card, 12.0, Color::rgba(255, 255, 255, 0.05));
+            r.stroke_rounded_rect(info_card, 12.0, Theme::SEPARATOR, 1.0);
+
+            r.fill_circle(info_card.x + 18.0, info_card.y + 22.0, 4.5, Theme::SIGNAL_GREEN);
+            r.draw_text(
+                &format!("房间号：{}", lt.room_id),
+                RectF::new(info_card.x + 30.0, info_card.y + 12.0, inner_w - 150.0, 20.0),
+                13.2,
+                600,
+                Theme::TEXT_PRIMARY,
+                TextAlign::Left,
+                true,
+                false,
+            );
+            let copy_btn = RectF::new(info_card.right() - 112.0, info_card.y + 10.0, 100.0, 28.0);
+            let copy_hov = body_rect.contains(self.mouse_pos.0, self.mouse_pos.1)
+                && copy_btn.contains(self.mouse_pos.0, self.mouse_pos.1);
+            r.draw_liquid_glass_button(
+                copy_btn,
+                8.0,
+                GlassBtnVariant::Tinted(accent),
+                copy_hov,
+                self.mouse_down,
+                self.mouse_pos,
+                self.glass_off(),
+            );
+            r.draw_text(
+                "复制邀请链接",
+                copy_btn,
+                11.8,
+                600,
+                Theme::TEXT_PRIMARY,
+                TextAlign::Center,
+                true,
+                false,
+            );
+            push_clipped_hit(&mut self.hit_regions, copy_btn, UiAction::LtCopyShareUrl);
+
+            // Online participants avatars + names + VIP / 非VIP indicator
+            let mut ux = info_card.x + 14.0;
+            let uy = info_card.y + 48.0;
+            if lt.users.is_empty() {
+                r.draw_text(
+                    "等待好友通过邀请链接或私信加入房间...",
+                    RectF::new(ux, uy + 8.0, inner_w - 28.0, 22.0),
+                    12.2,
+                    400,
+                    Theme::TEXT_MUTED,
+                    TextAlign::Left,
+                    true,
+                    false,
+                );
+            } else {
+                for u in lt.users.iter().take(3) {
+                    let chip_w = 160.0f32.min((inner_w - 44.0) / (lt.users.len().min(3) as f32));
+                    let chip = RectF::new(ux, uy, chip_w, 40.0);
+                    r.fill_rounded_rect(chip, 18.0, Color::rgba(255, 255, 255, 0.06));
+                    let av_r = RectF::new(chip.x + 5.0, chip.y + 6.0, 28.0, 28.0);
+                    if let Some(ref av) = u.avatar_url {
+                        r.draw_rounded_artwork(av, false, av_r, 14.0, 1.0);
+                    } else {
+                        r.fill_rounded_rect(av_r, 14.0, accent.with_alpha(0.42));
+                    }
+                    let nm = if u.is_host {
+                        format!("{} (房主)", u.nickname)
+                    } else {
+                        u.nickname.clone()
+                    };
+                    r.draw_text(
+                        &nm,
+                        RectF::new(av_r.right() + 7.0, chip.y + 4.0, chip_w - 44.0, 17.0),
+                        11.5,
+                        600,
+                        Theme::TEXT_PRIMARY,
+                        TextAlign::Left,
+                        true,
+                        false,
+                    );
+                    let u_vip = if u.is_vip { "黑胶 VIP" } else { "非 VIP" };
+                    r.draw_text(
+                        u_vip,
+                        RectF::new(av_r.right() + 7.0, chip.y + 21.0, chip_w - 44.0, 14.0),
+                        10.2,
+                        500,
+                        if u.is_vip {
+                            Color::rgb(252, 214, 124)
+                        } else {
+                            Theme::TEXT_MUTED
+                        },
+                        TextAlign::Left,
+                        true,
+                        false,
+                    );
+                    ux += chip_w + 8.0;
+                }
+            }
+            y += 112.0;
+
+            // Room Controls Row (with fixed `LtForceResync`!)
+            let gap = 8.0f32;
+            let bw = (inner_w - gap * 2.0) / 3.0;
+            for (i, (lbl, danger, act)) in [
+                ("同步房主歌单", false, UiAction::LtSyncRoomPlaylist),
+                ("立即校准进度", false, UiAction::LtForceResync),
+                ("退出 / 结束房间", true, UiAction::LtEndOrLeaveRoom),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let br = RectF::new(px + (bw + gap) * (i as f32), y, bw, 34.0);
+                let bhov = body_rect.contains(self.mouse_pos.0, self.mouse_pos.1)
+                    && br.contains(self.mouse_pos.0, self.mouse_pos.1);
+                r.draw_liquid_glass_button(
+                    br,
+                    9.0,
+                    if danger {
+                        GlassBtnVariant::Tinted(Theme::ACCENT_RED)
+                    } else {
+                        GlassBtnVariant::Regular
+                    },
+                    bhov,
+                    self.mouse_down,
+                    self.mouse_pos,
+                    self.glass_off(),
+                );
+                r.draw_text(
+                    lbl,
+                    br,
+                    12.2,
+                    if danger || bhov { 600 } else { 500 },
+                    Theme::TEXT_PRIMARY,
+                    TextAlign::Center,
+                    true,
+                    false,
+                );
+                push_clipped_hit(&mut self.hit_regions, br, act);
+            }
+            y += 44.0;
+
+            // Scrollable Room Shared Queue
+            r.draw_text(
+                &format!("房间共享队列 ({} 首)", lt.room_tracks.len()),
+                RectF::new(px, y, inner_w, 20.0),
+                12.8,
+                600,
+                Theme::TEXT_SECONDARY,
+                TextAlign::Left,
+                true,
+                false,
+            );
+            y += 24.0;
+
+            if lt.room_tracks.is_empty() {
+                r.draw_text(
+                    "在 AM Light 任意播放一首网易云歌曲，将自动同步到一起听房间队列。",
+                    RectF::new(px, y + 4.0, inner_w, 32.0),
+                    12.0,
+                    400,
+                    Theme::TEXT_MUTED,
+                    TextAlign::Left,
+                    false,
+                    true,
+                );
+                y += 40.0;
+            } else {
+                for (ti, tr) in lt.room_tracks.iter().enumerate() {
+                    let row = RectF::new(px, y, inner_w, 32.0);
+                    if row.bottom() >= body_rect.y && row.y <= body_rect.bottom() {
+                        let is_cur = self
+                            .smtc
+                            .adam_id
+                            .as_deref()
+                            .is_some_and(|a| netease_api::strip_ne_id(a) == netease_api::strip_ne_id(&tr.effective_adam_id()));
+                        let rhov = body_rect.contains(self.mouse_pos.0, self.mouse_pos.1)
+                            && row.contains(self.mouse_pos.0, self.mouse_pos.1);
+                        if is_cur {
+                            r.fill_rounded_rect(row, 8.0, accent.with_alpha(0.18));
+                        } else if rhov {
+                            r.fill_rounded_rect(row, 8.0, Color::rgba(255, 255, 255, 0.08));
+                        }
+                        let vip_mark = if tr.audio_traits.iter().any(|t| t.eq_ignore_ascii_case("vip")) {
+                            " [VIP]"
+                        } else {
+                            ""
+                        };
+                        r.draw_text(
+                            &format!("{}.  {}{}", ti + 1, tr.name, vip_mark),
+                            RectF::new(row.x + 8.0, row.y, inner_w * 0.64, 32.0),
+                            12.4,
+                            if is_cur { 600 } else { 500 },
+                            if is_cur {
+                                accent
+                            } else {
+                                Theme::TEXT_PRIMARY
+                            },
+                            TextAlign::Left,
+                            true,
+                            false,
+                        );
+                        r.draw_text(
+                            &tr.artist_name,
+                            RectF::new(row.x + inner_w * 0.66, row.y, inner_w * 0.32, 32.0),
+                            11.5,
+                            400,
+                            Theme::TEXT_MUTED,
+                            TextAlign::Right,
+                            true,
+                            false,
+                        );
+                        push_clipped_hit(&mut self.hit_regions, row, UiAction::LtPlayRoomTrack(ti));
+                    }
+                    y += 34.0;
+                }
+            }
+
+            // Invite Mutual Friends into Current Active Room!
+            y += 10.0;
+            r.draw_line(px, y, px + inner_w, y, Theme::SEPARATOR, 1.0);
+            y += 12.0;
+            r.draw_text(
+                &format!("邀请互关好友加入当前房间 ({})", lt.mutual_friends.len()),
+                RectF::new(px, y + 2.0, inner_w - 92.0, 22.0),
+                12.8,
+                600,
+                Theme::TEXT_SECONDARY,
+                TextAlign::Left,
+                true,
+                false,
+            );
+            let rf_btn = RectF::new(px + inner_w - 84.0, y, 84.0, 24.0);
+            let rf_hov = body_rect.contains(self.mouse_pos.0, self.mouse_pos.1)
+                && rf_btn.contains(self.mouse_pos.0, self.mouse_pos.1);
+            r.draw_liquid_glass_button(
+                rf_btn,
+                7.0,
+                GlassBtnVariant::Regular,
+                rf_hov,
+                self.mouse_down,
+                self.mouse_pos,
+                self.glass_off(),
+            );
+            r.draw_text(
+                "刷新互关",
+                rf_btn,
+                11.2,
+                500,
+                Theme::TEXT_PRIMARY,
+                TextAlign::Center,
+                true,
+                false,
+            );
+            push_clipped_hit(&mut self.hit_regions, rf_btn, UiAction::LtFetchMutualFriends);
+            y += 32.0;
+
+            for fr in &lt.mutual_friends {
+                let row = RectF::new(px, y, inner_w, 44.0);
+                if row.bottom() >= body_rect.y && row.y <= body_rect.bottom() {
+                    r.fill_rounded_rect(row, 9.0, Color::rgba(255, 255, 255, 0.04));
+                    let av_r = RectF::new(row.x + 8.0, row.y + 7.0, 30.0, 30.0);
+                    if let Some(ref av) = fr.avatar_url {
+                        r.draw_rounded_artwork(av, false, av_r, 15.0, 1.0);
+                    } else {
+                        r.fill_rounded_rect(av_r, 15.0, accent.with_alpha(0.35));
+                    }
+                    r.draw_text(
+                        &fr.nickname,
+                        RectF::new(av_r.right() + 10.0, row.y + 5.0, inner_w - 146.0, 18.0),
+                        12.5,
+                        600,
+                        Theme::TEXT_PRIMARY,
+                        TextAlign::Left,
+                        true,
+                        false,
+                    );
+                    r.draw_text(
+                        if fr.is_vip { "互关 · VIP" } else { "互关好友" },
+                        RectF::new(av_r.right() + 10.0, row.y + 23.0, inner_w - 146.0, 14.0),
+                        10.6,
+                        400,
+                        if fr.is_vip {
+                            Color::rgb(252, 214, 124)
+                        } else {
+                            Theme::TEXT_MUTED
+                        },
+                        TextAlign::Left,
+                        true,
+                        false,
+                    );
+                    let invited = lt.invited_friend_ids.contains(&fr.user_id);
+                    let inv_btn = RectF::new(row.right() - 78.0, row.y + 9.0, 68.0, 26.0);
+                    let ihov = body_rect.contains(self.mouse_pos.0, self.mouse_pos.1)
+                        && inv_btn.contains(self.mouse_pos.0, self.mouse_pos.1);
+                    r.draw_liquid_glass_button(
+                        inv_btn,
+                        7.5,
+                        if invited {
+                            GlassBtnVariant::Regular
+                        } else {
+                            GlassBtnVariant::Tinted(accent)
+                        },
+                        ihov,
+                        self.mouse_down,
+                        self.mouse_pos,
+                        self.glass_off(),
+                    );
+                    r.draw_text(
+                        if invited { "已邀请" } else { "邀请" },
+                        inv_btn,
+                        11.5,
+                        600,
+                        if invited {
+                            Theme::SIGNAL_GREEN
+                        } else {
+                            Theme::TEXT_PRIMARY
+                        },
+                        TextAlign::Center,
+                        true,
+                        false,
+                    );
+                    push_clipped_hit(
+                        &mut self.hit_regions,
+                        inv_btn,
+                        UiAction::LtInviteFriend {
+                            friend_uid: fr.user_id,
+                            friend_name: fr.nickname.clone(),
+                        },
+                    );
+                }
+                y += 50.0;
+            }
+        }
+        r.pop_clip();
+
+        let total_content_h = (y - content_start_y).max(0.0);
+        self.listen_together.modal_max_scroll_y = (total_content_h - body_rect.h).max(0.0);
+        self.listen_together.modal_scroll_y = self
+            .listen_together
+            .modal_scroll_y
+            .clamp(0.0, self.listen_together.modal_max_scroll_y);
+
+        // Draw subtle right-edge scrollbar when modal body scrolls
+        if self.listen_together.modal_max_scroll_y > 1.0 {
+            let track_h = (body_rect.h - 6.0).max(20.0);
+            let thumb_h =
+                ((body_rect.h / total_content_h.max(1.0)) * track_h).clamp(24.0, track_h);
+            let frac =
+                (self.listen_together.modal_scroll_y / self.listen_together.modal_max_scroll_y)
+                    .clamp(0.0, 1.0);
+            let thumb_y = body_rect.y + 3.0 + frac * (track_h - thumb_h);
+            r.fill_rounded_rect(
+                RectF::new(modal.right() - 14.0, body_rect.y + 3.0, 3.5, track_h),
+                2.0,
+                Color::rgba(255, 255, 255, 0.08),
+            );
+            r.fill_rounded_rect(
+                RectF::new(modal.right() - 14.0, thumb_y, 3.5, thumb_h),
+                2.0,
+                Color::rgba(255, 255, 255, 0.34),
+            );
+        }
+    }
+
     fn draw_banner_toast(&mut self, r: &mut D2DRenderer, area: RectF, msg: &str, is_err: bool) {
         let bw = (msg.chars().count() as f32 * 14.0 + 48.0).clamp(220.0, area.w - 60.0);
         let toast = RectF::new(area.center_x() - bw * 0.5, 16.0, bw, 36.0);
@@ -16901,6 +19452,52 @@ fn read_clipboard_unicode_text() -> Option<String> {
         }
         let _ = CloseClipboard();
         res
+    }
+}
+
+fn write_clipboard_unicode_text(text: &str) -> bool {
+    unsafe {
+        use windows::Win32::Foundation::{GlobalFree, HANDLE};
+        use windows::Win32::System::DataExchange::{
+            CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+        };
+        use windows::Win32::System::Memory::{
+            GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
+        };
+        use windows::Win32::System::Ole::CF_UNICODETEXT;
+
+        let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+        let bytes = wide.len() * std::mem::size_of::<u16>();
+        let Ok(hmem) = GlobalAlloc(GMEM_MOVEABLE, bytes) else {
+            return false;
+        };
+        let ptr = GlobalLock(hmem) as *mut u16;
+        if ptr.is_null() {
+            let _ = GlobalFree(Some(hmem));
+            return false;
+        }
+        std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
+        let _ = GlobalUnlock(hmem);
+
+        let mut opened = false;
+        for _ in 0..6 {
+            if OpenClipboard(None).is_ok() {
+                opened = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(8));
+        }
+        if !opened {
+            let _ = GlobalFree(Some(hmem));
+            return false;
+        }
+        let _ = EmptyClipboard();
+        let ok = SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(hmem.0))).is_ok();
+        if !ok {
+            let _ = GlobalFree(Some(hmem));
+        }
+        let _ = CloseClipboard();
+        ok
     }
 }
 
