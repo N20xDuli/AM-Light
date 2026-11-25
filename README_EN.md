@@ -87,17 +87,18 @@ Switch seamlessly between **5 playback backends** under **Settings → Playback 
 - Ships with **5 full UI languages**: **简体中文**, **繁體中文**, **English**, **日本語**, and **한국어**, plus **Auto** (detects Windows UI locale via `GetUserDefaultUILanguage`).
 - Switching under **Settings → Language** takes effect on the very next frame without restarting, also localizing Apple Music editorial catalog requests while keeping song titles, artist names, album names, and lyrics completely untouched.
 
-### Native Direct2D / DirectComposition UI & Liquid Glass
+### Native Direct2D / DirectComposition UI & iPadOS 26 Liquid Glass
 
-- **Frameless customizable window** (`0..28 px` adjustable corner radius) with single-pass backdrop-snapshot **Liquid Glass** buttons and diagonal specular border rim.
-- **Viewport-Adaptive Motion Artwork**: Smooth animated covers on both Home shelves and Album/Playlist Detail pages — plays automatically when scrolled into view and pauses immediately off-screen with zero flicker.
-- **Unified `•••` Context Menus & Artist Profiles**: Play Next, Add to Playlist, Cross-Platform Playlist Transfer, Go to Artist (Top Songs + Full Discography), and Go to Album across every view.
+- **Rebuilt iPadOS 26 Optical Liquid Glass (On by Default)**: Powered by `R16G16B16A16_FLOAT` C2 quintic SDF lens displacement, a single half-resolution pre-blurred backdrop snapshot per frame, crisp vertical top/bottom specular rims, and elastic hover/press spring dynamics — crystal-clear and seam-free at 100%–200% HiDPI.
+- **100% Bundled OFL Inter Variable Typography**: Loaded in-memory via DirectWrite for all Latin UI text and numerals (`tnum=1 / zero=0` tabular unslashed `0` for timestamps & meters), with seamless native CJK/Emoji fallback.
+- **Flat Dark iPadOS Settings & SWR Page Cache**: Settings uses an authentic inset-grouped matte dark iPadOS layout with Apple green toggles, flat segmented controls, and zero Liquid Glass overhead; built-in Stale-While-Revalidate page caching (toggleable in Settings) and parallel API fetches make tab switching instant.
+- **Frameless Window & Viewport-Adaptive Motion Art**: Adjustable `0..28 px` corner radius, viewport-gated animated covers on Home & Detail pages, unified `•••` context menus, and complete Artist profiles.
 
-### Subpixel Word-Level Lyrics & Immersive Mode
+### Subpixel Word-Level Lyrics & Revamped Controls
 
-- Supports **TTML / YRC / LRC** parsing with live timing offset controls and `DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC` subpixel positioning.
-- Distinct **CJK per-character** and **Latin per-word** sweep physics, emphasis glow & scale, toggleable end-hold glow, centered instrumental indicators, and dual-pass GPU Gaussian depth-of-field blur.
-- **Lyrics Immersive Mode**: Cleanly hides all corner chrome so only the cover, playback controls, and synced lyrics remain — revealing corner controls smoothly as the cursor approaches.
+- Supports **TTML / YRC / LRC** with `DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC` subpixel motion, distinct **CJK per-character** and **Latin per-word** sweep physics, emphasis glow/scale, toggleable end-hold glow, and an end-of-playlist scroll-back latch.
+- **Seamless Flowing Aurora & Minimal Chrome**: Rebuilt seamless *Flow* / *Soft Focus* artwork backgrounds with zero tile corners, borderless transport & `•••` buttons, a compact 3-icon bottom-right capsule (**Translate / Lyrics / Up Next**), and an interactive right-column Up Next queue.
+- **Upgraded Left `•••` Lyrics Menu**: Consolidates an inline lyrics offset stepper (`- / 0.0s / +`), **Enlarged Left Column**, **Center-Axis Lyrics Alignment**, source switching, Flow/Soft Focus style, **Lyrics Immersive Mode** toggle, and local `.lrc`/`.ttml` import.
 
 ### Real-Time WASAPI Visualizer & Adaptive High-Refresh Pacing
 
@@ -132,8 +133,8 @@ If third-party iOS signing tools (e.g., Sideloadly) or broken folder ACLs cause 
 
 ### Step 2: Download & Install
 
-1. Download the latest Windows x64 installer (e.g., `AM-Light-Setup-v0.2.10-x64.exe`) from [**GitHub Releases**](https://github.com/N20xDuli/AM-Light/releases).
-   - Silent install: `AM-Light-Setup-v0.2.10-x64.exe --silent [--dir="C:\Path\To\AM-Light"]`
+1. Download the latest Windows x64 installer (e.g., `AM-Light-Setup-v0.2.11-x64.exe`) from [**GitHub Releases**](https://github.com/N20xDuli/AM-Light/releases).
+   - Silent install: `AM-Light-Setup-v0.2.11-x64.exe --silent [--dir="C:\Path\To\AM-Light"]`
    - Uninstall via Windows **Installed Apps** or `Uninstall-AM-Light.exe` inside the install folder.
 2. Launch AM Light and configure your preferred playback backend and UI language under **Settings**.
 
@@ -165,7 +166,7 @@ cargo test --release --bin AM-Light -- --test-threads=1
 # Build main executable (Release)
 cargo build --release --bin AM-Light
 
-# Build Windows installer (outputs to dist\AM-Light-Setup-v0.2.10-x64.exe)
+# Build Windows installer (outputs to dist\AM-Light-Setup-v0.2.11-x64.exe)
 $env:AM_LIGHT_BIN_PATH = "target\release\AM-Light.exe"
 cargo build --release --manifest-path installer\Cargo.toml
 ```
@@ -176,6 +177,7 @@ cargo build --release --manifest-path installer\Cargo.toml
 
 - Lyric parsing, timeline calibration, word-level motion physics, and the dual-pass blurred aurora lyrics presentation draw inspiration from **LyricsBlossom** and the technical notes shared by its author — sincere thanks for their work.
 - Built-in Apple Music Windows DRM diagnostics and repair flow are integrated from [N20xDuli/apple-music-windows-drm-fix](https://github.com/N20xDuli/apple-music-windows-drm-fix).
+- Bundled UI Latin & numeral typography uses **Inter** under the [SIL Open Font License 1.1](assets/fonts/OFL.txt).
 
 ---
 

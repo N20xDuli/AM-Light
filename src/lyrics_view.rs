@@ -34,6 +34,9 @@ pub enum LyricsHitAction {
     OpenListenTogether,
     NudgeLyricsOffset(f64),
     ResetLyricsOffset,
+    ToggleLyricsVisible,
+    ToggleLyricsQueue,
+    JumpLyricsQueueIndex(usize),
 }
 
 /// Evaluates target visibility (`[top_left, top_right, bottom_left, bottom_right]`) for peripheral
@@ -229,10 +232,24 @@ struct CachedLyricsLayoutKey {
 pub struct LyricsViewState {
     pub animator: LyricsAnimator,
     pub show_translation: bool,
+    pub show_lyrics: bool,
+    pub show_queue: bool,
+    pub queue_tracks: Vec<crate::am_agent::AgentTrackInput>,
+    pub queue_scroll_y: f32,
+    pub queue_max_scroll_y: f32,
+    pub queue_column_rect: RectF,
+    pub left_enlarged: bool,
+    pub center_axis: bool,
     pub music_free_blur: bool,
     pub source_pref: LyricsSourcePref,
     pub sync_offset_sec: f64,
     pub synced_playhead_sec: f64,
+    pub end_latched_playhead: Option<f64>,
+    last_track_key: String,
+    last_nonzero_playhead_sec: f64,
+    was_playing: bool,
+    seen_clamp_reset_seq: u64,
+    was_showing_queue: bool,
     last_raw_playhead_sec: f64,
     last_calibrated_offset_sec: f64,
     last_offset_track_key: String,
@@ -262,10 +279,24 @@ impl Default for LyricsViewState {
         Self {
             animator: LyricsAnimator::default(),
             show_translation: true,
+            show_lyrics: true,
+            show_queue: false,
+            queue_tracks: Vec::new(),
+            queue_scroll_y: 0.0,
+            queue_max_scroll_y: 0.0,
+            queue_column_rect: RectF::default(),
+            left_enlarged: true,
+            center_axis: false,
             music_free_blur: false,
             source_pref: LyricsSourcePref::Auto,
             sync_offset_sec: 0.0,
             synced_playhead_sec: 0.0,
+            end_latched_playhead: None,
+            last_track_key: String::new(),
+            last_nonzero_playhead_sec: 0.0,
+            was_playing: false,
+            seen_clamp_reset_seq: 0,
+            was_showing_queue: false,
             last_raw_playhead_sec: -1.0,
             last_calibrated_offset_sec: 0.0,
             last_offset_track_key: String::new(),
@@ -296,6 +327,35 @@ impl Default for LyricsViewState {
 }
 
 impl LyricsViewState {
+    const QUEUE_ROW_STRIDE: f32 = 60.0;
+
+    pub fn set_queue_tracks(&mut self, tracks: Vec<crate::am_agent::AgentTrackInput>) {
+        self.queue_tracks = tracks;
+        if self.queue_tracks.is_empty() {
+            self.queue_scroll_y = 0.0;
+            self.queue_max_scroll_y = 0.0;
+            self.was_showing_queue = false;
+        } else {
+            let est_view_h = if self.queue_column_rect.h > 80.0 {
+                (self.queue_column_rect.h - 62.0).max(120.0)
+            } else {
+                420.0
+            };
+            let total_h = (self.queue_tracks.len() as f32) * Self::QUEUE_ROW_STRIDE;
+            self.queue_max_scroll_y = (total_h - est_view_h).max(0.0);
+            self.queue_scroll_y = self.queue_scroll_y.clamp(0.0, self.queue_max_scroll_y);
+        }
+    }
+
+    pub fn on_queue_wheel(&mut self, px: f32) {
+        self.queue_scroll_y = (self.queue_scroll_y - px).clamp(0.0, self.queue_max_scroll_y);
+    }
+
+    pub fn clear_end_latch(&mut self) {
+        self.end_latched_playhead = None;
+        self.last_nonzero_playhead_sec = 0.0;
+    }
+
     pub fn has_active_layout_motion(&self) -> bool {
         let corner_settling = (0..4).any(|i| {
             (self.immersive_corner_alphas[i] - self.immersive_corner_targets[i]).abs() > 0.008
@@ -373,6 +433,20 @@ impl LyricsViewState {
         reduce_motion: bool,
         latin_by_word: bool,
     ) {
+        if !track_key.is_empty() && self.last_track_key != track_key {
+            let prev = self.last_track_key.as_str();
+            let same_meta_base = prev.starts_with("meta:")
+                && track_key.starts_with("meta:")
+                && prev[5..].split('#').next() == track_key[5..].split('#').next();
+            let id_upgrade = (prev.starts_with("meta:") && track_key.starts_with("id:"))
+                || (prev.starts_with("id:i.") && track_key.starts_with("id:"));
+            if !prev.is_empty() && !same_meta_base && !id_upgrade {
+                self.end_latched_playhead = None;
+                self.last_nonzero_playhead_sec = 0.0;
+                self.was_playing = false;
+            }
+            self.last_track_key = track_key.to_string();
+        }
         if !track_key.is_empty() && self.last_offset_track_key != track_key {
             if self.last_offset_meta_key.is_empty() {
                 let prev = self.last_offset_track_key.as_str();
@@ -416,8 +490,17 @@ impl LyricsViewState {
         self.cover_vel += cov_force * dt;
         self.cover_scale = (self.cover_scale + self.cover_vel * dt).clamp(0.75, 1.06);
 
-        // Smart instrumental / no-lyrics nonlinear centering spring (hold split layout up to 6.0s while fetching!)
-        if lyrics_loading && lyrics.is_none() && self.loading_hold_sec < 6.0 {
+        // Smart centering spring:
+        // - Queue open -> NEVER center cover (split layout for right-column Up Next queue!)
+        // - Lyrics explicitly hidden (and queue closed) -> smoothly center album cover + controls!
+        // - Otherwise -> hold split up to 6.0s while fetching, then center if instrumental/no lyrics
+        if self.show_queue {
+            self.loading_hold_sec = 0.0;
+            self.center_layout_spring.target = 0.0;
+        } else if !self.show_lyrics {
+            self.loading_hold_sec = 0.0;
+            self.center_layout_spring.target = 1.0;
+        } else if lyrics_loading && lyrics.is_none() && self.loading_hold_sec < 6.0 {
             self.loading_hold_sec += dt;
             self.center_layout_spring.target = 0.0;
         } else {
@@ -433,12 +516,71 @@ impl LyricsViewState {
             self.center_layout_spring.step(dt);
         }
 
+        // Detect external user seek / scrub / prev-next reset before our own offset clamp check
+        let external_seek = self.animator.clamp_reset_seq() != self.seen_clamp_reset_seq;
+        if external_seek {
+            self.end_latched_playhead = None;
+            self.last_nonzero_playhead_sec = playhead_sec;
+        }
+
+        // End-of-playlist scroll-back latch:
+        // When a playlist finishes and playback stops on the same track, SMTC/agent often drops
+        // `position_sec` back to `0.0`. Latch the end playhead so lyrics rest serenely at the
+        // final line instead of scrolling all the way back to line 0, and release immediately
+        // on explicit seek/scrub, play resume, or track change.
+        let effective_playhead = if is_playing {
+            if self.end_latched_playhead.is_some()
+                || playhead_sec > 0.05
+                || self.last_nonzero_playhead_sec <= 1.5
+            {
+                self.last_nonzero_playhead_sec = playhead_sec;
+            }
+            self.end_latched_playhead = None;
+            playhead_sec
+        } else if playhead_sec > 1.5 {
+            self.last_nonzero_playhead_sec = playhead_sec;
+            self.end_latched_playhead = None;
+            playhead_sec
+        } else if playhead_sec <= 1.2 {
+            if let Some(latched) = self.end_latched_playhead {
+                if playhead_sec > 0.05 && (playhead_sec - self.last_raw_playhead_sec).abs() > 0.05
+                {
+                    self.end_latched_playhead = None;
+                    self.last_nonzero_playhead_sec = playhead_sec;
+                    playhead_sec
+                } else {
+                    latched
+                }
+            } else {
+                let near_lyrics_end = lyrics
+                    .and_then(|l| l.lines.last())
+                    .map(|last_line| {
+                        self.last_nonzero_playhead_sec > 1.5
+                            && self.last_nonzero_playhead_sec
+                                >= (last_line.start_sec - 4.0).max(1.5)
+                    })
+                    .unwrap_or(false);
+                let abrupt_stop_snap =
+                    self.was_playing && self.last_nonzero_playhead_sec >= 12.0;
+                if !external_seek && (near_lyrics_end || abrupt_stop_snap) {
+                    self.end_latched_playhead = Some(self.last_nonzero_playhead_sec);
+                    self.last_nonzero_playhead_sec
+                } else {
+                    playhead_sec
+                }
+            }
+        } else {
+            playhead_sec
+        };
+        self.was_playing = is_playing;
+
         if (self.sync_offset_sec - self.last_calibrated_offset_sec).abs() > 1e-5 {
             self.animator.reset_word_clamps();
         }
+        self.seen_clamp_reset_seq = self.animator.clamp_reset_seq();
         self.last_raw_playhead_sec = playhead_sec;
         self.last_calibrated_offset_sec = self.sync_offset_sec;
-        self.synced_playhead_sec = self.calibrated_playhead(playhead_sec);
+        self.synced_playhead_sec = self.calibrated_playhead(effective_playhead);
         if let Some(lyr) = lyrics {
             self.animator.bind_lyrics(track_key, lyr);
             self.animator
@@ -489,6 +631,9 @@ impl LyricsViewState {
             );
             if !self.last_offset_meta_key.is_empty() && self.last_offset_meta_key != meta_key {
                 self.sync_offset_sec = 0.0;
+                self.end_latched_playhead = None;
+                self.last_nonzero_playhead_sec = 0.0;
+                self.was_playing = false;
                 self.last_raw_playhead_sec = smtc.position_sec;
                 self.last_calibrated_offset_sec = 0.0;
                 self.synced_playhead_sec = self.calibrated_playhead(smtc.position_sec);
@@ -564,7 +709,7 @@ impl LyricsViewState {
         let top_y = win_rect.y + Theme::TOP_BAR_Y;
         let btn_h = Theme::TOP_BAR_H;
         let btn_r = Theme::TOP_BAR_RADIUS;
-        let [a_tl, a_tr, a_bl, a_br] = self.immersive_corner_alphas;
+        let [a_tl, a_tr, _a_bl, a_br] = self.immersive_corner_alphas;
 
         // Top-Left Close Chevron Circle (hidden cleanly in Immersive Mode until mouse nears top-left)
         let close_btn = RectF::new(win_rect.x + 20.0, top_y, btn_h, btn_h);
@@ -716,35 +861,86 @@ impl LyricsViewState {
 
         // Responsive Viewport Scale (scales proportionally on large / maximized / 4K displays!)
         let ui_scale = ((win_rect.w / 1180.0).min(win_rect.h / 760.0)).clamp(0.88, 1.80);
-        let ctrl_scale = ui_scale.clamp(0.92, 1.45);
+        let pad_x = (36.0 * ui_scale).clamp(28.0, 76.0);
         let center_t = self.center_layout_spring.value.clamp(0.0, 1.0);
 
-        // Split View Layout: Left ~43% Artwork & Transport, Right ~57% SyncedLyricsViewController
-        let left_w = (win_rect.w * 0.43).clamp(300.0, 860.0);
-        let pad_x = (36.0 * ui_scale).clamp(28.0, 76.0);
-        let left_col = RectF::new(
-            win_rect.x + pad_x,
-            win_rect.y + 58.0,
-            (left_w - pad_x * 1.35).max(220.0),
-            (win_rect.h - 98.0).max(220.0),
-        );
-        let right_col = RectF::new(
-            win_rect.x + left_w + 8.0,
-            win_rect.y + 54.0,
-            (win_rect.w - left_w - pad_x * 0.85 - 8.0).max(260.0),
-            (win_rect.h - 108.0).max(200.0),
-        );
-        self.lyrics_column_rect = if center_t > 0.85 {
-            RectF::default()
+        // Split View Layout: supports `left_enlarged` (default true) and `center_axis` (default false)
+        let (left_col, right_col) = if self.center_axis {
+            // Midline alignment: right column (lyrics / queue) left alignment line sits strictly on `win_rect.center_x()`
+            let left_half_x = win_rect.x + pad_x;
+            let left_half_w = (win_rect.center_x() - 24.0 - left_half_x).max(220.0);
+            let lc = RectF::new(
+                left_half_x,
+                win_rect.y + 58.0,
+                left_half_w,
+                (win_rect.h - 98.0).max(220.0),
+            );
+            let rc = RectF::new(
+                win_rect.center_x(),
+                win_rect.y + 54.0,
+                (win_rect.right() - win_rect.center_x() - pad_x * 0.75).max(240.0),
+                (win_rect.h - 108.0).max(200.0),
+            );
+            (lc, rc)
         } else {
-            right_col
+            let left_w = if self.left_enlarged {
+                (win_rect.w * 0.46).clamp(340.0, 920.0)
+            } else {
+                (win_rect.w * 0.43).clamp(300.0, 860.0)
+            };
+            let lc = RectF::new(
+                win_rect.x + pad_x,
+                win_rect.y + 58.0,
+                (left_w - pad_x * 1.35).max(220.0),
+                (win_rect.h - 98.0).max(220.0),
+            );
+            let rc = RectF::new(
+                win_rect.x + left_w + 8.0,
+                win_rect.y + 54.0,
+                (win_rect.w - left_w - pad_x * 0.85 - 8.0).max(260.0),
+                (win_rect.h - 108.0).max(200.0),
+            );
+            (lc, rc)
         };
 
-        // --- Draw Left Column (or Centered Stage when Instrumental / No Lyrics): ---
-        let base_cov = (left_col.w * 0.86)
-            .min(left_col.h * 0.54)
-            .clamp(180.0, 620.0);
-        let max_cov = base_cov * (1.0 + 0.07 * center_t);
+        if self.show_queue {
+            self.queue_column_rect = right_col;
+            self.lyrics_column_rect = RectF::default();
+        } else {
+            self.queue_column_rect = RectF::default();
+            self.lyrics_column_rect = if center_t > 0.85 || !self.show_lyrics {
+                RectF::default()
+            } else {
+                right_col
+            };
+        }
+
+        // --- Draw Left Column (or Centered Stage when Lyrics Hidden / Instrumental): ---
+        let avail_h = (left_col.h - 12.0).max(240.0);
+        let mut ctrl_scale = if self.left_enlarged {
+            (ui_scale * 1.14).clamp(1.02, 1.62)
+        } else {
+            ui_scale.clamp(0.92, 1.45)
+        };
+        if self.left_enlarged {
+            let max_ctrl_scale = ((avail_h - 190.0) / 194.0).clamp(0.84, 1.62);
+            ctrl_scale = ctrl_scale.min(max_ctrl_scale);
+        }
+        let controls_h = 194.0 * ctrl_scale;
+        let max_cov_for_h = (avail_h - controls_h).max(160.0);
+        let base_cov = if self.left_enlarged {
+            (left_col.w * 0.90)
+                .min(left_col.h * 0.62)
+                .clamp(210.0, 700.0)
+        } else {
+            (left_col.w * 0.86)
+                .min(left_col.h * 0.54)
+                .clamp(180.0, 620.0)
+        };
+        let max_cov_w = left_col.w * (1.0 - center_t) + (win_rect.w * 0.65) * center_t;
+        let max_cov = (base_cov * (1.0 + 0.07 * center_t))
+            .min(max_cov_for_h)
+            .min(max_cov_w.max(180.0));
         let cov_cx = left_col.center_x() * (1.0 - center_t) + win_rect.center_x() * center_t;
 
         // Vertically center the [cover + title/artist + scrubber + transport + volume] stack!
@@ -842,22 +1038,34 @@ impl LyricsViewState {
             true,
             false,
         );
-        // Right `•••` Liquid Glass circle aligned with title/artist
+        // Clean borderless `•••` icon aligned with title/artist (ZERO circular border!)
         let dots_btn = RectF::new(meta_x + meta_w - dots_sz, my + 5.0 * ctrl_scale, dots_sz, dots_sz);
         let dots_hov = dots_btn.contains(hovered_pt.0, hovered_pt.1);
-        r.draw_liquid_glass_button(
-            dots_btn,
-            dots_sz * 0.5,
-            GlassBtnVariant::Subtle,
-            dots_hov,
-            mouse_down,
-            hovered_pt,
-            glass_off,
+        if dots_hov && mouse_down {
+            r.fill_rounded_rect(dots_btn, dots_sz * 0.5, Color::rgba(255, 255, 255, 0.12));
+        }
+        let dots_scale = if dots_hov && mouse_down {
+            0.93
+        } else if dots_hov {
+            1.08
+        } else {
+            1.0
+        };
+        let dots_ic_sz = dots_sz * 0.54 * dots_scale;
+        let dots_ic_rect = RectF::new(
+            dots_btn.center_x() - dots_ic_sz * 0.5,
+            dots_btn.center_y() - dots_ic_sz * 0.5,
+            dots_ic_sz,
+            dots_ic_sz,
         );
         r.draw_icon(
             SfIcon::MoreDots,
-            dots_btn.inset(dots_sz * 0.25, dots_sz * 0.25),
-            Color::rgba(255, 255, 255, 0.88),
+            dots_ic_rect,
+            if dots_hov {
+                Theme::TEXT_PRIMARY
+            } else {
+                Color::rgba(255, 255, 255, 0.68)
+            },
         );
         self.hit_zones.push(LyricsHitZone {
             rect: dots_btn,
@@ -940,7 +1148,7 @@ impl LyricsViewState {
         );
         my += 24.0 * ctrl_scale;
 
-        // 5-Button Liquid Glass Transport Row: Shuffle / Prev / Play-Pause / Next / Repeat
+        // 5-Button Borderless Apple Music Transport Row: Shuffle / Prev / Play-Pause / Next / Repeat
         let is_playing = smtc.status == "Playing";
         let ctrl_cy = my + 20.0 * ctrl_scale;
         let outer_dx = (meta_w * 0.44).clamp(96.0, 210.0);
@@ -997,21 +1205,13 @@ impl LyricsViewState {
         ] {
             let br = RectF::new(cx_pos - sz * 0.5, ctrl_cy - sz * 0.5, sz, sz);
             let bhov = br.contains(hovered_pt.0, hovered_pt.1);
-            if bhov || tint_active {
-                r.draw_liquid_glass_button(
-                    br,
-                    sz * 0.5,
-                    if tint_active {
-                        GlassBtnVariant::Tinted(Theme::ACCENT_RED)
-                    } else {
-                        GlassBtnVariant::Regular
-                    },
-                    bhov,
-                    mouse_down,
-                    hovered_pt,
-                    glass_off,
-                );
-            }
+            let b_scale = if bhov && mouse_down {
+                0.93
+            } else if bhov {
+                1.08
+            } else {
+                1.0
+            };
             if is_center_play && playback_loading {
                 r.draw_loading_spinner(
                     br.center_x(),
@@ -1021,12 +1221,32 @@ impl LyricsViewState {
                     Theme::TEXT_PRIMARY,
                 );
             } else {
-                let ic_col = if tint_active || sz > sz_sm + 2.0 || bhov {
+                let ic_col = if tint_active || bhov {
                     Theme::TEXT_PRIMARY
+                } else if is_center_play {
+                    Color::rgba(255, 255, 255, 0.94)
+                } else if sz > sz_sm + 2.0 {
+                    Color::rgba(255, 255, 255, 0.86)
                 } else {
-                    Color::rgba(255, 255, 255, 0.72)
+                    Color::rgba(255, 255, 255, 0.56)
                 };
-                r.draw_icon(ic, br.inset(sz * 0.22, sz * 0.22), ic_col);
+                let ic_sz = sz * 0.56 * b_scale;
+                let ic_rect = RectF::new(
+                    br.center_x() - ic_sz * 0.5,
+                    br.center_y() - ic_sz * 0.5,
+                    ic_sz,
+                    ic_sz,
+                );
+                r.draw_icon(ic, ic_rect, ic_col);
+                if tint_active {
+                    // Subtle 4px active indicator dot underneath Shuffle / Repeat (ZERO circular border!)
+                    r.fill_circle(
+                        cx_pos,
+                        ctrl_cy + sz * 0.44,
+                        2.0,
+                        Color::rgba(255, 255, 255, 0.92),
+                    );
+                }
             }
             self.hit_zones.push(LyricsHitZone {
                 rect: br,
@@ -1037,7 +1257,7 @@ impl LyricsViewState {
         my += ctrl_row_h;
 
         // Interactive Volume Slider
-        if my + 24.0 < win_rect.bottom() - 28.0 {
+        if my + 16.0 < win_rect.bottom() - 16.0 {
             let vol = smtc.volume.unwrap_or(0.75).clamp(0.0, 1.0) as f32;
             let spk_sz = (15.5 * ctrl_scale).clamp(15.0, 20.0);
             r.draw_icon(
@@ -1063,92 +1283,87 @@ impl LyricsViewState {
             });
         }
 
-        // Bottom-left subtle playback & lyrics source attribution
-        let is_no_lyrics = crate::lyrics::is_effectively_instrumental_or_empty(lyrics);
-        let src_caption = if lyrics_loading && lyrics.is_none() {
-            "AM Light · 正在匹配同步歌词...".to_string()
-        } else if is_no_lyrics {
-            if lyrics.is_some() {
-                "AM Light · 纯音乐".to_string()
-            } else {
-                format!("AM Light · {}", self.source_pref.label())
-            }
-        } else if let Some(l) = lyrics {
-            format!("AM Light · {}", l.source_name)
-        } else {
-            format!("AM Light · {}", self.source_pref.label())
-        };
-        if a_bl > 0.02 {
-            r.draw_icon(
-                SfIcon::Radio,
-                RectF::new(win_rect.x + 28.0, win_rect.bottom() - 34.0, 16.0, 16.0),
-                Color::rgba(255, 255, 255, 0.45 * a_bl),
-            );
-            r.draw_text(
-                &src_caption,
-                RectF::new(win_rect.x + 50.0, win_rect.bottom() - 36.0, 320.0, 20.0),
-                11.8,
-                500,
-                Color::rgba(255, 255, 255, 0.48 * a_bl),
-                TextAlign::Left,
-                true,
-                false,
-            );
-        }
-
-        // --- Draw Right Column: SyncedLyricsViewController (Hidden smoothly when Instrumental / No Lyrics!) ---
-        let lyrics_col_alpha = ((1.0 - center_t * 1.38).clamp(0.0, 1.0) * sa).clamp(0.0, 1.0);
-        if lyrics_col_alpha > 0.01 {
-            let shifted_right = RectF::new(
-                right_col.x + (1.0 - lyrics_col_alpha) * 32.0,
-                right_col.y,
-                right_col.w,
-                right_col.h,
-            );
-
-            if let Some(lyr) = lyrics.filter(|l| !crate::lyrics::is_effectively_instrumental_or_empty(Some(l))) {
-                let synced_playhead = if self.last_raw_playhead_sec >= 0.0
-                    && (smtc.position_sec - self.last_raw_playhead_sec).abs() <= 0.25
-                    && (self.sync_offset_sec - self.last_calibrated_offset_sec).abs() < 1e-6
-                {
-                    self.synced_playhead_sec
-                } else {
-                    let t = self.calibrated_playhead(smtc.position_sec);
-                    self.last_raw_playhead_sec = smtc.position_sec;
-                    self.last_calibrated_offset_sec = self.sync_offset_sec;
-                    self.synced_playhead_sec = t;
-                    t
-                };
-                self.draw_synced_lyrics_column(
+        // --- Draw Right Column: Up Next Queue OR SyncedLyricsViewController ---
+        let right_col_alpha = ((1.0 - center_t * 1.38).clamp(0.0, 1.0) * sa).clamp(0.0, 1.0);
+        if self.show_queue {
+            if right_col_alpha > 0.01 {
+                let shifted_right = RectF::new(
+                    right_col.x + (1.0 - right_col_alpha) * 32.0,
+                    right_col.y,
+                    right_col.w,
+                    right_col.h,
+                );
+                self.draw_queue_column(
                     r,
                     shifted_right,
-                    lyr,
-                    lyrics_key,
-                    synced_playhead,
+                    smtc,
                     hovered_pt,
-                    reduce_motion,
-                    non_emph_fx,
-                    auto_emphasis,
-                    frontier_wave,
-                    end_hold_glow,
-                    lyrics_col_alpha,
+                    mouse_down,
+                    ctrl_scale,
+                    right_col_alpha,
                 );
-            } else if lyrics_loading {
-                r.draw_text(
-                    "正在匹配逐字同步歌词...",
-                    RectF::new(
-                        shifted_right.x + 20.0,
-                        shifted_right.center_y() - 30.0,
-                        shifted_right.w - 40.0,
-                        60.0,
-                    ),
-                    18.0 * ctrl_scale,
-                    600,
-                    Color::rgba(255, 255, 255, 0.55 * lyrics_col_alpha),
-                    TextAlign::Left,
-                    true,
-                    true,
+            }
+            self.was_showing_queue = true;
+        } else {
+            self.was_showing_queue = false;
+            if self.show_lyrics && right_col_alpha > 0.01 {
+                let shifted_right = RectF::new(
+                    right_col.x + (1.0 - right_col_alpha) * 32.0,
+                    right_col.y,
+                    right_col.w,
+                    right_col.h,
                 );
+
+                if let Some(lyr) = lyrics
+                    .filter(|l| !crate::lyrics::is_effectively_instrumental_or_empty(Some(l)))
+                {
+                    let effective_raw = self.end_latched_playhead.unwrap_or(smtc.position_sec);
+                    let synced_playhead = if self.end_latched_playhead.is_some() {
+                        self.calibrated_playhead(effective_raw)
+                    } else if self.last_raw_playhead_sec >= 0.0
+                        && (smtc.position_sec - self.last_raw_playhead_sec).abs() <= 0.25
+                        && (self.sync_offset_sec - self.last_calibrated_offset_sec).abs() < 1e-6
+                    {
+                        self.synced_playhead_sec
+                    } else {
+                        let t = self.calibrated_playhead(smtc.position_sec);
+                        self.last_raw_playhead_sec = smtc.position_sec;
+                        self.last_calibrated_offset_sec = self.sync_offset_sec;
+                        self.synced_playhead_sec = t;
+                        t
+                    };
+                    self.draw_synced_lyrics_column(
+                        r,
+                        shifted_right,
+                        lyr,
+                        lyrics_key,
+                        synced_playhead,
+                        hovered_pt,
+                        reduce_motion,
+                        non_emph_fx,
+                        auto_emphasis,
+                        frontier_wave,
+                        end_hold_glow,
+                        right_col_alpha,
+                    );
+                } else if lyrics_loading {
+                    let load_inset = if self.center_axis { 0.0 } else { 20.0 };
+                    r.draw_text(
+                        "正在匹配逐字同步歌词...",
+                        RectF::new(
+                            shifted_right.x + load_inset,
+                            shifted_right.center_y() - 30.0,
+                            (shifted_right.w - load_inset * 2.0).max(160.0),
+                            60.0,
+                        ),
+                        18.0 * ctrl_scale.min(1.3),
+                        600,
+                        Color::rgba(255, 255, 255, 0.55 * right_col_alpha),
+                        TextAlign::Left,
+                        true,
+                        true,
+                    );
+                }
             }
         }
 
@@ -1515,10 +1730,12 @@ impl LyricsViewState {
             let edge_fade = (st_top * st_bot).clamp(0.0, 1.0);
 
             let line = &lyr.lines[i];
+            let left_inset = if self.center_axis { 0.0 } else { 16.0 };
+            let right_inset = if self.center_axis { 8.0 } else { 20.0 };
             let origin_x = if cl.align == TextAlign::Right {
-                right_col.right() - vocal_max_w - 20.0
+                right_col.right() - vocal_max_w - right_inset
             } else {
-                right_col.x + 16.0
+                right_col.x + left_inset
             };
             let active_w = st.active_blend.value.clamp(0.0, 1.0);
             let line_t_sweep = st.clamped_word_time(t_sweep);
@@ -1698,7 +1915,7 @@ impl LyricsViewState {
 
             let env = self.animator.interlude.scale_alpha;
             let prog = self.animator.interlude.progress;
-            let base_x = right_col.x + 22.0;
+            let base_x = right_col.x + if self.center_axis { 6.0 } else { 22.0 };
             for d in 0..3 {
                 let seg_p = ((prog * 3.0) - (d as f32)).clamp(0.0, 1.0);
                 let wave = if reduce_motion {
@@ -1980,9 +2197,10 @@ impl LyricsViewState {
                     - self.animator.user_scroll_offset;
                 if credit_y < right_col.bottom() + 40.0 && credit_y + 60.0 > right_col.y {
                     let credit_txt = format!("词曲作者：{}", lyr.songwriters.join("、"));
+                    let credit_x = right_col.x + if self.center_axis { 0.0 } else { 16.0 };
                     r.draw_text(
                         &credit_txt,
-                        RectF::new(right_col.x + 16.0, credit_y, vocal_max_w, 48.0),
+                        RectF::new(credit_x, credit_y, vocal_max_w, 48.0),
                         (trans_font_sz * 0.92).clamp(13.5, 22.0),
                         500,
                         Color::rgba(255, 255, 255, 0.38 * col_alpha),
@@ -2568,6 +2786,285 @@ impl LyricsViewState {
         flush_run(r, &mut solid_run);
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn draw_queue_column(
+        &mut self,
+        r: &mut D2DRenderer,
+        right_col: RectF,
+        smtc: &SmtcState,
+        hovered_pt: (f32, f32),
+        mouse_down: bool,
+        ctrl_scale: f32,
+        col_alpha: f32,
+    ) {
+        let left_pad = if self.center_axis { 0.0 } else { 14.0 };
+        let col_x = right_col.x + left_pad;
+        let col_w = (right_col.w - left_pad - 12.0).max(200.0);
+
+        // Header: "待播清单" + track count
+        let header_h = 46.0;
+        let title_sz = (21.0 * ctrl_scale.clamp(0.95, 1.24)).clamp(19.0, 26.0);
+        r.draw_text(
+            "待播清单",
+            RectF::new(col_x + 4.0, right_col.y + 4.0, col_w - 110.0, 32.0),
+            title_sz,
+            700,
+            Color::rgba(255, 255, 255, 0.96 * col_alpha),
+            TextAlign::Left,
+            true,
+            false,
+        );
+        let count_lbl = format!("{} 首曲目", self.queue_tracks.len());
+        r.draw_text(
+            &count_lbl,
+            RectF::new(col_x + col_w - 112.0, right_col.y + 8.0, 108.0, 26.0),
+            12.8,
+            500,
+            Color::rgba(255, 255, 255, 0.52 * col_alpha),
+            TextAlign::Right,
+            true,
+            false,
+        );
+        r.fill_rect(
+            RectF::new(col_x + 2.0, right_col.y + header_h - 4.0, col_w - 4.0, 1.0),
+            Color::rgba(255, 255, 255, 0.11 * col_alpha),
+        );
+
+        let list_rect = RectF::new(
+            col_x,
+            right_col.y + header_h + 4.0,
+            col_w,
+            (right_col.h - header_h - 14.0).max(120.0),
+        );
+
+        if self.queue_tracks.is_empty() {
+            self.queue_max_scroll_y = 0.0;
+            self.queue_scroll_y = 0.0;
+            let ic_sz = 34.0;
+            r.draw_icon(
+                SfIcon::QueueList,
+                RectF::new(
+                    list_rect.center_x() - ic_sz * 0.5,
+                    list_rect.center_y() - 42.0,
+                    ic_sz,
+                    ic_sz,
+                ),
+                Color::rgba(255, 255, 255, 0.30 * col_alpha),
+            );
+            r.draw_text(
+                "当前待播清单为空",
+                RectF::new(list_rect.x, list_rect.center_y() + 2.0, list_rect.w, 26.0),
+                15.0,
+                600,
+                Color::rgba(255, 255, 255, 0.56 * col_alpha),
+                TextAlign::Center,
+                true,
+                false,
+            );
+            return;
+        }
+
+        // Resolve active track index (prefer AdamID match, fallback to exact title+artist match)
+        let active_idx = smtc
+            .adam_id
+            .as_deref()
+            .filter(|a| !a.is_empty())
+            .and_then(|aid| {
+                self.queue_tracks
+                    .iter()
+                    .position(|t| t.effective_adam_id() == aid || t.id == aid)
+            })
+            .or_else(|| {
+                let st_title = smtc.title.trim();
+                let st_artist = smtc.artist.trim();
+                if st_title.is_empty() {
+                    None
+                } else {
+                    self.queue_tracks.iter().position(|t| {
+                        t.name.trim().eq_ignore_ascii_case(st_title)
+                            && (st_artist.is_empty()
+                                || t.artist_name.trim().eq_ignore_ascii_case(st_artist))
+                    })
+                }
+            });
+
+        let row_h = 56.0f32;
+        let row_stride = Self::QUEUE_ROW_STRIDE;
+        let total_h = (self.queue_tracks.len() as f32) * row_stride;
+        self.queue_max_scroll_y = (total_h - list_rect.h).max(0.0);
+        if !self.was_showing_queue && self.queue_scroll_y <= 0.5 {
+            if let Some(ai) = active_idx {
+                self.queue_scroll_y = ((ai as f32) * row_stride - list_rect.h * 0.25)
+                    .clamp(0.0, self.queue_max_scroll_y);
+            }
+        }
+        self.queue_scroll_y = self.queue_scroll_y.clamp(0.0, self.queue_max_scroll_y);
+
+        let sb_reserve = if self.queue_max_scroll_y > 1.0 { 14.0 } else { 2.0 };
+        let row_w = (list_rect.w - sb_reserve).max(160.0);
+        let thumb_sz = 42.0f32;
+        let thumb_r = 7.0f32;
+        let dur_w = 54.0f32;
+
+        r.push_clip(list_rect);
+        for (idx, tr) in self.queue_tracks.iter().enumerate() {
+            let y = list_rect.y + (idx as f32) * row_stride - self.queue_scroll_y;
+            if y + row_h < list_rect.y - 4.0 || y > list_rect.bottom() + 4.0 {
+                continue;
+            }
+            let row = RectF::new(list_rect.x, y, row_w, row_h);
+            let clip_y0 = row.y.max(list_rect.y);
+            let clip_y1 = row.bottom().min(list_rect.bottom());
+            let hit_r = RectF::new(row.x, clip_y0, row.w, (clip_y1 - clip_y0).max(0.0));
+            let is_cur = active_idx == Some(idx);
+            let is_hov = hit_r.h > 1.0 && hit_r.contains(hovered_pt.0, hovered_pt.1);
+
+            if is_cur {
+                let bg_a = if is_hov { 0.20 } else { 0.15 };
+                r.fill_rounded_rect(row, 12.0, Color::rgba(255, 255, 255, bg_a * col_alpha));
+                r.stroke_rounded_rect(
+                    row,
+                    12.0,
+                    Color::rgba(255, 255, 255, 0.14 * col_alpha),
+                    1.0,
+                );
+            } else if is_hov {
+                let hov_a = if mouse_down { 0.15 } else { 0.095 };
+                r.fill_rounded_rect(row, 12.0, Color::rgba(255, 255, 255, hov_a * col_alpha));
+            }
+
+            // Album thumbnail (42x42 rounded)
+            let thumb_rect = RectF::new(
+                row.x + 8.0,
+                row.center_y() - thumb_sz * 0.5,
+                thumb_sz,
+                thumb_sz,
+            );
+            let drew_thumb = tr
+                .artwork_url
+                .as_deref()
+                .filter(|u| !u.is_empty())
+                .map(|u| r.draw_rounded_artwork(u, false, thumb_rect, thumb_r, col_alpha))
+                .unwrap_or(false);
+            if !drew_thumb {
+                r.fill_rounded_rect(
+                    thumb_rect,
+                    thumb_r,
+                    Color::rgba(255, 255, 255, 0.10 * col_alpha),
+                );
+                r.draw_icon(
+                    SfIcon::MusicNote,
+                    thumb_rect.inset(11.0, 11.0),
+                    Color::rgba(255, 255, 255, 0.42 * col_alpha),
+                );
+            }
+            if is_cur {
+                r.fill_rounded_rect(
+                    thumb_rect,
+                    thumb_r,
+                    Color::rgba(0, 0, 0, 0.44 * col_alpha),
+                );
+                r.draw_icon(
+                    SfIcon::Visualizer,
+                    thumb_rect.inset(11.0, 11.0),
+                    Color::rgba(255, 255, 255, 0.96 * col_alpha),
+                );
+            }
+            r.stroke_rounded_rect(
+                thumb_rect,
+                thumb_r,
+                Color::rgba(255, 255, 255, 0.12 * col_alpha),
+                1.0,
+            );
+
+            // Track duration (tabular mono digits, right-aligned)
+            let dur_x = row.right() - dur_w - 10.0;
+            if tr.duration_sec > 0.5 {
+                let dur_col = if is_cur {
+                    Color::rgba(255, 255, 255, 0.88 * col_alpha)
+                } else {
+                    Color::rgba(255, 255, 255, 0.48 * col_alpha)
+                };
+                r.draw_mono_text(
+                    &format_mmss(tr.duration_sec),
+                    RectF::new(dur_x, row.y, dur_w, row.h),
+                    12.2,
+                    500,
+                    dur_col,
+                    TextAlign::Right,
+                    true,
+                );
+            }
+
+            // Track title + artist
+            let text_x = thumb_rect.right() + 12.0;
+            let text_w = (dur_x - text_x - 8.0).max(64.0);
+            let title_col = if is_cur {
+                Color::rgba(255, 255, 255, 1.0 * col_alpha)
+            } else {
+                Color::rgba(255, 255, 255, 0.92 * col_alpha)
+            };
+            let artist_col = if is_cur {
+                Color::rgba(255, 255, 255, 0.78 * col_alpha)
+            } else {
+                Color::rgba(255, 255, 255, 0.56 * col_alpha)
+            };
+            r.draw_text(
+                &tr.name,
+                RectF::new(text_x, row.y + 8.0, text_w, 21.0),
+                14.2,
+                if is_cur { 700 } else { 600 },
+                title_col,
+                TextAlign::Left,
+                true,
+                false,
+            );
+            let sub = if tr.artist_name.is_empty() {
+                tr.album_name.as_str()
+            } else {
+                tr.artist_name.as_str()
+            };
+            r.draw_text(
+                sub,
+                RectF::new(text_x, row.y + 30.0, text_w, 18.0),
+                12.4,
+                400,
+                artist_col,
+                TextAlign::Left,
+                true,
+                false,
+            );
+
+            if hit_r.h > 2.0 && col_alpha > 0.25 {
+                self.hit_zones.push(LyricsHitZone {
+                    rect: hit_r,
+                    action: LyricsHitAction::JumpLyricsQueueIndex(idx),
+                    line_idx: None,
+                });
+            }
+        }
+        r.pop_clip();
+
+        // Translucent scrollbar on right edge
+        if self.queue_max_scroll_y > 1.0 {
+            let track_h = (list_rect.h - 8.0).max(24.0);
+            let thumb_h = ((list_rect.h / total_h.max(1.0)) * track_h).clamp(28.0, track_h);
+            let frac = (self.queue_scroll_y / self.queue_max_scroll_y).clamp(0.0, 1.0);
+            let thumb_y = list_rect.y + 4.0 + frac * (track_h - thumb_h);
+            let sb_x = list_rect.right() - 5.0;
+            r.fill_rounded_rect(
+                RectF::new(sb_x, list_rect.y + 4.0, 3.8, track_h),
+                2.0,
+                Color::rgba(255, 255, 255, 0.08 * col_alpha),
+            );
+            r.fill_rounded_rect(
+                RectF::new(sb_x, thumb_y, 3.8, thumb_h),
+                2.0,
+                Color::rgba(255, 255, 255, 0.36 * col_alpha),
+            );
+        }
+    }
+
     fn draw_bottom_right_glass_controls(
         &mut self,
         r: &mut D2DRenderer,
@@ -2577,76 +3074,38 @@ impl LyricsViewState {
         glass_off: bool,
         corner_alpha: f32,
     ) {
-        let src_lbl = self.source_pref.label();
-        let blur_lbl = if self.music_free_blur {
-            "流光"
-        } else {
-            "柔焦"
-        };
-        let off_active = self.sync_offset_sec.abs() >= 0.04;
-        let off_lbl = if off_active {
-            format!("{:+.1}s", self.sync_offset_sec)
-        } else {
-            "0.0s".to_string()
-        };
-        let items: [(String, f32, bool, LyricsHitAction); 8] = [
+        // Sleek 3-icon Apple Music cluster (left -> right):
+        // 1. 翻译 (Translate), 2. 歌词显示开关 (LyricsBubble), 3. 播放列表 (QueueList)
+        let items: [(SfIcon, bool, LyricsHitAction); 3] = [
             (
-                "-0.1s".to_string(),
-                40.0,
-                false,
-                LyricsHitAction::NudgeLyricsOffset(-0.1),
-            ),
-            (
-                off_lbl,
-                44.0,
-                off_active,
-                LyricsHitAction::ResetLyricsOffset,
-            ),
-            (
-                "+0.1s".to_string(),
-                40.0,
-                false,
-                LyricsHitAction::NudgeLyricsOffset(0.1),
-            ),
-            (
-                "译".to_string(),
-                32.0,
+                SfIcon::Translate,
                 self.show_translation,
                 LyricsHitAction::ToggleTranslation,
             ),
             (
-                src_lbl.to_string(),
-                74.0,
-                self.source_pref != LyricsSourcePref::Auto,
-                LyricsHitAction::CycleLyricsSource,
+                SfIcon::LyricsBubble,
+                self.show_lyrics && !self.show_queue,
+                LyricsHitAction::ToggleLyricsVisible,
             ),
             (
-                blur_lbl.to_string(),
-                44.0,
-                self.music_free_blur,
-                LyricsHitAction::ToggleFreeBlur,
-            ),
-            (
-                "沉浸".to_string(),
-                44.0,
-                self.immersive_mode,
-                LyricsHitAction::ToggleImmersiveMode,
-            ),
-            (
-                "导入".to_string(),
-                44.0,
-                false,
-                LyricsHitAction::ImportLocalLyrics,
+                SfIcon::QueueList,
+                self.show_queue,
+                LyricsHitAction::ToggleLyricsQueue,
             ),
         ];
 
-        let inner_gap = 4.0;
-        let total_w: f32 =
-            items.iter().map(|x| x.1).sum::<f32>() + inner_gap * ((items.len() - 1) as f32) + 12.0;
-        let pill_h = 36.0;
+        let btn_w = 32.0f32;
+        let btn_h = 32.0f32;
+        let inner_gap = 6.0f32;
+        let pad_h = 5.0f32;
+        let pad_v = 5.0f32;
+        let total_w = pad_h * 2.0
+            + btn_w * (items.len() as f32)
+            + inner_gap * ((items.len() - 1) as f32);
+        let pill_h = btn_h + pad_v * 2.0;
         let pill = RectF::new(
-            win_rect.right() - total_w - 22.0,
-            win_rect.bottom() - pill_h - 16.0,
+            win_rect.right() - total_w - 24.0,
+            win_rect.bottom() - pill_h - 18.0,
             total_w,
             pill_h,
         );
@@ -2659,52 +3118,56 @@ impl LyricsViewState {
 
         r.draw_liquid_glass(
             pill,
-            18.0,
-            16.0,
-            Color::rgba(22, 24, 30, 0.32),
+            pill_h * 0.5,
+            14.0,
+            Color::rgba(22, 24, 30, 0.28),
             Theme::GLASS_RIM_LIGHT,
             glass_off,
         );
 
-        let mut x = pill.x + 6.0;
-        for (lbl, bw, active, act) in items {
-            let br = RectF::new(x, pill.y + 4.0, bw, 28.0);
+        let mut x = pill.x + pad_h;
+        for (icon, active, act) in items {
+            let br = RectF::new(x, pill.y + pad_v, btn_w, btn_h);
             let is_hov = br.contains(hovered_pt.0, hovered_pt.1);
-            if active {
-                r.draw_liquid_glass_button(
-                    br,
-                    14.0,
-                    GlassBtnVariant::ProminentLight,
-                    is_hov,
-                    mouse_down,
-                    hovered_pt,
-                    glass_off,
-                );
+            let scale = if is_hov && mouse_down {
+                0.94
             } else if is_hov {
-                r.draw_liquid_glass_button(
-                    br,
-                    14.0,
-                    GlassBtnVariant::Regular,
-                    true,
-                    mouse_down,
-                    hovered_pt,
-                    glass_off,
-                );
-            }
-            r.draw_text(
-                &lbl,
-                br,
-                11.5,
-                if active { 700 } else { 500 },
-                if active {
-                    Color::rgb(14, 14, 18)
+                1.06
+            } else {
+                1.0
+            };
+
+            if active {
+                let fill_a = if is_hov && mouse_down {
+                    0.30
+                } else if is_hov {
+                    0.28
                 } else {
-                    Theme::TEXT_PRIMARY
-                },
-                TextAlign::Center,
-                true,
-                false,
+                    0.24
+                };
+                r.fill_rounded_rect(br, btn_h * 0.5, Color::rgba(255, 255, 255, fill_a));
+                r.stroke_rounded_rect(br, btn_h * 0.5, Color::rgba(255, 255, 255, 0.28), 1.0);
+            } else if is_hov {
+                let hov_a = if mouse_down { 0.20 } else { 0.14 };
+                r.fill_rounded_rect(br, btn_h * 0.5, Color::rgba(255, 255, 255, hov_a));
+            }
+
+            let ic_sz = 16.5 * scale;
+            let ic_rect = RectF::new(
+                br.center_x() - ic_sz * 0.5,
+                br.center_y() - ic_sz * 0.5,
+                ic_sz,
+                ic_sz,
             );
+            let ic_col = if active {
+                Color::rgb(255, 255, 255)
+            } else if is_hov {
+                Color::rgba(255, 255, 255, 0.92)
+            } else {
+                Color::rgba(255, 255, 255, 0.56)
+            };
+            r.draw_icon(icon, ic_rect, ic_col);
+
             if corner_alpha > 0.20 {
                 self.hit_zones.push(LyricsHitZone {
                     rect: br,
@@ -2712,7 +3175,7 @@ impl LyricsViewState {
                     line_idx: None,
                 });
             }
-            x += bw + inner_gap;
+            x += btn_w + inner_gap;
         }
         if pushed_br {
             r.pop_layer();

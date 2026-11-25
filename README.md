@@ -87,17 +87,18 @@
 - 内置 **简体中文**、**繁體中文**、**English**、**日本語**、**한국어** 五种界面语言，并支持 **Auto（自动跟随 Windows 系统区域）**。
 - 在 **「设置 -> 界面语言」** 点击即可在下一帧立即切换全站 UI 文案，并自动同步 Apple Music 目录请求语言；同时严格保护曲名、艺人名、专辑名与歌词原文不被误改。
 
-### 原生 Direct2D / DirectComposition UI & 液态玻璃
+### 原生 Direct2D / DirectComposition UI & iPadOS 26 液态玻璃
 
-- **无边框可调圆角窗口**（`0..28 px` 精细调节），搭配单次截帧批处理 **Liquid Glass** 液态玻璃材质与对角镜面边框。
-- **视口自适应动态封面**：主页及专辑/歌单详情页同步支持动态封面，滚动入屏即时播放、离屏自动暂停释放解码器，无闪烁卡顿；点击专辑/歌单提供无缝封面飞入加载过渡。
-- **全站统一 `•••` 上下文菜单 & 完整艺人详情页**：支持下一首播放、添加到歌单、跨平台复制歌单、前往艺人页（热门单曲 + 全部专辑）与前往专辑页。
+- **重构 iPadOS 26 光学液态玻璃（默认开启）**：基于 `R16G16B16A16_FLOAT` 16-bit 浮点 C2 五次 SDF 透镜位移、每帧单次半分辨率预模糊快照、纯上下垂直镜面高光与悬停/按压弹性弹簧动效，在 100%–200% HiDPI 下通透无断层、高帧流畅。
+- **全站内置 OFL Inter Variable 字体**：通过 DirectWrite 内存加载器 100% 覆盖西文与数字排版，时间轴与指标采用 `tnum=1 / zero=0` 等宽无斜线数字 `0`，中文与 Emoji 无缝回落系统字体。
+- **纯黑扁平 iPadOS 风格设置页 & SWR 页面缓存加速**：设置页完全禁用液态玻璃以实现超低 GPU 占用，采用居中分组卡片、Apple 绿拨动开关与扁平分段控件；内置 SWR 内存缓存（支持开关与一键清空/刷新）与并行拉取，大幅消除切页“加载中”等待。
+- **无边框可调圆角窗口 & 视口自适应动态封面**：支持 `0..28 px` 精细圆角调节；主页与详情页动态封面滚动入屏即时播放、离屏自动暂停释放解码器；统一 `•••` 上下文菜单与完整艺人详情页。
 
-### 亚像素逐字/逐词歌词与沉浸模式
+### 亚像素逐字/逐词歌词与全新交互
 
-- 支持 **TTML / YRC / LRC** 多格式解析与手动偏移微调，采用 `DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC` 亚像素排版平滑上浮。
-- 区分**象形文字逐字**与**西文按词**精细动效，支持强调词柔光放大、尾字停留渐亮开关、间奏纯音乐自动居中与双通道 GPU 高斯景深模糊。
-- **歌词沉浸模式**：一键隐藏四角冗余控件，仅保留封面、播放区与逐字歌词，鼠标移近四角时平滑渐显。
+- 支持 **TTML / YRC / LRC** 多格式解析，采用 `DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC` 亚像素排版平滑上浮，区分象形文字逐字与西文按词动效，支持强调词柔光放大、尾字停留渐亮与播完防回顶锁定。
+- **无缝流光极光背景 & 精简控件**：重构“流光 / 柔焦”背景彻底消除边缘方角；移除播控与 `•••` 圆形边框，右下角精简为 **「翻译 / 歌词 / 播放列表」** 三图标胶囊，右侧支持交互式待播清单滚动切歌。
+- **升级左侧 `•••` 歌词菜单**：集成行内歌词偏移微调器（`- / 0.0s / +`）、**左侧放大显示**、**歌词中轴居中**、词源切换、流光/柔焦切换、**歌词沉浸模式**开关与本地歌词导入。
 
 ### WASAPI 实时音频可视化与高刷低耗调度
 
@@ -132,8 +133,8 @@
 
 ### 第二步：下载与安装
 
-1. 前往 [**GitHub Releases**](https://github.com/N20xDuli/AM-Light/releases) 下载最新的 Windows x64 安装包（如 `AM-Light-Setup-v0.2.10-x64.exe`）并运行安装。
-   - 静默安装：`AM-Light-Setup-v0.2.10-x64.exe --silent [--dir="C:\Path\To\AM-Light"]`
+1. 前往 [**GitHub Releases**](https://github.com/N20xDuli/AM-Light/releases) 下载最新的 Windows x64 安装包（如 `AM-Light-Setup-v0.2.11-x64.exe`）并运行安装。
+   - 静默安装：`AM-Light-Setup-v0.2.11-x64.exe --silent [--dir="C:\Path\To\AM-Light"]`
    - 卸载方式：通过 Windows「已安装的应用」或安装目录下的 `Uninstall-AM-Light.exe` 卸载。
 2. 启动 AM Light，在 **「设置」** 中可随时切换播放后端与界面语言。
 
@@ -165,7 +166,7 @@ cargo test --release --bin AM-Light -- --test-threads=1
 # 构建主程序（Release）
 cargo build --release --bin AM-Light
 
-# 打包 Windows 安装器（输出至 dist\AM-Light-Setup-v0.2.10-x64.exe）
+# 打包 Windows 安装器（输出至 dist\AM-Light-Setup-v0.2.11-x64.exe）
 $env:AM_LIGHT_BIN_PATH = "target\release\AM-Light.exe"
 cargo build --release --manifest-path installer\Cargo.toml
 ```
@@ -176,6 +177,7 @@ cargo build --release --manifest-path installer\Cargo.toml
 
 - 本项目的歌词解析、时间轴校准、逐字动效曲线与双通道模糊流光界面**参考了 LyricsBlossom 的实现及其作者公开分享的技术资料**，在此致以诚挚感谢。
 - Apple Music Windows 版无法播放 / 点歌秒切诊断与内置 DRM 修复逻辑集成自：[N20xDuli/apple-music-windows-drm-fix](https://github.com/N20xDuli/apple-music-windows-drm-fix)。
+- 内置拉丁/数字界面字体采用开源字体 **Inter**（[SIL Open Font License 1.1](assets/fonts/OFL.txt)）。
 
 ---
 

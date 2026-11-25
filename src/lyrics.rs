@@ -624,6 +624,7 @@ pub struct LyricsAnimator {
     interlude_latched: Option<Option<usize>>,
     layout_initialized: bool,
     last_playhead_sec: f64,
+    clamp_reset_seq: u64,
 }
 
 impl Default for LyricsAnimator {
@@ -646,6 +647,7 @@ impl Default for LyricsAnimator {
             interlude_latched: None,
             layout_initialized: false,
             last_playhead_sec: -1.0,
+            clamp_reset_seq: 0,
         }
     }
 }
@@ -717,6 +719,12 @@ impl LyricsAnimator {
             st.max_word_t = -1.0;
         }
         self.last_playhead_sec = -1.0;
+        self.clamp_reset_seq = self.clamp_reset_seq.wrapping_add(1);
+    }
+
+    #[inline]
+    pub fn clamp_reset_seq(&self) -> u64 {
+        self.clamp_reset_seq
     }
 
     pub fn reset_layout_snap(&mut self) {

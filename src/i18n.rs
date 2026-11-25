@@ -862,6 +862,97 @@ static EXACT_TABLE: Lazy<HashMap<&'static str, [&'static str; 4]>> = Lazy::new(|
             "スマホの短縮リンク (https://163cn.tv/...) や招待URL、ルームIDに対応。Ctrl+V ですぐ参加できます。",
             "모바일 단축 링크(https://163cn.tv/...), 초대 URL, 방 ID를 지원합니다. Ctrl+V로 바로 참가하세요."
         ]),
+
+        // --- Lyrics Menu, Queue, Liquid Glass v2 & Page Cache ---
+        ("待播清单", ["待播清單", "Up Next", "再生キュー", "재생 대기열"]),
+        ("左侧放大显示", ["左側放大顯示", "Enlarged Left Player", "左側プレイヤー拡大", "왼쪽 플레이어 확대"]),
+        ("歌词中轴居中", ["歌詞中軸置中", "Center-Axis Lyrics", "歌詞を中央軸に配置", "가사 중앙축 정렬"]),
+        ("歌词沉浸模式", ["歌詞沉浸模式", "Immersive Lyrics", "歌詞没入モード", "가사 몰입 모드"]),
+        ("歌词偏移", ["歌詞偏移", "Lyrics Offset", "歌詞オフセット", "가사 오프셋"]),
+        ("背景风格", ["背景風格", "Backdrop Style", "背景スタイル", "배경 스타일"]),
+        ("背景风格：流光", ["背景風格：流光", "Backdrop: Aurora", "背景スタイル：オーロラ", "배경 스타일: 오로라"]),
+        ("背景风格：柔焦", ["背景風格：柔焦", "Backdrop: Soft Focus", "背景スタイル：ソフト", "배경 스타일: 소프트"]),
+        ("歌词来源", ["歌詞來源", "Lyrics Source", "歌詞ソース", "가사 소스"]),
+        ("页面缓存", ["頁面快取", "Page Cache", "ページキャッシュ", "페이지 캐시"]),
+        ("页面缓存与加载加速", ["頁面快取與載入加速", "Page Cache & Fast Navigation", "ページキャッシュ・高速切替", "페이지 캐시 및 빠른 전환"]),
+        ("开启后自动预热侧栏并秒开歌单/专辑详情（后台静默更新）；关闭则每次重新拉取", [
+            "開啟後自動預熱側欄並秒開歌單/專輯詳情（背景靜默更新）；關閉則每次重新拉取",
+            "Pre-warms sidebar tabs and opens playlists/albums instantly with silent background revalidation",
+            "サイドバーを事前読込し、プレイリストやアルバムを瞬時表示（裏で自動更新）",
+            "사이드바를 미리 불러오고 플레이리스트·앨범을 즉시 표시합니다 (백그라운드 자동 갱신)"
+        ]),
+        ("刷新与清空页面缓存", ["重新整理與清空頁面快取", "Refresh & Clear Page Cache", "更新とキャッシュ消去", "새로고침 및 캐시 지우기"]),
+        ("刷新当前页", ["重新整理目前頁", "Refresh Page", "現在のページを更新", "현재 페이지 새로고침"]),
+        ("清空缓存", ["清空快取", "Clear Cache", "キャッシュ消去", "캐시 지우기"]),
+        ("已清空页面缓存，下次访问将重新拉取最新数据", [
+            "已清空頁面快取，下次造訪將重新拉取最新資料",
+            "Page cache cleared — fresh data will be fetched on next visit",
+            "ページキャッシュを消去しました。次回表示時に最新データを取得します",
+            "페이지 캐시를 지웠습니다. 다음 방문 시 최신 데이터를 불러옵니다"
+        ]),
+        ("正在刷新当前页面数据...", [
+            "正在重新整理目前頁面資料...",
+            "Refreshing current view...",
+            "現在のページを更新中...",
+            "현재 페이지 데이터를 새로고침하는 중..."
+        ]),
+        ("默认开启；侧栏与浮层启用 iOS 26 光学折射液态玻璃材质", [
+            "預設開啟；側欄與浮層啟用 iOS 26 光學折射液態玻璃材質",
+            "On by default; applies iOS 26 optical refractive Liquid Glass to sidebar & floating controls",
+            "既定オン。サイドバーと浮遊UIに iOS 26 光学屈折リキッドガラスを適用",
+            "기본 켜짐. 사이드바와 플로팅 UI에 iOS 26 광학 굴절 리퀴드 글래스를 적용합니다"
+        ]),
+        ("未能载入内容，请按 F5 或前往设置刷新重试。", [
+            "未能載入內容，請按 F5 或前往設定重新整理重試。",
+            "Failed to load content. Press F5 or refresh from Settings to retry.",
+            "読み込みに失敗しました。F5 キーまたは設定から更新して再試行してください。",
+            "콘텐츠를 불러오지 못했습니다. F5 키를 누르거나 설정에서 새로고침하세요."
+        ]),
+        ("暂无内容", ["暫無內容", "No items available", "項目がありません", "항목이 없습니다"]),
+
+        // --- iPadOS Flat Dark Settings Page (Headers, Labels & Footers) ---
+        ("音频", ["音訊", "Audio", "オーディオ", "오디오"]),
+        ("外观与显示", ["外觀與顯示", "Appearance & Display", "外観と表示", "화면 및 표시"]),
+        ("性能与缓存", ["效能與快取", "Performance & Cache", "パフォーマンスとキャッシュ", "성능 및 캐시"]),
+        ("Hi-Res 24/192", ["Hi-Res 24/192", "Hi-Res 24/192", "Hi-Res 24/192", "Hi-Res 24/192"]),
+        ("无损 24/48", ["無損 24/48", "Lossless 24/48", "ロスレス 24/48", "무손실 24/48"]),
+        ("已展开", ["已展開", "Expanded", "展開中", "펼쳐짐"]),
+        ("更改音频质量后将在下一首播放或重新缓冲时生效。", [
+            "更改音訊品質後將在下一首播放或重新緩衝時生效。",
+            "Audio quality changes apply on the next track or when rebuffering.",
+            "音質の変更は次の曲の再生または再バッファリング時に適用されます。",
+            "오디오 음질 변경은 다음 곡 재생 또는 재버퍼링 시 적용됩니다."
+        ]),
+        ("液态玻璃默认开启，作用于侧栏与浮层控件；设置页始终使用纯黑静态界面以节省 GPU 资源。", [
+            "液態玻璃預設開啟，作用於側欄與浮層控制項；設定頁始終使用純黑靜態介面以節省 GPU 資源。",
+            "Liquid Glass is on by default for the sidebar and floating chrome. Settings stays flat and static to save GPU power.",
+            "リキッドガラスはサイドバーや浮遊コントロールで既定オンです。設定画面は省電力のため常にフラット表示になります。",
+            "리퀴드 글래스는 사이드바와 플로팅 UI에 기본 적용되며, 설정 화면은 GPU 절약을 위해 항상 평면 정적 UI를 유지합니다."
+        ]),
+        ("开启后自动预热侧栏并秒开歌单/专辑详情（后台静默更新）；关闭则每次重新拉取。", [
+            "開啟後自動預熱側欄並秒開歌單/專輯詳情（背景靜默更新）；關閉則每次重新拉取。",
+            "Pre-warms sidebar tabs and opens playlists/albums instantly with silent background revalidation.",
+            "サイドバーを事前読込し、プレイリストやアルバムを瞬時表示（裏で自動更新）します。",
+            "사이드바를 미리 불러오고 플레이리스트·앨범을 즉시 표시합니다 (백그라운드 자동 갱신)."
+        ]),
+        ("沉浸模式隐藏歌词页四角控件并在鼠标靠近时自动渐显；开启降采样可将未唱行景深降至 0.75× 节能。", [
+            "沉浸模式隱藏歌詞頁四角控制項並在滑鼠靠近時自動漸顯；開啟降採樣可將未唱行景深降至 0.75× 節能。",
+            "Immersive mode hides corner controls until hovered; downsample lowers inactive line blur to 0.75× to save power.",
+            "没入モードは四隅の操作UIを隠しホバー時に表示。ダウンサンプリングで未唱行のぼかしを 0.75× に省電力化します。",
+            "몰입 모드는 모서리 컨트롤을 숨기고 마우스를 가까이 대면 표시합니다. 다운샘플링으로 비활성 가사 블러를 0.75×로 절전합니다."
+        ]),
+        ("仅在主页与歌词页启用纯 Win32 硬件解码动态封面；关闭实时频谱播放图标可停用后台采样。", [
+            "僅在主頁與歌詞頁啟用純 Win32 硬體解碼動態封面；關閉即時頻譜播放圖示可停用背景取樣。",
+            "Hardware-decoded motion covers run on Home and Lyrics only; turning off live spectrum icon stops background audio sampling.",
+            "ハードウェア再生の動くアートワークはホームと歌詞画面のみ有効。リアルタイム指標オフで裏の音声サンプリングを停止します。",
+            "하드웨어 디코딩 모션 아트워크는 홈과 가사 화면에서만 동작하며, 실시간 스펙트럼 아이콘을 끄면 백그라운드 샘플링을 중단합니다."
+        ]),
+        ("外化头影与早期反射渲染（需两路可用输出端点）", [
+            "外化頭影與早期反射算繪（需兩路可用輸出端點）",
+            "Externalized head-shadow & early reflections (requires 2 output endpoints)",
+            "頭外定位と初期反射レンダリング（2系統の出力エンドポイントが必要）",
+            "외부화 두부 그림자 및 초기 반사 렌더링 (출력 엔드포인트 2개 필요)"
+        ]),
     ];
 
     let mut map = HashMap::with_capacity(entries.len() * 2);
@@ -1106,6 +1197,36 @@ pub fn translate_ui_text_for<'a>(input: &'a str, lang: ResolvedLang) -> Cow<'a, 
         let p = pick(lang, ["歌詞來源已切換為：", "Lyrics source set to: ", "歌詞ソースを切替：", "가사 소스 변경: "]);
         let tail = translate_ui_text_for(rest, lang);
         return Cow::Owned(format!("{p}{tail}"));
+    }
+    if let Some(rest) = input.strip_prefix("歌词来源：") {
+        let p = pick(lang, ["歌詞來源：", "Lyrics Source: ", "歌詞ソース：", "가사 소스: "]);
+        let tail = translate_ui_text_for(rest, lang);
+        return Cow::Owned(format!("{p}{tail}"));
+    }
+    if let Some(rest) = input.strip_prefix("背景风格：") {
+        let p = pick(lang, ["背景風格：", "Backdrop: ", "背景スタイル：", "배경 스타일: "]);
+        let tail = translate_ui_text_for(rest, lang);
+        return Cow::Owned(format!("{p}{tail}"));
+    }
+    if let Some(rest) = input.strip_prefix("已缓存 ") {
+        if let Some((cnt, _)) = rest.split_once(" 个详情页") {
+            return Cow::Owned(match lang {
+                ResolvedLang::ZhTw => format!("已快取 {cnt} 個詳情頁 · 按 F5 可隨時強制重新整理目前頁面"),
+                ResolvedLang::En => format!("{cnt} detail pages cached · Press F5 anytime to force refresh"),
+                ResolvedLang::Ja => format!("{cnt} 件の詳細をキャッシュ済 · F5 キーでいつでも強制更新"),
+                ResolvedLang::Ko => format!("상세 페이지 {cnt}개 캐시됨 · F5 키로 언제든 강제 새로고침"),
+                ResolvedLang::ZhCn => input.to_string(),
+            });
+        }
+        if let Some((cnt, _)) = rest.split_once(" 项") {
+            return Cow::Owned(match lang {
+                ResolvedLang::ZhTw => format!("已快取 {cnt} 項"),
+                ResolvedLang::En => format!("{cnt} cached"),
+                ResolvedLang::Ja => format!("{cnt} 件キャッシュ済"),
+                ResolvedLang::Ko => format!("{cnt}개 캐시됨"),
+                ResolvedLang::ZhCn => input.to_string(),
+            });
+        }
     }
     if let Some(rest) = input.strip_prefix("艺人 · ") {
         let p = pick(lang, ["藝人 · ", "Artist · ", "アーティスト · ", "아티스트 · "]);

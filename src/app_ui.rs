@@ -318,8 +318,16 @@ pub struct AppSettings {
     pub viz_default_style: VizStyle,
     pub sidebar_collapsed: bool,
     pub window_corner_radius: f32,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub liquid_glass_enabled: bool,
+    #[serde(default)]
+    pub liquid_glass_v2_migrated: bool,
+    #[serde(default = "default_true")]
+    pub page_cache_enabled: bool,
+    #[serde(default = "default_true")]
+    pub lyrics_left_enlarged: bool,
+    #[serde(default)]
+    pub lyrics_center_axis: bool,
     #[serde(default = "default_true")]
     pub lyrics_latin_by_word: bool,
     #[serde(default)]
@@ -379,7 +387,11 @@ impl Default for AppSettings {
             viz_default_style: VizStyle::AudioInspector,
             sidebar_collapsed: false,
             window_corner_radius: 12.0,
-            liquid_glass_enabled: false,
+            liquid_glass_enabled: true,
+            liquid_glass_v2_migrated: true,
+            page_cache_enabled: true,
+            lyrics_left_enlarged: true,
+            lyrics_center_axis: false,
             lyrics_latin_by_word: true,
             lyrics_non_emphasis_effect: NonEmphasisLyricsEffect::None,
             lyrics_auto_emphasis: true,
@@ -448,7 +460,7 @@ impl AppSettings {
         }
     }
 
-    pub fn load_from_paths(paths: &[PathBuf]) -> Option<Self> {
+    fn load_from_paths_raw(paths: &[PathBuf]) -> Option<Self> {
         let mut parsed_list: Vec<(std::time::SystemTime, Self)> = Vec::new();
         for p in paths {
             if let Ok(txt) = fs::read_to_string(p) {
@@ -510,6 +522,15 @@ impl AppSettings {
         Some(primary)
     }
 
+    pub fn load_from_paths(paths: &[PathBuf]) -> Option<Self> {
+        let mut s = Self::load_from_paths_raw(paths)?;
+        if !s.liquid_glass_v2_migrated {
+            s.liquid_glass_enabled = true;
+            s.liquid_glass_v2_migrated = true;
+        }
+        Some(s)
+    }
+
     pub fn save_to_paths(&self, paths: &[PathBuf]) {
         if let Ok(txt) = serde_json::to_string_pretty(self) {
             for p in paths {
@@ -519,7 +540,7 @@ impl AppSettings {
     }
 
     pub fn load_with_official() -> (Self, am_api::OfficialClientAccountInfo) {
-        let mut s = Self::load_from_paths(&Self::config_paths()).unwrap_or_default();
+        let mut s = Self::load_from_paths_raw(&Self::config_paths()).unwrap_or_default();
         s.window_corner_radius = s.window_corner_radius.clamp(0.0, 28.0);
         s.viz_custom_fps = s.viz_custom_fps.clamp(30, 360);
         s.lyrics_custom_fps = s.lyrics_custom_fps.clamp(30, 360);
@@ -530,6 +551,14 @@ impl AppSettings {
         };
         let official = am_api::detect_official_am_account();
         let mut dirty = false;
+
+        // One-time migration for rebuilt iOS 26 optical Liquid Glass: enable by default on upgrade
+        // while allowing users to toggle it off permanently afterwards.
+        if !s.liquid_glass_v2_migrated {
+            s.liquid_glass_enabled = true;
+            s.liquid_glass_v2_migrated = true;
+            dirty = true;
+        }
 
         // Auto-adopt official Apple Music desktop client's signed-in storefront when not manually overridden
         if !s.storefront_customized {
@@ -681,13 +710,19 @@ pub enum AsyncMsg {
         songs: Vec<AgentTrackInput>,
     },
     LibraryCardsLoaded {
+        backend: PlaybackBackend,
         route_key: String,
         cards: Vec<MediaCardItem>,
     },
-    LibrarySongsLoaded(Vec<AgentTrackInput>),
+    LibrarySongsLoaded {
+        backend: PlaybackBackend,
+        songs: Vec<AgentTrackInput>,
+    },
     SidebarPlaylistsLoaded(Vec<MediaCardItem>),
     ContainerLoaded {
         seq: u64,
+        backend: PlaybackBackend,
+        req_kind: String,
         expected_id: String,
         res: Result<ContainerDetailData, String>,
     },
@@ -948,6 +983,13 @@ pub enum UiAction {
     SetWindowCornerRadius(f32),
     ScrubWindowCornerRadius(RectF),
     ToggleLiquidGlass,
+    TogglePageCache,
+    ClearPageCache,
+    NudgeLyricsOffset(f64),
+    ResetLyricsOffset,
+    ToggleLyricsLeftEnlarged,
+    ToggleLyricsCenterAxis,
+    CycleLyricsSourceFromMenu,
     ToggleLyricsLatinByWord,
     SetLyricsNonEmphasisEffect(NonEmphasisLyricsEffect),
     ToggleLyricsAutoEmphasis,
@@ -1102,6 +1144,16 @@ pub struct AppUi {
     pub sidebar_playlists: Vec<MediaCardItem>,
     pub detail_data: Option<ContainerDetailData>,
     pub detail_loading: bool,
+    home_in_flight: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    browse_in_flight: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    radio_in_flight: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    lib_in_flight: HashMap<&'static str, std::sync::Arc<std::sync::atomic::AtomicU32>>,
+    pub detail_mem_cache: HashMap<String, (ContainerDetailData, Instant)>,
+    pub lib_route_fetched_at: HashMap<String, Instant>,
+    detail_mem_lru: HashMap<String, u64>,
+    detail_mem_lru_seq: u64,
+    lyrics_queue_version: u64,
+    lyrics_queue_sync_epoch: u64,
     pub downloads_info: DownloadsOverview,
     pub downloads_paused: bool,
 
@@ -1224,6 +1276,13 @@ pub struct AppUi {
     pub queue_max_scroll_y: f32,
     pub play_next_queue: std::collections::VecDeque<AgentTrackInput>,
     pub last_mouse_move_at: Instant,
+    has_active_glass_motion: bool,
+    toggle_slide_anims: HashMap<u64, f32>,
+    has_settling_toggle: bool,
+    context_menu_open_spring: lyrics::Spring1D,
+    queue_popover_open_spring: lyrics::Spring1D,
+    more_popover_open_spring: lyrics::Spring1D,
+    lt_modal_open_spring: lyrics::Spring1D,
 }
 
 #[derive(Clone, Debug)]
@@ -1559,6 +1618,31 @@ fn current_unix_sec() -> u64 {
         .unwrap_or(0)
 }
 
+/// RAII guard for active background page-load requests. Guarantees the counter always
+/// returns to `0` on completion, error, empty result, or cancellation so idle CPU hits 0%.
+struct InFlightGuard {
+    counter: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    wake_hwnd: usize,
+}
+
+impl InFlightGuard {
+    fn acquire(counter: &std::sync::Arc<std::sync::atomic::AtomicU32>, wake_hwnd: usize) -> Self {
+        counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self {
+            counter: counter.clone(),
+            wake_hwnd,
+        }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.counter
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        AppUi::post_ui_wake(self.wake_hwnd);
+    }
+}
+
 impl AppUi {
     pub fn new(wake_hwnd: usize) -> Self {
         let (settings, official_account) = if wake_hwnd == 0 {
@@ -1587,6 +1671,8 @@ impl AppUi {
         let mut lyrics_view = LyricsViewState::default();
         lyrics_view.music_free_blur = settings.lyrics_free_blur;
         lyrics_view.immersive_mode = settings.lyrics_immersive_mode;
+        lyrics_view.left_enlarged = settings.lyrics_left_enlarged;
+        lyrics_view.center_axis = settings.lyrics_center_axis;
         lyrics_view.animator.latin_by_word = settings.lyrics_latin_by_word;
 
         let init_sb = if settings.sidebar_collapsed { 0.0 } else { 1.0 };
@@ -1694,6 +1780,25 @@ impl AppUi {
             sidebar_playlists: initial_sidebar_pls,
             detail_data: None,
             detail_loading: false,
+            home_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            browse_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            radio_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            lib_in_flight: [
+                ("recent", std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0))),
+                ("artists", std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0))),
+                ("albums", std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0))),
+                ("songs", std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0))),
+                ("foryou", std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0))),
+                ("playlists", std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0))),
+            ]
+            .into_iter()
+            .collect(),
+            detail_mem_cache: HashMap::with_capacity(32),
+            lib_route_fetched_at: HashMap::with_capacity(16),
+            detail_mem_lru: HashMap::with_capacity(32),
+            detail_mem_lru_seq: 0,
+            lyrics_queue_version: 1,
+            lyrics_queue_sync_epoch: 0,
             downloads_info: DownloadsOverview::default(),
             downloads_paused: false,
             smtc: SmtcState {
@@ -1807,6 +1912,13 @@ impl AppUi {
             queue_max_scroll_y: 0.0,
             play_next_queue: std::collections::VecDeque::new(),
             last_mouse_move_at: now,
+            has_active_glass_motion: false,
+            toggle_slide_anims: HashMap::with_capacity(24),
+            has_settling_toggle: false,
+            context_menu_open_spring: lyrics::Spring1D::new(1.0, 1.0, 340.0, 26.5),
+            queue_popover_open_spring: lyrics::Spring1D::new(1.0, 1.0, 340.0, 27.0),
+            more_popover_open_spring: lyrics::Spring1D::new(1.0, 1.0, 340.0, 27.0),
+            lt_modal_open_spring: lyrics::Spring1D::new(1.0, 1.0, 320.0, 26.5),
         };
 
         if wake_hwnd != 0 {
@@ -1898,6 +2010,7 @@ impl AppUi {
             }
             PlaybackBackend::ExternalSmtc => {}
         }
+        self.schedule_background_prewarm();
         // Background 2-hour auto-sync ticker (0% idle CPU while sleeping, wakes via PostMessage!)
         let sync_tx = self.tx.clone();
         let sync_hwnd = self.wake_hwnd;
@@ -1957,6 +2070,15 @@ impl AppUi {
     pub fn on_window_maximize_toggled(&mut self, going_maximized: bool) {
         self.win_max_going_max = going_maximized;
         self.win_max_trans = if self.settings.reduce_motion { 1.0 } else { 0.0 };
+    }
+
+    pub fn on_key_down(&mut self, vk: u16) -> bool {
+        // VK_F5 (0x74): force-refresh current view (bypassing SWR staleness check)
+        if vk == 0x74 {
+            self.execute_action(UiAction::RefreshCurrentView);
+            return true;
+        }
+        self.on_cover_flow_key(vk)
     }
 
     pub fn on_cover_flow_key(&mut self, vk: u16) -> bool {
@@ -2037,7 +2159,474 @@ impl AppUi {
 
     #[inline]
     pub fn glass_off(&self) -> bool {
-        !self.settings.liquid_glass_enabled || self.settings.reduce_transparency
+        !self.settings.liquid_glass_enabled
+            || self.settings.reduce_transparency
+            || (self.route == PageRoute::Settings && !self.show_lyrics_overlay)
+    }
+
+    #[inline]
+    fn trigger_open_spring(spring: &mut lyrics::Spring1D, reduce_motion: bool) {
+        if reduce_motion {
+            spring.snap(1.0);
+        } else {
+            spring.snap(0.0);
+            spring.target = 1.0;
+        }
+    }
+
+    #[inline]
+    fn morph_popover_rect(target: RectF, origin_x: f32, origin_y: f32, t: f32) -> RectF {
+        let u = t.clamp(0.0, 1.0);
+        if u >= 0.996 {
+            return target;
+        }
+        let sc = 0.88 + 0.12 * u;
+        let w = target.w * sc;
+        let h = target.h * sc;
+        let anchor_fx = ((origin_x - target.x) / target.w.max(1.0)).clamp(0.0, 1.0);
+        let anchor_fy = ((origin_y - target.y) / target.h.max(1.0)).clamp(0.0, 1.0);
+        let x = target.x + (target.w - w) * anchor_fx;
+        let y = target.y + (target.h - h) * anchor_fy + (1.0 - u) * 6.0;
+        RectF::new(x, y, w, h)
+    }
+
+    const SWR_FRESH_TTL_SECS: u64 = 120;
+    const DETAIL_MEM_CACHE_MAX: usize = 64;
+
+    fn detail_cache_key(backend: PlaybackBackend, kind: &str, id: &str) -> String {
+        format!("{backend:?}:{kind}:{id}")
+    }
+
+    fn lib_route_cache_key(backend: PlaybackBackend, route_key: &str) -> String {
+        format!("{backend:?}:{route_key}")
+    }
+
+    fn route_to_lib_key(route: &PageRoute) -> Option<&'static str> {
+        match route {
+            PageRoute::LibRecent => Some("recent"),
+            PageRoute::LibArtists => Some("artists"),
+            PageRoute::LibAlbums => Some("albums"),
+            PageRoute::LibSongs => Some("songs"),
+            PageRoute::LibForYou => Some("foryou"),
+            PageRoute::LibPlaylists => Some("playlists"),
+            _ => None,
+        }
+    }
+
+    fn put_detail_mem_cache(
+        &mut self,
+        backend: PlaybackBackend,
+        key_kind: &str,
+        key_id: &str,
+        data: ContainerDetailData,
+    ) {
+        if !self.settings.page_cache_enabled {
+            return;
+        }
+        let k = Self::detail_cache_key(backend, key_kind, key_id);
+        self.detail_mem_lru_seq = self.detail_mem_lru_seq.wrapping_add(1);
+        let seq = self.detail_mem_lru_seq;
+        self.detail_mem_cache.insert(k.clone(), (data, Instant::now()));
+        self.detail_mem_lru.insert(k, seq);
+        while self.detail_mem_cache.len() > Self::DETAIL_MEM_CACHE_MAX {
+            let victim = self
+                .detail_mem_cache
+                .keys()
+                .min_by_key(|key| self.detail_mem_lru.get(*key).copied().unwrap_or(0))
+                .cloned();
+            if let Some(vk) = victim {
+                self.detail_mem_cache.remove(&vk);
+                self.detail_mem_lru.remove(&vk);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn get_detail_mem_cache(
+        &mut self,
+        kind: &str,
+        id: &str,
+    ) -> Option<(ContainerDetailData, Instant)> {
+        let k = Self::detail_cache_key(self.settings.playback_backend, kind, id);
+        if let Some((data, ts)) = self.detail_mem_cache.get(&k) {
+            self.detail_mem_lru_seq = self.detail_mem_lru_seq.wrapping_add(1);
+            let seq = self.detail_mem_lru_seq;
+            let out = (data.clone(), *ts);
+            self.detail_mem_lru.insert(k, seq);
+            return Some(out);
+        }
+        None
+    }
+
+    pub fn clear_page_mem_cache(&mut self) {
+        self.detail_mem_cache.clear();
+        self.detail_mem_lru.clear();
+        self.lib_route_fetched_at.clear();
+    }
+
+    fn sync_lyrics_queue_if_needed(&mut self, force: bool) {
+        if !force && self.lyrics_queue_sync_epoch == self.lyrics_queue_version {
+            return;
+        }
+        let tracks = self.active_queue_tracks();
+        self.lyrics_view.set_queue_tracks(tracks);
+        self.lyrics_queue_sync_epoch = self.lyrics_queue_version;
+    }
+
+    fn is_counter_active(counter: &std::sync::atomic::AtomicU32) -> bool {
+        counter.load(std::sync::atomic::Ordering::Acquire) > 0
+    }
+
+    fn acquire_lib_in_flight(&self, route_key: &str) -> Option<InFlightGuard> {
+        self.lib_in_flight
+            .get(route_key)
+            .map(|c| InFlightGuard::acquire(c, self.wake_hwnd))
+    }
+
+    fn is_showing_loading_skeleton(&self) -> bool {
+        if self.show_lyrics_overlay {
+            return false;
+        }
+        let be = self.settings.playback_backend;
+        match &self.route {
+            PageRoute::ContainerDetail { .. } => self.detail_loading,
+            PageRoute::Home => {
+                self.home_shelves.is_empty()
+                    && self.home_albums.is_empty()
+                    && self.home_playlists.is_empty()
+                    && Self::is_counter_active(&self.home_in_flight)
+            }
+            PageRoute::Browse => {
+                self.browse_shelves.is_empty()
+                    && self.home_shelves.is_empty()
+                    && self.home_albums.is_empty()
+                    && self.home_playlists.is_empty()
+                    && (Self::is_counter_active(&self.browse_in_flight)
+                        || Self::is_counter_active(&self.home_in_flight))
+            }
+            PageRoute::Radio => {
+                self.radio_shelves.is_empty()
+                    && self.radio_cards.is_empty()
+                    && Self::is_counter_active(&self.radio_in_flight)
+            }
+            PageRoute::LibSongs => {
+                let needs_tok = be.is_apple_music() && self.settings.user_token.is_empty();
+                !needs_tok
+                    && self.lib_songs.is_empty()
+                    && self
+                        .lib_in_flight
+                        .get("songs")
+                        .is_some_and(|c| Self::is_counter_active(c))
+            }
+            PageRoute::LibRecent
+            | PageRoute::LibArtists
+            | PageRoute::LibAlbums
+            | PageRoute::LibForYou
+            | PageRoute::LibPlaylists => {
+                let needs_tok = be.is_apple_music() && self.settings.user_token.is_empty();
+                if needs_tok {
+                    return false;
+                }
+                let Some(rkey) = Self::route_to_lib_key(&self.route) else {
+                    return false;
+                };
+                self.lib_cards.get(rkey).map(|v| v.is_empty()).unwrap_or(true)
+                    && self
+                        .lib_in_flight
+                        .get(rkey)
+                        .is_some_and(|c| Self::is_counter_active(c))
+            }
+            _ => false,
+        }
+    }
+
+    /// Lightweight staggered background pre-warmer (~420ms after startup or backend switch) so
+    /// switching sidebar tabs (`Browse` / `Radio` / `Playlists` / `Albums` / `Recent` / `Songs`)
+    /// feels 0ms instant whenever `page_cache_enabled` is ON!
+    pub fn schedule_background_prewarm(&self) {
+        if !self.settings.page_cache_enabled || self.wake_hwnd == 0 {
+            return;
+        }
+        let backend = self.settings.playback_backend;
+        let tx = self.tx.clone();
+        let hwnd = self.wake_hwnd;
+        let sf = self.settings.storefront.clone();
+        let utok = non_empty_opt(&self.settings.user_token);
+        let ne_ck = self.settings.netease_cookie.clone();
+        let ne_uid = self.settings.netease_uid;
+        let qq_ck = self.settings.qq_cookie.clone();
+
+        self.rt.spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(420)).await;
+            if get_active_playback_backend() != backend {
+                return;
+            }
+            match backend {
+                PlaybackBackend::AppleMusicNative | PlaybackBackend::AppleMusicWeb => {
+                    let radio_fut = am_api::fetch_official_radio_shelves(&sf, utok.clone());
+                    if let Some(tok) = utok {
+                        let pl_fut = am_api::fetch_am_api(
+                            "v1/me/library/playlists?limit=40&l=zh-Hans-CN".to_string(),
+                            Some(tok.clone()),
+                            None,
+                            Some(sf.clone()),
+                        );
+                        let alb_fut = am_api::fetch_am_api(
+                            "v1/me/library/albums?limit=40&l=zh-Hans-CN".to_string(),
+                            Some(tok.clone()),
+                            None,
+                            Some(sf.clone()),
+                        );
+                        let rec_fut = am_api::fetch_am_api(
+                            "v1/me/library/recently-added?limit=25&l=zh-Hans-CN".to_string(),
+                            Some(tok.clone()),
+                            None,
+                            Some(sf.clone()),
+                        );
+                        let (r_res, pl_res, alb_res, rec_res) =
+                            tokio::join!(radio_fut, pl_fut, alb_fut, rec_fut);
+                        if get_active_playback_backend() != backend {
+                            return;
+                        }
+                        if let Ok(rshelves) = r_res {
+                            let _ = tx.send(AsyncMsg::RadioShelvesLoaded(rshelves));
+                        }
+                        if let Ok(json) = pl_res {
+                            let cards =
+                                parse_media_cards_array(json.get("data"), "library-playlists");
+                            let _ = tx.send(AsyncMsg::LibraryCardsLoaded {
+                                backend,
+                                route_key: "playlists".to_string(),
+                                cards,
+                            });
+                        }
+                        if let Ok(json) = alb_res {
+                            let cards =
+                                parse_media_cards_array(json.get("data"), "library-albums");
+                            let _ = tx.send(AsyncMsg::LibraryCardsLoaded {
+                                backend,
+                                route_key: "albums".to_string(),
+                                cards,
+                            });
+                        }
+                        if let Ok(json) = rec_res {
+                            let cards =
+                                parse_media_cards_array(json.get("data"), "library-albums");
+                            let _ = tx.send(AsyncMsg::LibraryCardsLoaded {
+                                backend,
+                                route_key: "recent".to_string(),
+                                cards,
+                            });
+                        }
+                        Self::post_ui_wake(hwnd);
+
+                        // Second calm wave: Library Songs & Artists
+                        tokio::time::sleep(std::time::Duration::from_millis(280)).await;
+                        if get_active_playback_backend() != backend {
+                            return;
+                        }
+                        let songs_fut = am_api::fetch_am_api(
+                            "v1/me/library/songs?include=catalog&extend=audioTraits&limit=80&l=zh-Hans-CN"
+                                .to_string(),
+                            Some(tok.clone()),
+                            None,
+                            Some(sf.clone()),
+                        );
+                        let art_fut = am_api::fetch_am_api(
+                            "v1/me/library/artists?limit=40&l=zh-Hans-CN".to_string(),
+                            Some(tok),
+                            None,
+                            Some(sf),
+                        );
+                        let (s_res, a_res) = tokio::join!(songs_fut, art_fut);
+                        if get_active_playback_backend() != backend {
+                            return;
+                        }
+                        if let Ok(json) = s_res {
+                            let songs = json
+                                .get("data")
+                                .and_then(Value::as_array)
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|v| parse_track_from_am_json(v, None, None))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            let _ = tx.send(AsyncMsg::LibrarySongsLoaded { backend, songs });
+                        }
+                        if let Ok(json) = a_res {
+                            let cards =
+                                parse_media_cards_array(json.get("data"), "library-artists");
+                            let _ = tx.send(AsyncMsg::LibraryCardsLoaded {
+                                backend,
+                                route_key: "artists".to_string(),
+                                cards,
+                            });
+                        }
+                        Self::post_ui_wake(hwnd);
+                    } else if let Ok(rshelves) = radio_fut.await {
+                        if get_active_playback_backend() == backend {
+                            let _ = tx.send(AsyncMsg::RadioShelvesLoaded(rshelves));
+                            Self::post_ui_wake(hwnd);
+                        }
+                    }
+                }
+                PlaybackBackend::NetEase => {
+                    let ck_opt = non_empty_opt(&ne_ck);
+                    let radio_fut = netease_api::fetch_radio_shelves(ck_opt.as_deref());
+                    let songs_fut = async {
+                        if !ne_ck.is_empty() {
+                            netease_api::fetch_daily_songs(&ne_ck).await.ok()
+                        } else {
+                            netease_api::fetch_container_detail(
+                                "ne-playlist",
+                                "3778678",
+                                "热歌榜",
+                                None,
+                            )
+                            .await
+                            .ok()
+                            .map(|d| d.tracks)
+                        }
+                    };
+                    let pls_fut = async {
+                        if ne_uid > 0 && !ne_ck.is_empty() {
+                            netease_api::fetch_user_playlists(ne_uid, &ne_ck).await.ok()
+                        } else {
+                            None
+                        }
+                    };
+                    let (r_res, s_res, p_res) = tokio::join!(radio_fut, songs_fut, pls_fut);
+                    if get_active_playback_backend() != backend {
+                        return;
+                    }
+                    if let Ok((shelves, cards)) = r_res {
+                        let mapped = cards
+                            .into_iter()
+                            .map(|c| MediaCardItem {
+                                id: c.id,
+                                kind: c.kind,
+                                title: c.title,
+                                subtitle: c.subtitle,
+                                description: c.description,
+                                artwork_url: c.artwork_url,
+                                badge: c.badge,
+                                track_input: c.track_input,
+                            })
+                            .collect();
+                        let _ = tx.send(AsyncMsg::BackendRadioLoaded {
+                            backend,
+                            shelves,
+                            cards: mapped,
+                        });
+                    }
+                    if let Some(songs) = s_res {
+                        let _ = tx.send(AsyncMsg::LibrarySongsLoaded { backend, songs });
+                    }
+                    if let Some(pls) = p_res {
+                        let mapped: Vec<MediaCardItem> = pls
+                            .into_iter()
+                            .map(|c| MediaCardItem {
+                                id: c.id,
+                                kind: c.kind,
+                                title: c.title,
+                                subtitle: c.subtitle,
+                                description: c.description,
+                                artwork_url: c.artwork_url,
+                                badge: c.badge,
+                                track_input: c.track_input,
+                            })
+                            .collect();
+                        let _ = tx.send(AsyncMsg::LibraryCardsLoaded {
+                            backend,
+                            route_key: "playlists".to_string(),
+                            cards: mapped.clone(),
+                        });
+                        let _ = tx.send(AsyncMsg::LibraryCardsLoaded {
+                            backend,
+                            route_key: "recent".to_string(),
+                            cards: mapped,
+                        });
+                    }
+                    Self::post_ui_wake(hwnd);
+                }
+                PlaybackBackend::QQMusic => {
+                    let ck_opt = non_empty_opt(&qq_ck);
+                    let radio_fut = qq_api::fetch_radio_shelves(ck_opt.as_deref());
+                    let songs_fut = qq_api::fetch_container_detail(
+                        "qq-toplist",
+                        "26",
+                        "QQ 热歌榜",
+                        ck_opt.as_deref(),
+                    );
+                    let pls_fut = async {
+                        if !qq_ck.trim().is_empty() {
+                            qq_api::fetch_user_playlists(&qq_ck).await.ok()
+                        } else {
+                            None
+                        }
+                    };
+                    let (r_res, s_res, p_res) = tokio::join!(radio_fut, songs_fut, pls_fut);
+                    if get_active_playback_backend() != backend {
+                        return;
+                    }
+                    if let Ok((shelves, cards)) = r_res {
+                        let mapped = cards
+                            .into_iter()
+                            .map(|c| MediaCardItem {
+                                id: c.id,
+                                kind: c.kind,
+                                title: c.title,
+                                subtitle: c.subtitle,
+                                description: c.description,
+                                artwork_url: c.artwork_url,
+                                badge: c.badge,
+                                track_input: None,
+                            })
+                            .collect();
+                        let _ = tx.send(AsyncMsg::BackendRadioLoaded {
+                            backend,
+                            shelves,
+                            cards: mapped,
+                        });
+                    }
+                    if let Ok(det) = s_res {
+                        let _ = tx.send(AsyncMsg::LibrarySongsLoaded {
+                            backend,
+                            songs: det.tracks,
+                        });
+                    }
+                    if let Some(pls) = p_res {
+                        let mapped: Vec<MediaCardItem> = pls
+                            .into_iter()
+                            .map(|c| MediaCardItem {
+                                id: c.id,
+                                kind: c.kind,
+                                title: c.title,
+                                subtitle: c.subtitle,
+                                description: c.description,
+                                artwork_url: c.artwork_url,
+                                badge: c.badge,
+                                track_input: None,
+                            })
+                            .collect();
+                        let _ = tx.send(AsyncMsg::LibraryCardsLoaded {
+                            backend,
+                            route_key: "playlists".to_string(),
+                            cards: mapped.clone(),
+                        });
+                        let _ = tx.send(AsyncMsg::LibraryCardsLoaded {
+                            backend,
+                            route_key: "recent".to_string(),
+                            cards: mapped,
+                        });
+                    }
+                    Self::post_ui_wake(hwnd);
+                }
+                PlaybackBackend::ExternalSmtc => {}
+            }
+        });
     }
 
     /// Returns `true` when any high-refresh interactive animation, spring, scroll, Lyrics, or Visualizer is active.
@@ -2045,6 +2634,7 @@ impl AppUi {
         if self.playback_loading
             || self.active_drag.is_some()
             || self.playlist_diff_anim.is_some()
+            || (!self.settings.reduce_motion && self.is_showing_loading_skeleton())
         {
             return true;
         }
@@ -2082,7 +2672,14 @@ impl AppUi {
         {
             return true;
         }
-        if self.has_settling_hover {
+        if self.has_settling_hover || self.has_settling_toggle || self.has_active_glass_motion {
+            return true;
+        }
+        if (self.context_menu.is_some() && !self.context_menu_open_spring.is_settled_norm())
+            || (self.show_queue_popover && !self.queue_popover_open_spring.is_settled_norm())
+            || (self.show_more_popover && !self.more_popover_open_spring.is_settled_norm())
+            || (self.listen_together.modal_open && !self.lt_modal_open_spring.is_settled_norm())
+        {
             return true;
         }
         if self
@@ -2163,7 +2760,14 @@ impl AppUi {
         {
             return true;
         }
-        if self.has_settling_hover {
+        if self.has_settling_hover || self.has_settling_toggle || self.has_active_glass_motion {
+            return true;
+        }
+        if (self.context_menu.is_some() && !self.context_menu_open_spring.is_settled_norm())
+            || (self.show_queue_popover && !self.queue_popover_open_spring.is_settled_norm())
+            || (self.show_more_popover && !self.more_popover_open_spring.is_settled_norm())
+            || (self.listen_together.modal_open && !self.lt_modal_open_spring.is_settled_norm())
+        {
             return true;
         }
         if self
@@ -2352,21 +2956,66 @@ impl AppUi {
                     playlists,
                     songs,
                 } => {
-                    self.home_albums = albums;
-                    self.home_playlists = playlists;
-                    self.home_songs = songs;
+                    if !matches!(
+                        self.settings.playback_backend,
+                        PlaybackBackend::NetEase | PlaybackBackend::QQMusic
+                    ) {
+                        self.home_albums = albums;
+                        self.home_playlists = playlists;
+                        self.home_songs = songs;
+                        self.lib_route_fetched_at.insert(
+                            Self::lib_route_cache_key(self.settings.playback_backend, "home"),
+                            Instant::now(),
+                        );
+                    }
                 }
                 AsyncMsg::RadioLoaded(cards) => {
-                    self.radio_cards = cards;
+                    if !matches!(
+                        self.settings.playback_backend,
+                        PlaybackBackend::NetEase | PlaybackBackend::QQMusic
+                    ) {
+                        self.radio_cards = cards;
+                        self.lib_route_fetched_at.insert(
+                            Self::lib_route_cache_key(self.settings.playback_backend, "radio"),
+                            Instant::now(),
+                        );
+                    }
                 }
                 AsyncMsg::HomeShelvesLoaded(shelves) => {
-                    self.home_shelves = shelves;
+                    if !matches!(
+                        self.settings.playback_backend,
+                        PlaybackBackend::NetEase | PlaybackBackend::QQMusic
+                    ) {
+                        self.home_shelves = shelves;
+                        self.lib_route_fetched_at.insert(
+                            Self::lib_route_cache_key(self.settings.playback_backend, "home"),
+                            Instant::now(),
+                        );
+                    }
                 }
                 AsyncMsg::BrowseShelvesLoaded(shelves) => {
-                    self.browse_shelves = shelves;
+                    if !matches!(
+                        self.settings.playback_backend,
+                        PlaybackBackend::NetEase | PlaybackBackend::QQMusic
+                    ) {
+                        self.browse_shelves = shelves;
+                        self.lib_route_fetched_at.insert(
+                            Self::lib_route_cache_key(self.settings.playback_backend, "browse"),
+                            Instant::now(),
+                        );
+                    }
                 }
                 AsyncMsg::RadioShelvesLoaded(shelves) => {
-                    self.radio_shelves = shelves;
+                    if !matches!(
+                        self.settings.playback_backend,
+                        PlaybackBackend::NetEase | PlaybackBackend::QQMusic
+                    ) {
+                        self.radio_shelves = shelves;
+                        self.lib_route_fetched_at.insert(
+                            Self::lib_route_cache_key(self.settings.playback_backend, "radio"),
+                            Instant::now(),
+                        );
+                    }
                 }
                 AsyncMsg::TrackMotionVideoResolved {
                     track_key,
@@ -2404,11 +3053,39 @@ impl AppUi {
                     songs,
                 } => {
                     if backend == self.settings.playback_backend {
+                        let now_ts = Instant::now();
+                        if self.settings.page_cache_enabled {
+                            if !albums.is_empty() {
+                                if self.lib_cards.get("albums").map(|v| v.is_empty()).unwrap_or(true) {
+                                    self.lib_cards.insert("albums".to_string(), albums.clone());
+                                    self.lib_route_fetched_at
+                                        .insert(Self::lib_route_cache_key(backend, "albums"), now_ts);
+                                }
+                                if self.lib_cards.get("artists").map(|v| v.is_empty()).unwrap_or(true) {
+                                    self.lib_cards.insert("artists".to_string(), albums.clone());
+                                    self.lib_route_fetched_at
+                                        .insert(Self::lib_route_cache_key(backend, "artists"), now_ts);
+                                }
+                            }
+                            if !playlists.is_empty() {
+                                for rkey in ["foryou", "recent"] {
+                                    if self.lib_cards.get(rkey).map(|v| v.is_empty()).unwrap_or(true) {
+                                        self.lib_cards.insert(rkey.to_string(), playlists.clone());
+                                        self.lib_route_fetched_at
+                                            .insert(Self::lib_route_cache_key(backend, rkey), now_ts);
+                                    }
+                                }
+                            }
+                        }
                         self.home_shelves = home_shelves;
                         self.browse_shelves = browse_shelves;
                         self.home_albums = albums;
                         self.home_playlists = playlists;
                         self.home_songs = songs;
+                        self.lib_route_fetched_at
+                            .insert(Self::lib_route_cache_key(backend, "home"), now_ts);
+                        self.lib_route_fetched_at
+                            .insert(Self::lib_route_cache_key(backend, "browse"), now_ts);
                     }
                 }
                 AsyncMsg::BackendRadioLoaded {
@@ -2419,6 +3096,10 @@ impl AppUi {
                     if backend == self.settings.playback_backend {
                         self.radio_shelves = shelves;
                         self.radio_cards = cards;
+                        self.lib_route_fetched_at.insert(
+                            Self::lib_route_cache_key(backend, "radio"),
+                            Instant::now(),
+                        );
                     }
                 }
                 AsyncMsg::BackendSearchLoaded {
@@ -2530,38 +3211,89 @@ impl AppUi {
                         self.search_songs = songs;
                     }
                 }
-                AsyncMsg::LibraryCardsLoaded { route_key, cards } => {
-                    self.lib_cards.insert(route_key, cards);
+                AsyncMsg::LibraryCardsLoaded {
+                    backend,
+                    route_key,
+                    cards,
+                } => {
+                    if backend == self.settings.playback_backend {
+                        self.lib_route_fetched_at.insert(
+                            Self::lib_route_cache_key(backend, &route_key),
+                            Instant::now(),
+                        );
+                        self.lib_cards.insert(route_key, cards);
+                    }
                 }
-                AsyncMsg::LibrarySongsLoaded(songs) => {
-                    self.lib_songs = songs;
+                AsyncMsg::LibrarySongsLoaded { backend, songs } => {
+                    if backend == self.settings.playback_backend {
+                        self.lib_route_fetched_at.insert(
+                            Self::lib_route_cache_key(backend, "songs"),
+                            Instant::now(),
+                        );
+                        self.lib_songs = songs;
+                    }
                 }
                 AsyncMsg::SidebarPlaylistsLoaded(pls) => {
                     self.playlist_cache
                         .upsert_sidebar(&pls, current_unix_sec());
                     self.save_playlist_cache_async();
+                    if self.settings.page_cache_enabled
+                        && !pls.is_empty()
+                        && self
+                            .lib_cards
+                            .get("playlists")
+                            .map(|v| v.is_empty())
+                            .unwrap_or(true)
+                    {
+                        self.lib_cards.insert("playlists".to_string(), pls.clone());
+                        self.lib_route_fetched_at.insert(
+                            Self::lib_route_cache_key(self.settings.playback_backend, "playlists"),
+                            Instant::now(),
+                        );
+                    }
                     self.sidebar_playlists = pls;
                 }
                 AsyncMsg::ContainerLoaded {
                     seq,
+                    backend,
+                    req_kind,
                     expected_id,
                     res,
                 } => {
                     let is_current = seq == self.detail_req_seq
+                        && backend == self.settings.playback_backend
                         && matches!(
                             &self.route,
                             PageRoute::ContainerDetail { id, .. } if id == &expected_id
                         );
                     match res {
                         Ok(data) => {
-                            if data.kind.contains("playlist") {
-                                self.playlist_cache
-                                    .upsert_detail(&data, current_unix_sec());
-                                self.save_playlist_cache_async();
-                            }
-                            if is_current {
-                                self.detail_loading = false;
-                                self.apply_loaded_container_detail(data);
+                            if backend == self.settings.playback_backend {
+                                if self.settings.page_cache_enabled {
+                                    self.put_detail_mem_cache(
+                                        backend,
+                                        &data.kind,
+                                        &data.id,
+                                        data.clone(),
+                                    );
+                                    if req_kind != data.kind || expected_id != data.id {
+                                        self.put_detail_mem_cache(
+                                            backend,
+                                            &req_kind,
+                                            &expected_id,
+                                            data.clone(),
+                                        );
+                                    }
+                                }
+                                if data.kind.contains("playlist") {
+                                    self.playlist_cache
+                                        .upsert_detail(&data, current_unix_sec());
+                                    self.save_playlist_cache_async();
+                                }
+                                if is_current {
+                                    self.detail_loading = false;
+                                    self.apply_loaded_container_detail(data);
+                                }
                             }
                         }
                         Err(e) => {
@@ -2575,6 +3307,10 @@ impl AppUi {
                     }
                 }
                 AsyncMsg::PlaylistBackgroundUpdated(data) => {
+                    if self.settings.page_cache_enabled {
+                        let be = self.settings.playback_backend;
+                        self.put_detail_mem_cache(be, &data.kind, &data.id, data.clone());
+                    }
                     let is_open = matches!(
                         self.route,
                         PageRoute::ContainerDetail { ref id, .. } if id == &data.id
@@ -3271,6 +4007,7 @@ impl AppUi {
     pub fn on_playback_state_changed(&mut self, mut st: SmtcState) {
         // Strictly reject stale playback updates emitted by a previously active backend after switching!
         let active_be = self.settings.playback_backend;
+        self.lyrics_queue_version = self.lyrics_queue_version.wrapping_add(1);
         if !st.backend_mode.is_empty() {
             let mode_matches = match active_be {
                 PlaybackBackend::AppleMusicNative => {
@@ -4075,6 +4812,8 @@ impl AppUi {
         self.lib_cards.clear();
         self.lib_songs.clear();
         self.sidebar_playlists.clear();
+        self.clear_page_mem_cache();
+        self.lyrics_queue_version = self.lyrics_queue_version.wrapping_add(1);
         self.detail_data = None;
         self.detail_loading = false;
         self.pending_detail_artwork = None;
@@ -4097,6 +4836,7 @@ impl AppUi {
         self.fetch_home_charts();
         self.fetch_radio_mixes();
         self.fetch_sidebar_playlists();
+        self.schedule_background_prewarm();
         match next {
             PlaybackBackend::NetEase => {
                 if !self.settings.netease_cookie.is_empty() {
@@ -4184,7 +4924,10 @@ impl AppUi {
         match backend {
             PlaybackBackend::NetEase => {
                 let ck = non_empty_opt(&self.settings.netease_cookie);
+                let _g_home = InFlightGuard::acquire(&self.home_in_flight, hwnd);
+                let _g_browse = InFlightGuard::acquire(&self.browse_in_flight, hwnd);
                 self.rt.spawn(async move {
+                    let (_gh, _gb) = (_g_home, _g_browse);
                     match netease_api::fetch_home_and_browse(ck.as_deref()).await {
                         Ok(bundle) => {
                             let albums = bundle
@@ -4235,7 +4978,10 @@ impl AppUi {
             }
             PlaybackBackend::QQMusic => {
                 let ck = non_empty_opt(&self.settings.qq_cookie);
+                let _g_home = InFlightGuard::acquire(&self.home_in_flight, hwnd);
+                let _g_browse = InFlightGuard::acquire(&self.browse_in_flight, hwnd);
                 self.rt.spawn(async move {
+                    let (_gh, _gb) = (_g_home, _g_browse);
                     match qq_api::fetch_home_and_browse(ck.as_deref()).await {
                         Ok(bundle) => {
                             let albums = bundle
@@ -4292,7 +5038,9 @@ impl AppUi {
         let sf_ed = sf.clone();
         let utok_ed = utok.clone();
         let tx_home = tx.clone();
+        let g_home_ed = InFlightGuard::acquire(&self.home_in_flight, hwnd);
         self.rt.spawn(async move {
+            let _guard = g_home_ed;
             if let Ok(shelves) =
                 am_api::fetch_home_editorial_shelves(&sf_ed, utok_ed.as_deref()).await
             {
@@ -4302,13 +5050,17 @@ impl AppUi {
         });
         let sf_browse = sf.clone();
         let tx_browse = tx.clone();
+        let g_browse = InFlightGuard::acquire(&self.browse_in_flight, hwnd);
         self.rt.spawn(async move {
+            let _guard = g_browse;
             if let Ok(bshelves) = am_api::fetch_apple_music_web_shelves(&sf_browse, "new").await {
                 let _ = tx_browse.send(AsyncMsg::BrowseShelvesLoaded(bshelves));
                 Self::post_ui_wake(hwnd);
             }
         });
+        let g_charts = InFlightGuard::acquire(&self.home_in_flight, hwnd);
         self.rt.spawn(async move {
+            let _guard = g_charts;
             let path = format!(
                 "v1/catalog/{sf}/charts?types=albums,playlists,songs&extend=audioTraits&limit=18&l=zh-Hans-CN"
             );
@@ -4359,7 +5111,9 @@ impl AppUi {
         match backend {
             PlaybackBackend::NetEase => {
                 let ck = non_empty_opt(&self.settings.netease_cookie);
+                let g_radio = InFlightGuard::acquire(&self.radio_in_flight, hwnd);
                 self.rt.spawn(async move {
+                    let _guard = g_radio;
                     if let Ok((shelves, cards)) = netease_api::fetch_radio_shelves(ck.as_deref()).await {
                         let mapped = cards
                             .into_iter()
@@ -4386,7 +5140,9 @@ impl AppUi {
             }
             PlaybackBackend::QQMusic => {
                 let ck = non_empty_opt(&self.settings.qq_cookie);
+                let g_radio = InFlightGuard::acquire(&self.radio_in_flight, hwnd);
                 self.rt.spawn(async move {
+                    let _guard = g_radio;
                     if let Ok((shelves, cards)) = qq_api::fetch_radio_shelves(ck.as_deref()).await {
                         let mapped = cards
                             .into_iter()
@@ -4419,13 +5175,17 @@ impl AppUi {
         let sf_api = sf.clone();
         let utok_api = utok.clone();
         let tx_api = tx.clone();
+        let g_radio1 = InFlightGuard::acquire(&self.radio_in_flight, hwnd);
         self.rt.spawn(async move {
+            let _guard = g_radio1;
             if let Ok(rshelves) = am_api::fetch_official_radio_shelves(&sf_api, utok_api).await {
                 let _ = tx_api.send(AsyncMsg::RadioShelvesLoaded(rshelves));
                 Self::post_ui_wake(hwnd);
             }
         });
+        let g_radio2 = InFlightGuard::acquire(&self.radio_in_flight, hwnd);
         self.rt.spawn(async move {
+            let _guard = g_radio2;
             let path = format!(
                 "v1/catalog/{sf}/search?term=Apple+Music+%E7%94%B5%E5%8F%B0&types=playlists&limit=18&l=zh-Hans-CN"
             );
@@ -4641,6 +5401,7 @@ impl AppUi {
         }
 
         // Backend-adaptive Library routes for NetEase & QQ Music!
+        let lib_guard = Self::route_to_lib_key(route).and_then(|k| self.acquire_lib_in_flight(k));
         match self.settings.playback_backend {
             PlaybackBackend::NetEase => {
                 let tx = self.tx.clone();
@@ -4649,6 +5410,7 @@ impl AppUi {
                 let uid = self.settings.netease_uid;
                 let r = route.clone();
                 self.rt.spawn(async move {
+                    let _guard = lib_guard;
                     match r {
                         PageRoute::LibSongs => {
                             let songs = if !ck.is_empty() {
@@ -4659,7 +5421,10 @@ impl AppUi {
                                     .map(|d| d.tracks)
                                     .unwrap_or_default()
                             };
-                            let _ = tx.send(AsyncMsg::LibrarySongsLoaded(songs));
+                            let _ = tx.send(AsyncMsg::LibrarySongsLoaded {
+                                backend: PlaybackBackend::NetEase,
+                                songs,
+                            });
                         }
                         PageRoute::LibPlaylists | PageRoute::LibRecent | PageRoute::LibForYou => {
                             let rkey = match r {
@@ -4704,6 +5469,7 @@ impl AppUi {
                                 }
                             }
                             let _ = tx.send(AsyncMsg::LibraryCardsLoaded {
+                                backend: PlaybackBackend::NetEase,
                                 route_key: rkey.to_string(),
                                 cards,
                             });
@@ -4726,6 +5492,7 @@ impl AppUi {
                                     })
                                     .collect();
                                 let _ = tx.send(AsyncMsg::LibraryCardsLoaded {
+                                    backend: PlaybackBackend::NetEase,
                                     route_key: rkey.to_string(),
                                     cards,
                                 });
@@ -4743,6 +5510,7 @@ impl AppUi {
                 let ck = self.settings.qq_cookie.clone();
                 let r = route.clone();
                 self.rt.spawn(async move {
+                    let _guard = lib_guard;
                     match r {
                         PageRoute::LibSongs => {
                             if let Ok(det) = qq_api::fetch_container_detail(
@@ -4753,7 +5521,10 @@ impl AppUi {
                             )
                             .await
                             {
-                                let _ = tx.send(AsyncMsg::LibrarySongsLoaded(det.tracks));
+                                let _ = tx.send(AsyncMsg::LibrarySongsLoaded {
+                                    backend: PlaybackBackend::QQMusic,
+                                    songs: det.tracks,
+                                });
                             }
                         }
                         PageRoute::LibPlaylists | PageRoute::LibRecent | PageRoute::LibForYou => {
@@ -4799,6 +5570,7 @@ impl AppUi {
                                 }
                             }
                             let _ = tx.send(AsyncMsg::LibraryCardsLoaded {
+                                backend: PlaybackBackend::QQMusic,
                                 route_key: rkey.to_string(),
                                 cards,
                             });
@@ -4821,6 +5593,7 @@ impl AppUi {
                                     })
                                     .collect();
                                 let _ = tx.send(AsyncMsg::LibraryCardsLoaded {
+                                    backend: PlaybackBackend::QQMusic,
                                     route_key: rkey.to_string(),
                                     cards,
                                 });
@@ -4838,6 +5611,7 @@ impl AppUi {
         let Some(utok) = non_empty_opt(&self.settings.user_token) else {
             return;
         };
+        let backend = self.settings.playback_backend;
         let sf = self.settings.storefront.clone();
         let tx = self.tx.clone();
         let hwnd = self.wake_hwnd;
@@ -4845,6 +5619,7 @@ impl AppUi {
         match route {
             PageRoute::LibSongs => {
                 self.rt.spawn(async move {
+                    let _guard = lib_guard;
                     let path =
                         "v1/me/library/songs?include=catalog&extend=audioTraits&limit=80&l=zh-Hans-CN"
                             .to_string();
@@ -4858,7 +5633,7 @@ impl AppUi {
                                     .collect()
                             })
                             .unwrap_or_default();
-                        let _ = tx.send(AsyncMsg::LibrarySongsLoaded(songs));
+                        let _ = tx.send(AsyncMsg::LibrarySongsLoaded { backend, songs });
                         Self::post_ui_wake(hwnd);
                     }
                 });
@@ -4899,6 +5674,7 @@ impl AppUi {
                 let path_s = path.to_string();
                 let dkind_s = default_kind.to_string();
                 self.rt.spawn(async move {
+                    let _guard = lib_guard;
                     if let Ok(json) = am_api::fetch_am_api(path_s, Some(utok), None, Some(sf)).await
                     {
                         let cards = if rkey_s == "foryou" {
@@ -4917,6 +5693,7 @@ impl AppUi {
                             parse_media_cards_array(json.get("data"), &dkind_s)
                         };
                         let _ = tx.send(AsyncMsg::LibraryCardsLoaded {
+                            backend,
                             route_key: rkey_s,
                             cards,
                         });
@@ -5047,31 +5824,74 @@ impl AppUi {
     }
 
     pub fn fetch_container_detail(&mut self, kind: String, id: String, title_hint: String) {
+        self.fetch_container_detail_ex(kind, id, title_hint, false);
+    }
+
+    pub fn fetch_container_detail_ex(
+        &mut self,
+        kind: String,
+        id: String,
+        title_hint: String,
+        force_refresh: bool,
+    ) {
         self.detail_req_seq = self.detail_req_seq.wrapping_add(1);
         let req_seq = self.detail_req_seq;
         let expected_id = id.clone();
+        let backend = self.settings.playback_backend;
         self.playlist_diff_anim = None;
-        if kind.contains("playlist") {
-            if let Some(cached) = self.playlist_cache.details.get(&id) {
-                self.detail_data = Some(cached.to_detail());
+
+        // Stale-While-Revalidate (SWR): display cached details in 0ms and skip redundant network calls
+        // if fresh (<120s); revalidate silently in the background if stale (>=120s)!
+        if self.settings.page_cache_enabled && !force_refresh {
+            if let Some((cached, fetched_at)) = self.get_detail_mem_cache(&kind, &id) {
+                self.detail_data = Some(cached);
                 self.detail_loading = false;
+                if fetched_at.elapsed().as_secs() < Self::SWR_FRESH_TTL_SECS {
+                    return;
+                }
+            } else if kind.contains("playlist") {
+                if let Some(cached) = self
+                    .playlist_cache
+                    .details
+                    .get(&id)
+                    .filter(|c| c.kind == kind)
+                    .cloned()
+                {
+                    let det = cached.to_detail();
+                    self.detail_data = Some(det.clone());
+                    self.detail_loading = false;
+                    let disk_age = current_unix_sec().saturating_sub(cached.updated_unix_sec);
+                    if disk_age < Self::SWR_FRESH_TTL_SECS {
+                        self.put_detail_mem_cache(backend, &kind, &id, det);
+                        return;
+                    }
+                } else {
+                    self.detail_loading = true;
+                    self.detail_data = None;
+                }
             } else {
                 self.detail_loading = true;
                 self.detail_data = None;
             }
+        } else if force_refresh && self.detail_data.as_ref().is_some_and(|d| d.id == id) {
+            self.detail_loading = false;
         } else {
             self.detail_loading = true;
             self.detail_data = None;
         }
+
         let sf = self.settings.storefront.clone();
         let utok = non_empty_opt(&self.settings.user_token);
         let tx = self.tx.clone();
         let hwnd = self.wake_hwnd;
+        let req_kind = kind.clone();
 
         self.rt.spawn(async move {
             let res = Self::fetch_container_detail_api(sf, utok, kind, id, title_hint).await;
             let _ = tx.send(AsyncMsg::ContainerLoaded {
                 seq: req_seq,
+                backend,
+                req_kind,
                 expected_id,
                 res,
             });
@@ -5153,21 +5973,6 @@ impl AppUi {
                     });
                 }
                 if kind == "library-artists" || kind == "artists" {
-                    let artist_name = if kind == "library-artists" {
-                        let meta_p = format!("v1/me/library/artists/{id}?l=zh-Hans-CN");
-                        am_api::fetch_am_api(meta_p, utok.clone(), None, Some(sf.clone()))
-                            .await
-                            .ok()
-                            .and_then(|j| {
-                                j.pointer("/data/0/attributes/name")
-                                    .and_then(Value::as_str)
-                                    .map(|s| s.to_string())
-                            })
-                            .unwrap_or_else(|| title_hint.clone())
-                    } else {
-                        title_hint.clone()
-                    };
-
                     if kind == "artists" {
                         let p = format!(
                             "v1/catalog/{sf}/artists/{id}?views=top-songs,full-albums&extend=audioTraits&l=zh-Hans-CN"
@@ -5179,7 +5984,7 @@ impl AppUi {
                         let title = root
                             .pointer("/attributes/name")
                             .and_then(Value::as_str)
-                            .unwrap_or(&artist_name)
+                            .unwrap_or(&title_hint)
                             .to_string();
                         let subtitle = root
                             .pointer("/attributes/genreNames/0")
@@ -5222,14 +6027,59 @@ impl AppUi {
                         });
                     }
 
-                    // Library artist -> search catalog for high-res portrait, albums & playable top songs
-                    let enc: String =
-                        url::form_urlencoded::byte_serialize(artist_name.trim().as_bytes())
-                            .collect();
-                    let sp = format!(
-                        "v1/catalog/{sf}/search?term={enc}&types=artists,albums,songs&extend=audioTraits&limit=25&l=zh-Hans-CN"
-                    );
-                    let json = am_api::fetch_am_api(sp, utok, None, Some(sf)).await?;
+                    // Library artist -> parallelize library metadata + catalog search when `title_hint` is known!
+                    let meta_p = format!("v1/me/library/artists/{id}?l=zh-Hans-CN");
+                    let hint_trimmed = title_hint.trim().to_string();
+                    let (artist_name, json) = if !hint_trimmed.is_empty() {
+                        let enc_hint: String =
+                            url::form_urlencoded::byte_serialize(hint_trimmed.as_bytes()).collect();
+                        let sp_hint = format!(
+                            "v1/catalog/{sf}/search?term={enc_hint}&types=artists,albums,songs&extend=audioTraits&limit=25&l=zh-Hans-CN"
+                        );
+                        let (meta_res, search_res) = tokio::join!(
+                            am_api::fetch_am_api(meta_p, utok.clone(), None, Some(sf.clone())),
+                            am_api::fetch_am_api(sp_hint, utok.clone(), None, Some(sf.clone())),
+                        );
+                        let resolved_name = meta_res
+                            .ok()
+                            .and_then(|j| {
+                                j.pointer("/data/0/attributes/name")
+                                    .and_then(Value::as_str)
+                                    .map(|s| s.to_string())
+                            })
+                            .filter(|s| !s.trim().is_empty())
+                            .unwrap_or_else(|| title_hint.clone());
+                        let search_json = if resolved_name.trim().eq_ignore_ascii_case(&hint_trimmed) {
+                            search_res?
+                        } else {
+                            let enc: String =
+                                url::form_urlencoded::byte_serialize(resolved_name.trim().as_bytes())
+                                    .collect();
+                            let sp = format!(
+                                "v1/catalog/{sf}/search?term={enc}&types=artists,albums,songs&extend=audioTraits&limit=25&l=zh-Hans-CN"
+                            );
+                            am_api::fetch_am_api(sp, utok, None, Some(sf)).await?
+                        };
+                        (resolved_name, search_json)
+                    } else {
+                        let resolved_name = am_api::fetch_am_api(meta_p, utok.clone(), None, Some(sf.clone()))
+                            .await
+                            .ok()
+                            .and_then(|j| {
+                                j.pointer("/data/0/attributes/name")
+                                    .and_then(Value::as_str)
+                                    .map(|s| s.to_string())
+                            })
+                            .unwrap_or_else(|| title_hint.clone());
+                        let enc: String =
+                            url::form_urlencoded::byte_serialize(resolved_name.trim().as_bytes())
+                                .collect();
+                        let sp = format!(
+                            "v1/catalog/{sf}/search?term={enc}&types=artists,albums,songs&extend=audioTraits&limit=25&l=zh-Hans-CN"
+                        );
+                        let search_json = am_api::fetch_am_api(sp, utok, None, Some(sf)).await?;
+                        (resolved_name, search_json)
+                    };
                     let art_node = json.pointer("/results/artists/data/0");
                     let artwork_url = art_node
                         .and_then(|n| n.pointer("/attributes/artwork/url"))
@@ -5263,12 +6113,56 @@ impl AppUi {
                     } else {
                         "playlists"
                     };
-                    let meta_path = format!("v1/me/library/{sub}/{id}?include=catalog&l=zh-Hans-CN");
+                    let meta_path = format!(
+                        "v1/me/library/{sub}/{id}?include=catalog&extend=editorialVideo&extend%5Balbums%5D=editorialVideo&extend%5Bplaylists%5D=editorialVideo&l=zh-Hans-CN"
+                    );
                     let tracks_path = format!(
                         "v1/me/library/{sub}/{id}/tracks?include=catalog&extend=audioTraits&limit=100&l=zh-Hans-CN"
                     );
-                    let meta_json = am_api::fetch_am_api(meta_path, utok.clone(), None, Some(sf.clone())).await.ok();
-                    let tr_json = am_api::fetch_am_api(tracks_path, utok.clone(), None, Some(sf.clone())).await?;
+                    let sf_m = sf.clone();
+                    let utok_m = utok.clone();
+                    let meta_and_motion_fut = async move {
+                        let meta_json =
+                            am_api::fetch_am_api(meta_path, utok_m.clone(), None, Some(sf_m.clone()))
+                                .await
+                                .ok();
+                        let root = meta_json.as_ref().and_then(|j| j.pointer("/data/0"));
+                        let mut motion_video_url = root
+                            .and_then(|r| r.pointer("/relationships/catalog/data/0/attributes"))
+                            .and_then(am_api::extract_editorial_motion_video_from_attrs)
+                            .or_else(|| {
+                                root.and_then(|r| r.get("attributes"))
+                                    .and_then(am_api::extract_editorial_motion_video_from_attrs)
+                            });
+                        if motion_video_url.is_none() {
+                            let cat_id = root.and_then(|r| {
+                                r.pointer("/relationships/catalog/data/0/id")
+                                    .or_else(|| r.pointer("/attributes/playParams/globalId"))
+                                    .or_else(|| r.pointer("/attributes/playParams/catalogId"))
+                                    .and_then(Value::as_str)
+                                    .map(|s| s.to_string())
+                            });
+                            if let Some(cid) = cat_id {
+                                let cat_path = format!(
+                                    "v1/catalog/{sf_m}/{sub}/{cid}?extend=editorialVideo&l=zh-Hans-CN"
+                                );
+                                if let Ok(cj) =
+                                    am_api::fetch_am_api(cat_path, utok_m, None, Some(sf_m)).await
+                                {
+                                    if let Some(attrs) = cj.pointer("/data/0/attributes") {
+                                        motion_video_url =
+                                            am_api::extract_editorial_motion_video_from_attrs(attrs);
+                                    }
+                                }
+                            }
+                        }
+                        (meta_json, motion_video_url)
+                    };
+                    let tracks_fut =
+                        am_api::fetch_am_api(tracks_path, utok, None, Some(sf));
+                    let ((meta_json, motion_video_url), tr_res) =
+                        tokio::join!(meta_and_motion_fut, tracks_fut);
+                    let tr_json = tr_res?;
 
                     let root = meta_json.as_ref().and_then(|j| j.pointer("/data/0"));
                     let title = root
@@ -5305,27 +6199,6 @@ impl AppUi {
                                 .collect::<Vec<_>>()
                         })
                         .unwrap_or_default();
-
-                    // Resolve editorial motion artwork for library albums & subscribed playlists via catalog ID
-                    let cat_id = root.and_then(|r| {
-                        r.pointer("/relationships/catalog/data/0/id")
-                            .or_else(|| r.pointer("/attributes/playParams/globalId"))
-                            .or_else(|| r.pointer("/attributes/playParams/catalogId"))
-                            .and_then(Value::as_str)
-                            .map(|s| s.to_string())
-                    });
-                    let mut motion_video_url = None;
-                    if let Some(cid) = cat_id {
-                        let cat_path = format!(
-                            "v1/catalog/{sf}/{sub}/{cid}?extend=editorialVideo&l=zh-Hans-CN"
-                        );
-                        if let Ok(cj) = am_api::fetch_am_api(cat_path, utok, None, Some(sf)).await {
-                            if let Some(attrs) = cj.pointer("/data/0/attributes") {
-                                motion_video_url =
-                                    am_api::extract_editorial_motion_video_from_attrs(attrs);
-                            }
-                        }
-                    }
 
                     Ok(ContainerDetailData {
                         id,
@@ -5519,17 +6392,42 @@ impl AppUi {
         }
         self.update_viz_subscription();
 
+        let be = self.settings.playback_backend;
+        let cache_on = self.settings.page_cache_enabled;
         match &next {
             PageRoute::Home | PageRoute::Browse => {
-                if self.home_albums.is_empty()
-                    || self.home_shelves.is_empty()
-                    || (next == PageRoute::Browse && self.browse_shelves.is_empty())
+                let rkey = if next == PageRoute::Browse { "browse" } else { "home" };
+                let has_data = if next == PageRoute::Browse {
+                    !self.browse_shelves.is_empty() || !self.home_albums.is_empty()
+                } else {
+                    !self.home_shelves.is_empty() || !self.home_albums.is_empty()
+                };
+                let is_fresh = cache_on
+                    && has_data
+                    && self
+                        .lib_route_fetched_at
+                        .get(&Self::lib_route_cache_key(be, rkey))
+                        .is_some_and(|t| t.elapsed().as_secs() < Self::SWR_FRESH_TTL_SECS);
+                if !is_fresh
+                    && (!has_data
+                        || !cache_on
+                        || self
+                            .lib_route_fetched_at
+                            .get(&Self::lib_route_cache_key(be, rkey))
+                            .is_some_and(|t| t.elapsed().as_secs() >= Self::SWR_FRESH_TTL_SECS))
                 {
                     self.fetch_home_charts();
                 }
             }
             PageRoute::Radio => {
-                if self.radio_cards.is_empty() || self.radio_shelves.is_empty() {
+                let has_data = !self.radio_shelves.is_empty() || !self.radio_cards.is_empty();
+                let is_fresh = cache_on
+                    && has_data
+                    && self
+                        .lib_route_fetched_at
+                        .get(&Self::lib_route_cache_key(be, "radio"))
+                        .is_some_and(|t| t.elapsed().as_secs() < Self::SWR_FRESH_TTL_SECS);
+                if !is_fresh {
                     self.fetch_radio_mixes();
                 }
             }
@@ -5538,8 +6436,26 @@ impl AppUi {
             | PageRoute::LibAlbums
             | PageRoute::LibSongs
             | PageRoute::LibForYou
-            | PageRoute::LibDownloads
             | PageRoute::LibPlaylists => {
+                let rkey = Self::route_to_lib_key(&next).unwrap_or("");
+                let has_data = if next == PageRoute::LibSongs {
+                    !self.lib_songs.is_empty()
+                } else {
+                    self.lib_cards.get(rkey).is_some_and(|v| !v.is_empty())
+                };
+                let is_fresh = cache_on
+                    && has_data
+                    && self
+                        .lib_route_fetched_at
+                        .get(&Self::lib_route_cache_key(be, rkey))
+                        .is_some_and(|t| t.elapsed().as_secs() < Self::SWR_FRESH_TTL_SECS);
+                if !is_fresh {
+                    // If cached data exists but is stale (>120s), keep displaying it immediately
+                    // while revalidating silently in the background!
+                    self.fetch_library_route(&next);
+                }
+            }
+            PageRoute::LibDownloads => {
                 self.fetch_library_route(&next);
             }
             PageRoute::ContainerDetail {
@@ -5592,6 +6508,15 @@ impl AppUi {
             return;
         }
         if self.show_lyrics_overlay {
+            if self.lyrics_view.show_queue
+                && self
+                    .lyrics_view
+                    .queue_column_rect
+                    .contains(self.mouse_pos.0, self.mouse_pos.1)
+            {
+                self.lyrics_view.on_queue_wheel(px);
+                return;
+            }
             if self
                 .lyrics_view
                 .lyrics_column_rect
@@ -6433,12 +7358,14 @@ impl AppUi {
             }
             LyricsHitAction::SeekToSec(sec) => {
                 let s = sec.max(0.0);
+                self.lyrics_view.clear_end_latch();
                 self.smtc.position_sec = s;
                 self.playhead_anchor_sec = s;
                 self.playhead_anchor_inst = Instant::now();
                 self.control_player("seek", Some(s));
             }
             LyricsHitAction::ScrubProgressBar(bar) => {
+                self.lyrics_view.clear_end_latch();
                 let ratio = ((self.mouse_pos.0 - bar.x) / bar.w.max(1.0)).clamp(0.0, 1.0) as f64;
                 self.execute_action(UiAction::SeekRatio(ratio));
             }
@@ -6447,6 +7374,7 @@ impl AppUi {
                 self.execute_action(UiAction::SetVolumeRatio(ratio));
             }
             LyricsHitAction::TogglePlayPause => {
+                self.lyrics_view.clear_end_latch();
                 self.execute_action(UiAction::TogglePlayPause);
             }
             LyricsHitAction::PrevTrack => {
@@ -6517,6 +7445,10 @@ impl AppUi {
                         show_playlist_submenu: false,
                         from_lyrics: true,
                     });
+                    Self::trigger_open_spring(
+                        &mut self.context_menu_open_spring,
+                        self.settings.reduce_motion,
+                    );
                 }
             }
             LyricsHitAction::OpenListenTogether => {
@@ -6526,6 +7458,50 @@ impl AppUi {
                 if let Some(path) = pick_local_lyrics_file_dialog(self.wake_hwnd) {
                     let _ = self.import_lyrics_from_path(&path);
                 }
+            }
+            LyricsHitAction::ToggleLyricsVisible => {
+                self.lyrics_view.show_lyrics = !self.lyrics_view.show_lyrics;
+                if self.lyrics_view.show_lyrics {
+                    self.lyrics_view.show_queue = false;
+                }
+            }
+            LyricsHitAction::ToggleLyricsQueue => {
+                self.lyrics_view.show_queue = !self.lyrics_view.show_queue;
+                if self.lyrics_view.show_queue {
+                    let q = self.active_queue_tracks();
+                    let cur_idx = self
+                        .smtc
+                        .adam_id
+                        .as_deref()
+                        .and_then(|aid| q.iter().position(|t| t.effective_adam_id() == aid))
+                        .or_else(|| {
+                            if self.smtc.title.is_empty() {
+                                None
+                            } else {
+                                q.iter().position(|t| {
+                                    t.name.eq_ignore_ascii_case(&self.smtc.title)
+                                        && (self.smtc.artist.is_empty()
+                                            || t.artist_name.eq_ignore_ascii_case(&self.smtc.artist))
+                                })
+                            }
+                        })
+                        .unwrap_or(0);
+                    let vis_h = if self.lyrics_view.queue_column_rect.h > 80.0 {
+                        self.lyrics_view.queue_column_rect.h - 48.0
+                    } else {
+                        420.0
+                    };
+                    let row_h = 56.0f32;
+                    let max_est = ((q.len() as f32) * row_h - vis_h).max(0.0);
+                    self.lyrics_view.set_queue_tracks(q);
+                    self.lyrics_queue_sync_epoch = self.lyrics_queue_version;
+                    self.lyrics_view.queue_max_scroll_y = max_est;
+                    self.lyrics_view.queue_scroll_y =
+                        ((cur_idx as f32) * row_h - vis_h * 0.30).clamp(0.0, max_est);
+                }
+            }
+            LyricsHitAction::JumpLyricsQueueIndex(idx) => {
+                self.execute_action(UiAction::JumpQueueIndex(idx));
             }
         }
     }
@@ -7145,6 +8121,10 @@ impl AppUi {
                 self.show_queue_popover = !self.show_queue_popover;
                 self.show_more_popover = false;
                 if self.show_queue_popover {
+                    Self::trigger_open_spring(
+                        &mut self.queue_popover_open_spring,
+                        self.settings.reduce_motion,
+                    );
                     let q = self.active_queue_tracks();
                     let cur_idx = self
                         .smtc
@@ -7161,6 +8141,12 @@ impl AppUi {
             UiAction::ToggleMorePopover => {
                 self.show_more_popover = !self.show_more_popover;
                 self.show_queue_popover = false;
+                if self.show_more_popover {
+                    Self::trigger_open_spring(
+                        &mut self.more_popover_open_spring,
+                        self.settings.reduce_motion,
+                    );
+                }
             }
             UiAction::JumpQueueIndex(idx) => {
                 let q = self.active_queue_tracks();
@@ -7184,9 +8170,16 @@ impl AppUi {
                         kind,
                         id,
                         title_hint,
-                    } => self.fetch_container_detail(kind, id, title_hint),
+                    } => self.fetch_container_detail_ex(kind, id, title_hint, true),
+                    PageRoute::Settings | PageRoute::Visualizer => {
+                        self.fetch_home_charts();
+                        self.fetch_radio_mixes();
+                        self.fetch_sidebar_playlists();
+                        self.refresh_devices_and_prefs(false);
+                    }
                     other => self.fetch_library_route(&other),
                 }
+                self.set_banner("正在刷新当前页面数据...".to_string(), false);
             }
             UiAction::OpenDownloadsFolder => {
                 let tx = self.tx.clone();
@@ -7649,9 +8642,50 @@ impl AppUi {
             }
             UiAction::ToggleLiquidGlass => {
                 self.settings.liquid_glass_enabled = !self.settings.liquid_glass_enabled;
+                self.settings.liquid_glass_v2_migrated = true;
                 if self.wake_hwnd != 0 {
                     self.save_settings();
                 }
+            }
+            UiAction::TogglePageCache => {
+                self.settings.page_cache_enabled = !self.settings.page_cache_enabled;
+                if !self.settings.page_cache_enabled {
+                    self.clear_page_mem_cache();
+                } else {
+                    self.schedule_background_prewarm();
+                }
+                if self.wake_hwnd != 0 {
+                    self.save_settings();
+                }
+            }
+            UiAction::ClearPageCache => {
+                self.clear_page_mem_cache();
+                self.set_banner("已清空页面缓存，下次访问将重新拉取最新数据".to_string(), false);
+            }
+            UiAction::NudgeLyricsOffset(delta) => {
+                self.handle_lyrics_action(LyricsHitAction::NudgeLyricsOffset(delta));
+            }
+            UiAction::ResetLyricsOffset => {
+                self.handle_lyrics_action(LyricsHitAction::ResetLyricsOffset);
+            }
+            UiAction::ToggleLyricsLeftEnlarged => {
+                self.settings.lyrics_left_enlarged = !self.settings.lyrics_left_enlarged;
+                self.lyrics_view.left_enlarged = self.settings.lyrics_left_enlarged;
+                self.lyrics_view.invalidate_layout_cache();
+                if self.wake_hwnd != 0 {
+                    self.save_settings();
+                }
+            }
+            UiAction::ToggleLyricsCenterAxis => {
+                self.settings.lyrics_center_axis = !self.settings.lyrics_center_axis;
+                self.lyrics_view.center_axis = self.settings.lyrics_center_axis;
+                self.lyrics_view.invalidate_layout_cache();
+                if self.wake_hwnd != 0 {
+                    self.save_settings();
+                }
+            }
+            UiAction::CycleLyricsSourceFromMenu => {
+                self.handle_lyrics_action(LyricsHitAction::CycleLyricsSource);
             }
             UiAction::ToggleLyricsLatinByWord => {
                 self.settings.lyrics_latin_by_word = !self.settings.lyrics_latin_by_word;
@@ -7861,6 +8895,10 @@ impl AppUi {
                     show_playlist_submenu: false,
                     from_lyrics: false,
                 });
+                Self::trigger_open_spring(
+                    &mut self.context_menu_open_spring,
+                    self.settings.reduce_motion,
+                );
             }
             UiAction::OpenDetailContextMenu { anchor } => {
                 self.show_more_popover = false;
@@ -7879,6 +8917,10 @@ impl AppUi {
                         show_playlist_submenu: false,
                         from_lyrics: false,
                     });
+                    Self::trigger_open_spring(
+                        &mut self.context_menu_open_spring,
+                        self.settings.reduce_motion,
+                    );
                 }
             }
             UiAction::CloseContextMenu => {
@@ -7891,6 +8933,7 @@ impl AppUi {
             }
             UiAction::PlayNextTrack(track) => {
                 self.context_menu = None;
+                self.lyrics_queue_version = self.lyrics_queue_version.wrapping_add(1);
                 let tname = track.name.clone();
                 if self.settings.playback_backend.uses_native_stream_player() {
                     if !native_player::insert_next_in_queue(track.clone()) {
@@ -8288,6 +9331,10 @@ impl AppUi {
                 self.show_queue_popover = false;
                 self.listen_together.modal_open = true;
                 self.listen_together.modal_scroll_y = 0.0;
+                Self::trigger_open_spring(
+                    &mut self.lt_modal_open_spring,
+                    self.settings.reduce_motion,
+                );
                 if self.netease_account.logged_in && !self.settings.netease_cookie.is_empty() {
                     self.execute_action(UiAction::LtFetchInboxInvites);
                     if self.listen_together.mutual_friends.is_empty() {
@@ -8632,6 +9679,7 @@ impl AppUi {
         if tracks.is_empty() {
             return;
         }
+        self.lyrics_queue_version = self.lyrics_queue_version.wrapping_add(1);
         let clamped_idx = start_index.min(tracks.len() - 1);
         let first_id = tracks[clamped_idx].id.clone();
         let is_ne = first_id.starts_with("ne:") || self.settings.playback_backend == PlaybackBackend::NetEase;
@@ -8918,6 +9966,8 @@ impl AppUi {
         self.frame_dt = dt;
         self.visited_hover_keys.clear();
         self.has_settling_hover = false;
+        self.has_settling_toggle = false;
+        r.step_glass_animations(if self.settings.reduce_motion { 1.0 } else { dt });
         r.set_aggressive_memory_release(self.settings.aggressive_memory_release);
         if self.settings.aggressive_memory_release
             && (self.pending_route_mem_trim
@@ -9043,6 +10093,10 @@ impl AppUi {
             self.sidebar_sel_y_spring.snap(self.sidebar_sel_y_spring.target);
             self.sidebar_sel_alpha_spring
                 .snap(self.sidebar_sel_alpha_spring.target);
+            self.context_menu_open_spring.snap(1.0);
+            self.queue_popover_open_spring.snap(1.0);
+            self.more_popover_open_spring.snap(1.0);
+            self.lt_modal_open_spring.snap(1.0);
         } else {
             if self.route_trans < 1.0 {
                 self.route_trans = (self.route_trans + dt / 0.25).min(1.0);
@@ -9085,6 +10139,30 @@ impl AppUi {
             if self.sidebar_sel_alpha_spring.is_settled_norm() {
                 self.sidebar_sel_alpha_spring
                     .snap(self.sidebar_sel_alpha_spring.target);
+            }
+            if self.context_menu.is_some() && !self.context_menu_open_spring.is_settled_norm() {
+                self.context_menu_open_spring.step(dt);
+                if self.context_menu_open_spring.is_settled_norm() {
+                    self.context_menu_open_spring.snap(1.0);
+                }
+            }
+            if self.show_queue_popover && !self.queue_popover_open_spring.is_settled_norm() {
+                self.queue_popover_open_spring.step(dt);
+                if self.queue_popover_open_spring.is_settled_norm() {
+                    self.queue_popover_open_spring.snap(1.0);
+                }
+            }
+            if self.show_more_popover && !self.more_popover_open_spring.is_settled_norm() {
+                self.more_popover_open_spring.step(dt);
+                if self.more_popover_open_spring.is_settled_norm() {
+                    self.more_popover_open_spring.snap(1.0);
+                }
+            }
+            if self.listen_together.modal_open && !self.lt_modal_open_spring.is_settled_norm() {
+                self.lt_modal_open_spring.step(dt);
+                if self.lt_modal_open_spring.is_settled_norm() {
+                    self.lt_modal_open_spring.snap(1.0);
+                }
             }
         }
         let lyr_open_t = self.lyrics_open_spring.value.clamp(0.0, 1.0);
@@ -9377,8 +10455,13 @@ impl AppUi {
             );
         }
 
-        // Keep permanent top-right NetEase `一起听` pill synced into the Full-Screen Lyrics overlay too!
+        // Keep permanent top-right NetEase `一起听` pill + Lyrics layout/queue state synced before draw!
         self.lyrics_view.listen_together_pill = self.build_listen_together_pill_info();
+        self.lyrics_view.left_enlarged = self.settings.lyrics_left_enlarged;
+        self.lyrics_view.center_axis = self.settings.lyrics_center_axis;
+        if lyr_open_t > 0.004 && self.lyrics_view.show_queue {
+            self.sync_lyrics_queue_if_needed(false);
+        }
 
         // Fast path when Lyrics view is fully expanded (`lyr_open_t >= 0.996`)
         if lyr_open_t >= 0.996 {
@@ -9425,6 +10508,7 @@ impl AppUi {
             if let Some((ref msg, is_err, _)) = self.banner_text.clone() {
                 self.draw_banner_toast(r, win_rect, msg, is_err);
             }
+            self.has_active_glass_motion = !self.glass_off() && r.has_active_glass_motion();
             let sync_int = if live_resize_no_vsync {
                 0
             } else {
@@ -9621,11 +10705,17 @@ impl AppUi {
         }
 
         let nav_sb_t = if is_narrow { 0.0 } else { sb_open_t };
-        // Single per-frame GPU backdrop snapshot shared by ALL 9 floating top-bar buttons + MiniPlayer!
-        r.begin_glass_backdrop_snapshot(self.glass_off());
+        // Single per-frame GPU backdrop snapshot shared by floating top-bar buttons + MiniPlayer!
+        // Completely skipped on Settings (or whenever Liquid Glass is disabled) for 0 GPU blur cost!
+        let glass_off_now = self.glass_off();
+        if !glass_off_now {
+            r.begin_glass_backdrop_snapshot(false);
+        }
         self.draw_top_floating_nav(r, content_area, nav_sb_t);
         self.draw_floating_mini_player(r, content_area);
-        r.end_glass_backdrop_snapshot();
+        if !glass_off_now {
+            r.end_glass_backdrop_snapshot();
+        }
 
         // Narrow-window floating sidebar drawer + click-to-dismiss scrim
         if is_narrow && sb_open_t > 0.003 {
@@ -9779,6 +10869,7 @@ impl AppUi {
         }
 
         // Never combine Present(1..=4, 0) VBlank block with explicit hr_timer wait!
+        self.has_active_glass_motion = !self.glass_off() && r.has_active_glass_motion();
         let sync_int = if live_resize_no_vsync {
             0
         } else {
@@ -10752,12 +11843,11 @@ impl AppUi {
             });
         }
 
-        // Top-right Unified Liquid Glass Functional Buttons (`一起听` [NetEase], `刷新`, `偏好设置 •••`) — same 34px centerline!
+        // Top-right Unified Liquid Glass Functional Buttons (`一起听` [NetEase], `偏好设置 •••`) — same 34px centerline!
         let more_r = RectF::new(min_r.x - 14.0 - bh, ty, bh, bh);
-        let ref_r = RectF::new(more_r.x - 8.0 - bh, ty, bh, bh);
         if let Some((lt_active, lt_lbl)) = self.build_listen_together_pill_info() {
             let lt_w = if lt_active { 124.0f32 } else { 78.0f32 };
-            let lt_r = RectF::new(ref_r.x - 8.0 - lt_w, ty, lt_w, bh);
+            let lt_r = RectF::new(more_r.x - 8.0 - lt_w, ty, lt_w, bh);
             let lt_hov = lt_r.contains(self.mouse_pos.0, self.mouse_pos.1);
             r.draw_liquid_glass_floating_button(
                 lt_r,
@@ -10801,15 +11891,9 @@ impl AppUi {
                 action: UiAction::OpenListenTogetherModal,
             });
         }
-        for (hr, ic, is_active, act) in [
-            (ref_r, SfIcon::Refresh, false, UiAction::RefreshCurrentView),
-            (
-                more_r,
-                SfIcon::MoreDots,
-                self.route == PageRoute::Settings,
-                UiAction::Navigate(PageRoute::Settings),
-            ),
-        ] {
+        {
+            let hr = more_r;
+            let is_active = self.route == PageRoute::Settings;
             let hov = hr.contains(self.mouse_pos.0, self.mouse_pos.1);
             r.draw_liquid_glass_floating_button(
                 hr,
@@ -10824,10 +11908,10 @@ impl AppUi {
                 self.mouse_pos,
                 self.glass_off(),
             );
-            r.draw_icon(ic, hr.inset(8.5, 8.5), Theme::TEXT_PRIMARY);
+            r.draw_icon(SfIcon::MoreDots, hr.inset(8.5, 8.5), Theme::TEXT_PRIMARY);
             self.hit_regions.push(HitRegion {
                 rect: hr,
-                action: act,
+                action: UiAction::Navigate(PageRoute::Settings),
             });
         }
     }
@@ -11241,6 +12325,10 @@ impl AppUi {
         }
 
         r.push_clip(area);
+        if self.route == PageRoute::Settings {
+            // Pure dark iPadOS Settings canvas (`#08080A`) — crisp high-contrast flat backdrop!
+            r.fill_rect(area, Color::rgb(8, 8, 10));
+        }
         let pad_x = 32.0;
         let start_y = 62.0 - self.scroll_y + trans_dy;
         let inner_w = (area.w - pad_x * 2.0).max(200.0);
@@ -11808,30 +12896,49 @@ impl AppUi {
                     false,
                     false,
                 );
+            } else {
+                let a = self.skeleton_pulse_alpha(0.0);
+                r.fill_rounded_rect(
+                    RectF::new(rx, y + 28.0, (rw * 0.56).clamp(140.0, 320.0), 24.0),
+                    8.0,
+                    Color::rgba(255, 255, 255, a * 1.45),
+                );
             }
-            r.draw_loading_spinner(
-                rx + 10.0,
-                y + 82.0,
-                8.5,
-                self.spinner_phase,
-                Theme::TEXT_SECONDARY,
+            // Sleek pulsing dark-glass hero metadata & action pills + skeleton tracklist rows!
+            let a1 = self.skeleton_pulse_alpha(0.25);
+            let a2 = self.skeleton_pulse_alpha(0.50);
+            r.fill_rounded_rect(
+                RectF::new(rx, y + 66.0, (rw * 0.34).clamp(110.0, 220.0), 16.0),
+                6.0,
+                Color::rgba(255, 255, 255, a1 * 1.2),
             );
-            r.draw_text(
-                "正在载入曲目列表...",
-                RectF::new(rx + 28.0, y + 66.0, (rw - 28.0).max(120.0), 32.0),
-                15.0,
-                500,
-                Theme::TEXT_SECONDARY,
-                TextAlign::Left,
-                true,
-                false,
+            r.fill_rounded_rect(
+                RectF::new(rx, y + 96.0, (rw * 0.62).clamp(160.0, 400.0), 12.0),
+                5.0,
+                Color::rgba(255, 255, 255, a2),
             );
-            return y + art_sz + 80.0;
+            r.fill_rounded_rect(
+                RectF::new(rx, y + 116.0, (rw * 0.44).clamp(120.0, 300.0), 12.0),
+                5.0,
+                Color::rgba(255, 255, 255, a2 * 0.9),
+            );
+            let skel_btn_y = art_rect.bottom() - 42.0;
+            r.fill_rounded_rect(
+                RectF::new(rx, skel_btn_y, 42.0, 42.0),
+                21.0,
+                Color::rgba(255, 255, 255, a1 * 1.15),
+            );
+            r.fill_rounded_rect(
+                RectF::new(rx + 54.0, skel_btn_y, 138.0, 42.0),
+                21.0,
+                Color::rgba(255, 255, 255, a1 * 1.35),
+            );
+            return self.draw_skeleton_track_rows(r, x0, y + art_sz + 28.0, w, 10);
         }
 
         let Some(detail) = self.detail_data.take() else {
             r.draw_text(
-                "未能载入内容，请点击右上角刷新重试。",
+                "未能载入内容，请按 F5 或前往设置刷新重试。",
                 RectF::new(x0, y + 60.0, w, 32.0),
                 15.0,
                 500,
@@ -13366,14 +14473,19 @@ impl AppUi {
         y += 48.0;
 
         if self.home_albums.is_empty() && self.home_playlists.is_empty() {
-            let loading_lbl = format!(
-                "正在获取 {} 精选内容...",
-                self.settings.playback_backend.display_name()
-            );
+            if self.is_showing_loading_skeleton() {
+                let a = self.skeleton_pulse_alpha(0.0);
+                r.fill_rounded_rect(
+                    RectF::new(x0, y + 4.0, 148.0, 20.0),
+                    7.0,
+                    Color::rgba(255, 255, 255, a * 1.35),
+                );
+                return self.draw_skeleton_card_grid(r, x0, y + 36.0, w, 2);
+            }
             r.draw_text(
-                &loading_lbl,
+                "暂无内容",
                 RectF::new(x0, y + 20.0, w, 28.0),
-                15.0,
+                14.5,
                 400,
                 Theme::TEXT_SECONDARY,
                 TextAlign::Left,
@@ -13591,6 +14703,127 @@ impl AppUi {
         y
     }
 
+    fn skeleton_pulse_alpha(&self, phase_offset: f32) -> f32 {
+        if self.settings.reduce_motion {
+            return 0.068;
+        }
+        let wave = ((self.spinner_phase * 2.15 - phase_offset).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
+        0.044 + 0.048 * wave
+    }
+
+    fn draw_skeleton_card_grid(
+        &self,
+        r: &mut D2DRenderer,
+        x0: f32,
+        y: f32,
+        w: f32,
+        rows_n: usize,
+    ) -> f32 {
+        let gap = 18.0;
+        let cols = ((w + gap) / 184.0).floor().clamp(2.0, 7.0) as usize;
+        let card_w = (w - gap * ((cols - 1) as f32)) / (cols as f32);
+        let card_h = card_w + 48.0;
+        let win_h = r.logical_height();
+
+        for row_idx in 0..rows_n {
+            for col in 0..cols {
+                let cx = x0 + (col as f32) * (card_w + gap);
+                let cy = y + (row_idx as f32) * (card_h + 14.0);
+                if cy + card_h < 0.0 || cy > win_h {
+                    continue;
+                }
+                let phase = (row_idx as f32) * 0.48 + (col as f32) * 0.24;
+                let a = self.skeleton_pulse_alpha(phase);
+                let art_r = RectF::new(cx, cy, card_w, card_w);
+                r.fill_rounded_rect(art_r, 11.0, Color::rgba(255, 255, 255, a));
+                r.stroke_rounded_rect(
+                    art_r,
+                    11.0,
+                    Color::rgba(255, 255, 255, 0.05 + a * 0.65),
+                    1.0,
+                );
+                let title_w = (card_w * (0.64 + ((row_idx * 5 + col * 3) % 4) as f32 * 0.06))
+                    .min(card_w - 6.0);
+                let sub_w = (card_w * (0.38 + ((row_idx * 3 + col * 7) % 3) as f32 * 0.07))
+                    .min(card_w - 16.0);
+                r.fill_rounded_rect(
+                    RectF::new(cx, art_r.bottom() + 10.0, title_w, 12.0),
+                    5.5,
+                    Color::rgba(255, 255, 255, a * 1.25),
+                );
+                r.fill_rounded_rect(
+                    RectF::new(cx, art_r.bottom() + 28.0, sub_w, 10.0),
+                    4.5,
+                    Color::rgba(255, 255, 255, a * 0.85),
+                );
+            }
+        }
+        y + (rows_n as f32) * (card_h + 14.0)
+    }
+
+    fn draw_skeleton_track_rows(
+        &self,
+        r: &mut D2DRenderer,
+        x0: f32,
+        mut y: f32,
+        w: f32,
+        count: usize,
+    ) -> f32 {
+        let row_h = Theme::TRACK_ROW_HEIGHT;
+        let win_h = r.logical_height();
+        for i in 0..count {
+            if y + row_h >= 0.0 && y <= win_h {
+                let a = self.skeleton_pulse_alpha((i as f32) * 0.30);
+                let rr = RectF::new(x0 - 8.0, y, w + 16.0, row_h);
+                r.fill_rounded_rect(rr, 9.0, Color::rgba(255, 255, 255, a * 0.42));
+                // Track index dot + 40x40 rounded cover placeholder
+                r.fill_rounded_rect(
+                    RectF::new(x0 + 6.0, y + row_h * 0.5 - 5.0, 14.0, 10.0),
+                    4.0,
+                    Color::rgba(255, 255, 255, a * 0.85),
+                );
+                let thumb = RectF::new(x0 + 34.0, y + (row_h - 40.0) * 0.5, 40.0, 40.0);
+                r.fill_rounded_rect(thumb, 7.0, Color::rgba(255, 255, 255, a * 1.25));
+                r.stroke_rounded_rect(
+                    thumb,
+                    7.0,
+                    Color::rgba(255, 255, 255, 0.05 + a * 0.5),
+                    0.9,
+                );
+                let tx = thumb.right() + 14.0;
+                let max_tw = (w - (tx - x0) - 86.0).max(90.0);
+                let tw = (max_tw * (0.34 + ((i * 7) % 5) as f32 * 0.075)).min(max_tw);
+                let sw = (max_tw * (0.20 + ((i * 5) % 4) as f32 * 0.05)).min(max_tw * 0.65);
+                r.fill_rounded_rect(
+                    RectF::new(tx, y + row_h * 0.5 - 14.0, tw, 12.0),
+                    5.5,
+                    Color::rgba(255, 255, 255, a * 1.35),
+                );
+                r.fill_rounded_rect(
+                    RectF::new(tx, y + row_h * 0.5 + 4.0, sw, 10.0),
+                    4.5,
+                    Color::rgba(255, 255, 255, a * 0.85),
+                );
+                // Duration placeholder on right
+                r.fill_rounded_rect(
+                    RectF::new(x0 + w - 48.0, y + row_h * 0.5 - 5.5, 36.0, 11.0),
+                    5.0,
+                    Color::rgba(255, 255, 255, a * 0.95),
+                );
+                r.draw_line(
+                    tx,
+                    y + row_h - 0.5,
+                    x0 + w - 8.0,
+                    y + row_h - 0.5,
+                    Color::rgba(255, 255, 255, 0.055),
+                    1.0,
+                );
+            }
+            y += row_h;
+        }
+        y + 12.0
+    }
+
     fn draw_cards_page(
         &mut self,
         r: &mut D2DRenderer,
@@ -13621,8 +14854,11 @@ impl AppUi {
         }
 
         if cards.is_empty() {
+            if self.is_showing_loading_skeleton() {
+                return self.draw_skeleton_card_grid(r, x0, y, w, 2);
+            }
             r.draw_text(
-                "暂无内容或正在加载中...",
+                "暂无内容",
                 RectF::new(x0, y + 20.0, w, 28.0),
                 14.5,
                 400,
@@ -13672,8 +14908,11 @@ impl AppUi {
         }
 
         if self.lib_songs.is_empty() {
+            if self.is_showing_loading_skeleton() {
+                return self.draw_skeleton_track_rows(r, x0, y, w, 10);
+            }
             r.draw_text(
-                "正在同步资料库歌曲...",
+                "暂无内容",
                 RectF::new(x0, y + 20.0, w, 28.0),
                 14.5,
                 400,
@@ -14003,7 +15242,7 @@ impl AppUi {
         );
         y += 32.0;
 
-        let items = self.downloads_info.items.clone();
+        let items = std::mem::take(&mut self.downloads_info.items);
         if items.is_empty() {
             r.draw_text(
                 "本地目录暂无已缓存的离线音频文件。",
@@ -14018,7 +15257,12 @@ impl AppUi {
             return y + 70.0;
         }
 
-        for item in items {
+        let view_h = r.logical_height();
+        for item in &items {
+            if y + 54.0 < -60.0 || y > view_h + 80.0 {
+                y += 62.0;
+                continue;
+            }
             let row = RectF::new(x0, y, w, 54.0);
             r.fill_rounded_rect(row, 10.0, Theme::BG_ELEVATED);
             r.draw_text(
@@ -14079,2442 +15323,281 @@ impl AppUi {
             });
             self.hit_regions.push(HitRegion {
                 rect: del_btn,
-                action: UiAction::DeleteDownload(item.path),
+                action: UiAction::DeleteDownload(item.path.clone()),
             });
             y += 62.0;
         }
+        self.downloads_info.items = items;
         y
     }
 
     // ========================================================================
-    // Settings Page (`settings.md`, Liquid Glass Hover Buttons, Window Corner Radius, Hidden Spatial)
+    // Settings Page (Authentic Dark iPadOS 26 Inset-Grouped Flat UI — 0 Glass)
     // ========================================================================
-    fn draw_settings_page(&mut self, r: &mut D2DRenderer, x0: f32, mut y: f32, w: f32) -> f32 {
-        let cw = w.min(760.0);
+    fn draw_ipad_section_header(
+        r: &mut D2DRenderer,
+        cx: f32,
+        y: f32,
+        cw: f32,
+        title: &str,
+    ) -> f32 {
         r.draw_text(
-            "设置",
-            RectF::new(x0, y, cw, 38.0),
-            28.0,
-            700,
-            Theme::TEXT_PRIMARY,
-            TextAlign::Left,
-            true,
-            false,
-        );
-        y += 48.0;
-
-        // --- Group 0 (TOP): 播放后端与音乐源切换 (Apple Music 原生 / 网页 / 网易云 / QQ 音乐 / 外置 SMTC) ---
-        r.draw_text(
-            "播放后端与音乐源",
-            RectF::new(x0 + 4.0, y, cw, 22.0),
-            13.0,
-            600,
-            Theme::TEXT_MUTED,
-            TextAlign::Left,
-            true,
-            false,
-        );
-        y += 26.0;
-
-        let active_be = self.settings.playback_backend;
-        let g_be = RectF::new(x0, y, cw, 98.0);
-        r.fill_rounded_rect(g_be, 14.0, Theme::BG_ELEVATED);
-        r.stroke_rounded_rect(g_be, 14.0, Theme::SEPARATOR, 1.0);
-
-        let btn_gap = 8.0f32;
-        let btn_w = (cw - 36.0 - btn_gap * 4.0) / 5.0;
-        let mut bx_be = x0 + 18.0;
-        for &be in &PlaybackBackend::ALL {
-            let sel = active_be == be;
-            let br = RectF::new(bx_be, y + 14.0, btn_w, 34.0);
-            let bhov = self.mouse_pos.1 >= TOP_BAR_GUARD_H
-                && br.contains(self.mouse_pos.0, self.mouse_pos.1);
-            r.draw_liquid_glass_button(
-                br,
-                9.5,
-                if sel {
-                    GlassBtnVariant::Tinted(be.accent_color())
-                } else {
-                    GlassBtnVariant::Regular
-                },
-                bhov,
-                self.mouse_down,
-                self.mouse_pos,
-                self.glass_off(),
-            );
-            r.draw_text(
-                be.short_label(),
-                br.inset(4.0, 0.0),
-                12.2,
-                if sel || bhov { 600 } else { 500 },
-                Theme::TEXT_PRIMARY,
-                TextAlign::Center,
-                true,
-                false,
-            );
-            self.hit_regions.push(HitRegion {
-                rect: br,
-                action: UiAction::SetPlaybackBackend(be),
-            });
-            bx_be += btn_w + btn_gap;
-        }
-        r.draw_text(
-            active_be.description(),
-            RectF::new(x0 + 18.0, y + 58.0, cw - 36.0, 28.0),
-            11.8,
-            400,
-            Theme::TEXT_SECONDARY,
-            TextAlign::Left,
-            true,
-            false,
-        );
-        y += 118.0;
-
-        // --- Group 0.5: 界面语言 / Language (Auto + 5 UI Languages, instant no-restart switch) ---
-        r.draw_text(
-            "界面语言",
-            RectF::new(x0 + 4.0, y, cw, 22.0),
-            13.0,
-            600,
-            Theme::TEXT_MUTED,
-            TextAlign::Left,
-            true,
-            false,
-        );
-        y += 26.0;
-
-        let g_lang = RectF::new(x0, y, cw, 92.0);
-        r.fill_rounded_rect(g_lang, 14.0, Theme::BG_ELEVATED);
-        r.stroke_rounded_rect(g_lang, 14.0, Theme::SEPARATOR, 1.0);
-
-        let lang_gap = 8.0f32;
-        let lang_w = (cw - 36.0 - lang_gap * 5.0) / 6.0;
-        let mut lx = x0 + 18.0;
-        for &lang in &AppLanguage::ALL {
-            let sel = self.settings.language == lang;
-            let lr = RectF::new(lx, y + 14.0, lang_w, 32.0);
-            let lhov = self.mouse_pos.1 >= TOP_BAR_GUARD_H
-                && lr.contains(self.mouse_pos.0, self.mouse_pos.1);
-            r.draw_liquid_glass_button(
-                lr,
-                9.0,
-                if sel {
-                    GlassBtnVariant::Tinted(active_be.accent_color())
-                } else {
-                    GlassBtnVariant::Regular
-                },
-                lhov,
-                self.mouse_down,
-                self.mouse_pos,
-                self.glass_off(),
-            );
-            r.draw_text(
-                lang.autonym(),
-                lr.inset(4.0, 0.0),
-                12.2,
-                if sel || lhov { 600 } else { 500 },
-                Theme::TEXT_PRIMARY,
-                TextAlign::Center,
-                true,
-                false,
-            );
-            self.hit_regions.push(HitRegion {
-                rect: lr,
-                action: UiAction::SetAppLanguage(lang),
-            });
-            lx += lang_w + lang_gap;
-        }
-        r.draw_text(
-            "跟随系统自动识别语言，或手动切换界面显示语言（立即生效）",
-            RectF::new(x0 + 18.0, y + 54.0, cw - 36.0, 26.0),
-            11.8,
-            400,
-            Theme::TEXT_SECONDARY,
-            TextAlign::Left,
-            true,
-            false,
-        );
-        y += 112.0;
-
-        // --- Backend-Adaptive Group 1: Web Apple Music / NetEase / QQ Music / External SMTC ---
-        match active_be {
-            PlaybackBackend::AppleMusicWeb => {
-                r.draw_text(
-                    "网页版 Apple Music 播放引擎 (Edge MusicKit JS)",
-                    RectF::new(x0 + 4.0, y, cw, 22.0),
-                    13.0,
-                    600,
-                    Theme::TEXT_MUTED,
-                    TextAlign::Left,
-                    true,
-                    false,
-                );
-                y += 26.0;
-                let g_web = RectF::new(x0, y, cw, 114.0);
-                r.fill_rounded_rect(g_web, 14.0, Theme::BG_ELEVATED);
-                r.stroke_rounded_rect(g_web, 14.0, Theme::SEPARATOR, 1.0);
-
-                let st_col = if self.web_am_status.authorized {
-                    Theme::SIGNAL_GREEN
-                } else if self.web_am_status.running {
-                    Theme::SIGNAL_AMBER
-                } else {
-                    Theme::TEXT_SECONDARY
-                };
-                r.draw_text(
-                    &self.web_am_status.status_text,
-                    RectF::new(x0 + 18.0, y + 14.0, cw - 36.0, 22.0),
-                    12.6,
-                    500,
-                    st_col,
-                    TextAlign::Left,
-                    true,
-                    false,
-                );
-
-                let vis_lbl = if self.web_am_status.window_visible {
-                    "隐藏网页窗口"
-                } else {
-                    "显示网页窗口"
-                };
-                let mut wx = x0 + 18.0;
-                for (lbl, bw, tinted, act) in [
-                    ("启动 / 网页登录", 122.0f32, true, UiAction::StartWebAmLogin),
-                    (vis_lbl, 102.0, false, UiAction::ToggleWebAmWindow),
-                    ("同步网页 Token", 112.0, false, UiAction::SyncWebAmToken),
-                    ("关闭引擎", 80.0, false, UiAction::ShutdownWebAm),
-                ] {
-                    let br = RectF::new(wx, y + 48.0, bw, 30.0);
-                    let bhov = self.mouse_pos.1 >= TOP_BAR_GUARD_H
-                        && br.contains(self.mouse_pos.0, self.mouse_pos.1);
-                    r.draw_liquid_glass_button(
-                        br,
-                        8.5,
-                        if tinted {
-                            GlassBtnVariant::Tinted(active_be.accent_color())
-                        } else {
-                            GlassBtnVariant::Regular
-                        },
-                        bhov,
-                        self.mouse_down,
-                        self.mouse_pos,
-                        self.glass_off(),
-                    );
-                    r.draw_text(
-                        lbl,
-                        br,
-                        12.0,
-                        if bhov || tinted { 600 } else { 500 },
-                        Theme::TEXT_PRIMARY,
-                        TextAlign::Center,
-                        true,
-                        false,
-                    );
-                    self.hit_regions.push(HitRegion { rect: br, action: act });
-                    wx += bw + 8.0;
-                }
-                r.draw_text(
-                    "使用本机 Edge 独立配置文件运行 MusicKit JS（支持 Widevine 完整曲库与电台，登录后自动同步个人资料库 Token）",
-                    RectF::new(x0 + 18.0, y + 86.0, cw - 36.0, 20.0),
-                    11.2,
-                    400,
-                    Theme::TEXT_MUTED,
-                    TextAlign::Left,
-                    true,
-                    false,
-                );
-                y += 134.0;
-            }
-            PlaybackBackend::NetEase => {
-                r.draw_text(
-                    "网易云音乐账号与音质",
-                    RectF::new(x0 + 4.0, y, cw, 22.0),
-                    13.0,
-                    600,
-                    Theme::TEXT_MUTED,
-                    TextAlign::Left,
-                    true,
-                    false,
-                );
-                y += 26.0;
-                let has_qr = self.netease_qr.is_some();
-                let card_h = if has_qr { 346.0 } else { 176.0 };
-                let g_ne = RectF::new(x0, y, cw, card_h);
-                r.fill_rounded_rect(g_ne, 14.0, Theme::BG_ELEVATED);
-                r.stroke_rounded_rect(g_ne, 14.0, Theme::SEPARATOR, 1.0);
-
-                // Row 1a: Title + Action Buttons
-                r.draw_text(
-                    "网易云账号",
-                    RectF::new(x0 + 18.0, y + 14.0, 120.0, 26.0),
-                    14.0,
-                    600,
-                    Theme::TEXT_PRIMARY,
-                    TextAlign::Left,
-                    true,
-                    false,
-                );
-                let mut nx = x0 + cw - 18.0;
-                for (lbl, bw, tinted, act) in [
-                    ("退出", 48.0f32, false, UiAction::ClearNetEaseAuth),
-                    ("网页端", 56.0, false, UiAction::OpenWebNetEase),
-                    ("粘贴 Cookie", 84.0, false, UiAction::PasteNetEaseCookie),
-                    ("扫码登录", 74.0, true, UiAction::StartNetEaseQrLogin),
-                    (
-                        "一起听",
-                        62.0,
-                        self.listen_together.in_room,
-                        UiAction::OpenListenTogetherModal,
-                    ),
-                ] {
-                    nx -= bw;
-                    let br = RectF::new(nx, y + 13.0, bw, 28.0);
-                    let bhov = self.mouse_pos.1 >= TOP_BAR_GUARD_H
-                        && br.contains(self.mouse_pos.0, self.mouse_pos.1);
-                    r.draw_liquid_glass_button(
-                        br,
-                        8.5,
-                        if tinted {
-                            GlassBtnVariant::Tinted(active_be.accent_color())
-                        } else {
-                            GlassBtnVariant::Regular
-                        },
-                        bhov,
-                        self.mouse_down,
-                        self.mouse_pos,
-                        self.glass_off(),
-                    );
-                    r.draw_text(
-                        lbl,
-                        br,
-                        12.0,
-                        if bhov || tinted { 600 } else { 500 },
-                        Theme::TEXT_PRIMARY,
-                        TextAlign::Center,
-                        true,
-                        false,
-                    );
-                    self.hit_regions.push(HitRegion { rect: br, action: act });
-                    nx -= 6.0;
-                }
-
-                // Row 1b: VIP Tier/Level Badge + Live Account Status
-                let status_y = y + 46.0;
-                let mut status_x = x0 + 18.0;
-                if self.netease_account.logged_in {
-                    let vip_lbl = if self.netease_account.vip_label.trim().is_empty() {
-                        if self.netease_account.is_vip {
-                            "黑胶 VIP"
-                        } else {
-                            "普通用户"
-                        }
-                    } else {
-                        self.netease_account.vip_label.as_str()
-                    };
-                    let pill_w = (vip_lbl.chars().count() as f32 * 9.8 + 20.0).clamp(64.0, 148.0);
-                    let pill = RectF::new(status_x, status_y + 1.0, pill_w, 22.0);
-                    if self.netease_account.is_vip {
-                        r.fill_rounded_rect(pill, 11.0, Color::rgba(232, 178, 68, 0.22));
-                        r.stroke_rounded_rect(pill, 11.0, Color::rgba(246, 198, 96, 0.65), 1.0);
-                        r.draw_text(
-                            vip_lbl,
-                            pill,
-                            11.2,
-                            700,
-                            Color::rgb(252, 214, 124),
-                            TextAlign::Center,
-                            true,
-                            false,
-                        );
-                    } else {
-                        r.fill_rounded_rect(pill, 11.0, Color::rgba(255, 255, 255, 0.08));
-                        r.stroke_rounded_rect(pill, 11.0, Theme::SEPARATOR, 1.0);
-                        r.draw_text(
-                            vip_lbl,
-                            pill,
-                            11.2,
-                            500,
-                            Theme::TEXT_SECONDARY,
-                            TextAlign::Center,
-                            true,
-                            false,
-                        );
-                    }
-                    status_x = pill.right() + 10.0;
-                }
-                r.draw_text(
-                    &self.netease_account.message,
-                    RectF::new(status_x, status_y, (x0 + cw - 18.0 - status_x).max(120.0), 24.0),
-                    12.2,
-                    500,
-                    if self.netease_account.logged_in {
-                        Theme::SIGNAL_GREEN
-                    } else {
-                        Theme::TEXT_SECONDARY
-                    },
-                    TextAlign::Left,
-                    true,
-                    false,
-                );
-
-                // Inline Native Direct2D QR Code Login Panel!
-                let mut q_row_y = y + 80.0;
-                if let Some(ref qr) = self.netease_qr {
-                    r.draw_line(x0 + 18.0, y + 74.0, x0 + cw - 18.0, y + 74.0, Theme::SEPARATOR, 1.0);
-                    let qr_box = RectF::new(x0 + 24.0, y + 86.0, 148.0, 148.0);
-                    r.fill_rounded_rect(qr_box, 10.0, Color::rgba(255, 255, 255, 0.98));
-                    if qr.qr_width > 0 && qr.qr_modules.len() == qr.qr_width * qr.qr_width {
-                        let quiet = 10.0;
-                        let cell = (qr_box.w - quiet * 2.0) / (qr.qr_width as f32);
-                        let dark = Color::rgba(14, 16, 20, 1.0);
-                        for row_i in 0..qr.qr_width {
-                            for col_i in 0..qr.qr_width {
-                                if qr.qr_modules[row_i * qr.qr_width + col_i] {
-                                    r.fill_rect(
-                                        RectF::new(
-                                            qr_box.x + quiet + (col_i as f32) * cell,
-                                            qr_box.y + quiet + (row_i as f32) * cell,
-                                            cell + 0.25,
-                                            cell + 0.25,
-                                        ),
-                                        dark,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    let info_x = qr_box.right() + 20.0;
-                    let info_w = (x0 + cw - 18.0 - info_x).max(160.0);
-                    r.draw_text(
-                        "打开手机「网易云音乐」扫一扫",
-                        RectF::new(info_x, y + 94.0, info_w, 24.0),
-                        15.0,
-                        600,
-                        Theme::TEXT_PRIMARY,
-                        TextAlign::Left,
-                        true,
-                        false,
-                    );
-                    r.draw_text(
-                        &qr.status_text,
-                        RectF::new(info_x, y + 124.0, info_w, 24.0),
-                        13.0,
-                        500,
-                        if qr.status_code == 802 {
-                            Theme::SIGNAL_GREEN
-                        } else if qr.status_code == 800 {
-                            Theme::ACCENT_RED
-                        } else {
-                            Theme::SIGNAL_AMBER
-                        },
-                        TextAlign::Left,
-                        true,
-                        false,
-                    );
-                    r.draw_text(
-                        "扫码确认后自动获取 MUSIC_U 并同步你的自建/收藏歌单、每日推荐与 VIP 音质。",
-                        RectF::new(info_x, y + 152.0, info_w, 36.0),
-                        11.6,
-                        400,
-                        Theme::TEXT_SECONDARY,
-                        TextAlign::Left,
-                        false,
-                        true,
-                    );
-                    let ref_btn = RectF::new(info_x, y + 200.0, 96.0, 28.0);
-                    let ref_hov = ref_btn.contains(self.mouse_pos.0, self.mouse_pos.1);
-                    r.draw_liquid_glass_button(ref_btn, 8.0, GlassBtnVariant::Regular, ref_hov, self.mouse_down, self.mouse_pos, self.glass_off());
-                    r.draw_text("刷新二维码", ref_btn, 12.0, 500, Theme::TEXT_PRIMARY, TextAlign::Center, true, false);
-                    self.hit_regions.push(HitRegion { rect: ref_btn, action: UiAction::StartNetEaseQrLogin });
-
-                    let cls_btn = RectF::new(ref_btn.right() + 8.0, y + 200.0, 68.0, 28.0);
-                    let cls_hov = cls_btn.contains(self.mouse_pos.0, self.mouse_pos.1);
-                    r.draw_liquid_glass_button(cls_btn, 8.0, GlassBtnVariant::Regular, cls_hov, self.mouse_down, self.mouse_pos, self.glass_off());
-                    r.draw_text("收起", cls_btn, 12.0, 500, Theme::TEXT_SECONDARY, TextAlign::Center, true, false);
-                    self.hit_regions.push(HitRegion { rect: cls_btn, action: UiAction::CancelNetEaseQrLogin });
-
-                    q_row_y = y + 248.0;
-                }
-
-                r.draw_line(x0 + 18.0, q_row_y - 8.0, x0 + cw - 18.0, q_row_y - 8.0, Theme::SEPARATOR, 1.0);
-                r.draw_text(
-                    "网易云音质",
-                    RectF::new(x0 + 18.0, q_row_y + 4.0, 120.0, 26.0),
-                    14.0,
-                    600,
-                    Theme::TEXT_PRIMARY,
-                    TextAlign::Left,
-                    true,
-                    false,
-                );
-                let mut qx = x0 + cw - 18.0 - (96.0 * 4.0 + 8.0 * 3.0);
-                for &q in &NetEaseQuality::ALL {
-                    let sel = self.settings.netease_quality == q;
-                    let br = RectF::new(qx, q_row_y + 3.0, 96.0, 28.0);
-                    let bhov = br.contains(self.mouse_pos.0, self.mouse_pos.1);
-                    r.draw_liquid_glass_button(
-                        br,
-                        8.5,
-                        if sel {
-                            GlassBtnVariant::Tinted(active_be.accent_color())
-                        } else {
-                            GlassBtnVariant::Regular
-                        },
-                        bhov,
-                        self.mouse_down,
-                        self.mouse_pos,
-                        self.glass_off(),
-                    );
-                    r.draw_text(
-                        q.label(),
-                        br,
-                        11.8,
-                        if sel || bhov { 600 } else { 400 },
-                        Theme::TEXT_PRIMARY,
-                        TextAlign::Center,
-                        true,
-                        false,
-                    );
-                    self.hit_regions.push(HitRegion {
-                        rect: br,
-                        action: UiAction::SetNetEaseQuality(q),
-                    });
-                    qx += 104.0;
-                }
-                r.draw_text(
-                    "音频通过 MediaFoundation + WASAPI 原生直出，自动优先加载网易云精确曲目 ID 逐字歌词 (YRC) 与翻译。",
-                    RectF::new(x0 + 18.0, q_row_y + 44.0, cw - 36.0, 22.0),
-                    11.4,
-                    400,
-                    Theme::TEXT_MUTED,
-                    TextAlign::Left,
-                    true,
-                    false,
-                );
-                y += card_h + 20.0;
-            }
-            PlaybackBackend::QQMusic => {
-                r.draw_text(
-                    "QQ 音乐账号与音质",
-                    RectF::new(x0 + 4.0, y, cw, 22.0),
-                    13.0,
-                    600,
-                    Theme::TEXT_MUTED,
-                    TextAlign::Left,
-                    true,
-                    false,
-                );
-                y += 26.0;
-                let g_qq = RectF::new(x0, y, cw, 156.0);
-                r.fill_rounded_rect(g_qq, 14.0, Theme::BG_ELEVATED);
-                r.stroke_rounded_rect(g_qq, 14.0, Theme::SEPARATOR, 1.0);
-
-                r.draw_text(
-                    "QQ 音乐账号",
-                    RectF::new(x0 + 18.0, y + 14.0, 102.0, 26.0),
-                    14.0,
-                    600,
-                    Theme::TEXT_PRIMARY,
-                    TextAlign::Left,
-                    true,
-                    false,
-                );
-                r.draw_text(
-                    &self.qq_account.message,
-                    RectF::new(x0 + 120.0, y + 14.0, cw - 380.0, 26.0),
-                    12.2,
-                    500,
-                    if self.qq_account.logged_in {
-                        Theme::SIGNAL_GREEN
-                    } else {
-                        Theme::TEXT_SECONDARY
-                    },
-                    TextAlign::Left,
-                    true,
-                    false,
-                );
-                let mut qbx = x0 + cw - 18.0;
-                for (lbl, bw, tinted, act) in [
-                    ("清除", 52.0f32, false, UiAction::ClearQQAuth),
-                    ("打开 y.qq.com", 94.0, false, UiAction::OpenWebQQMusic),
-                    ("粘贴 Cookie", 92.0, true, UiAction::PasteQQCookie),
-                ] {
-                    qbx -= bw;
-                    let br = RectF::new(qbx, y + 13.0, bw, 28.0);
-                    let bhov = self.mouse_pos.1 >= TOP_BAR_GUARD_H
-                        && br.contains(self.mouse_pos.0, self.mouse_pos.1);
-                    r.draw_liquid_glass_button(
-                        br,
-                        8.5,
-                        if tinted {
-                            GlassBtnVariant::Tinted(active_be.accent_color())
-                        } else {
-                            GlassBtnVariant::Regular
-                        },
-                        bhov,
-                        self.mouse_down,
-                        self.mouse_pos,
-                        self.glass_off(),
-                    );
-                    r.draw_text(
-                        lbl,
-                        br,
-                        12.0,
-                        if bhov || tinted { 600 } else { 500 },
-                        Theme::TEXT_PRIMARY,
-                        TextAlign::Center,
-                        true,
-                        false,
-                    );
-                    self.hit_regions.push(HitRegion { rect: br, action: act });
-                    qbx -= 6.0;
-                }
-                r.draw_line(x0 + 18.0, y + 52.0, x0 + cw - 18.0, y + 52.0, Theme::SEPARATOR, 1.0);
-
-                r.draw_text(
-                    "QQ 音乐音质",
-                    RectF::new(x0 + 18.0, y + 66.0, 120.0, 26.0),
-                    14.0,
-                    600,
-                    Theme::TEXT_PRIMARY,
-                    TextAlign::Left,
-                    true,
-                    false,
-                );
-                let mut qx = x0 + cw - 18.0 - (98.0 * 4.0 + 8.0 * 3.0);
-                for &q in &QQQuality::ALL {
-                    let sel = self.settings.qq_quality == q;
-                    let br = RectF::new(qx, y + 65.0, 98.0, 28.0);
-                    let bhov = br.contains(self.mouse_pos.0, self.mouse_pos.1);
-                    r.draw_liquid_glass_button(
-                        br,
-                        8.5,
-                        if sel {
-                            GlassBtnVariant::Tinted(active_be.accent_color())
-                        } else {
-                            GlassBtnVariant::Regular
-                        },
-                        bhov,
-                        self.mouse_down,
-                        self.mouse_pos,
-                        self.glass_off(),
-                    );
-                    r.draw_text(
-                        q.label(),
-                        br,
-                        11.8,
-                        if sel || bhov { 600 } else { 400 },
-                        Theme::TEXT_PRIMARY,
-                        TextAlign::Center,
-                        true,
-                        false,
-                    );
-                    self.hit_regions.push(HitRegion {
-                        rect: br,
-                        action: UiAction::SetQQQuality(q),
-                    });
-                    qx += 106.0;
-                }
-                r.draw_text(
-                    "粘贴包含 uin 与 qm_keyst 的浏览器 Cookie 可同步个人「我喜欢」与歌单；若选高音质无权限会自动平滑降级播放。",
-                    RectF::new(x0 + 18.0, y + 108.0, cw - 36.0, 34.0),
-                    11.4,
-                    400,
-                    Theme::TEXT_MUTED,
-                    TextAlign::Left,
-                    false,
-                    true,
-                );
-                y += 176.0;
-            }
-            PlaybackBackend::ExternalSmtc => {
-                r.draw_text(
-                    "通用外置播放器接管 (Windows SMTC)",
-                    RectF::new(x0 + 4.0, y, cw, 22.0),
-                    13.0,
-                    600,
-                    Theme::TEXT_MUTED,
-                    TextAlign::Left,
-                    true,
-                    false,
-                );
-                y += 26.0;
-                let g_sm = RectF::new(x0, y, cw, 82.0);
-                r.fill_rounded_rect(g_sm, 14.0, Theme::BG_ELEVATED);
-                r.stroke_rounded_rect(g_sm, 14.0, Theme::SEPARATOR, 1.0);
-                let live_lbl = if self.smtc.active && !self.smtc.title.is_empty() {
-                    format!(
-                        "当前接管：{} — {} ({})",
-                        self.smtc.title,
-                        self.smtc.artist,
-                        if self.smtc.app_id.is_empty() { "系统媒体" } else { &self.smtc.app_id }
-                    )
-                } else {
-                    "尚未检测到活跃的外部媒体会话（在 Spotify / 网易云客户端 / QQ 音乐客户端 / 浏览器播放即可自动接管）".to_string()
-                };
-                r.draw_text(
-                    &live_lbl,
-                    RectF::new(x0 + 18.0, y + 16.0, cw - 36.0, 22.0),
-                    12.8,
-                    500,
-                    if self.smtc.active { Theme::SIGNAL_GREEN } else { Theme::TEXT_SECONDARY },
-                    TextAlign::Left,
-                    true,
-                    false,
-                );
-                r.draw_text(
-                    "此模式不会抢占音频焦点，完整保留 AM Light 的逐字滚动歌词与实时音频可视化分析。",
-                    RectF::new(x0 + 18.0, y + 46.0, cw - 36.0, 20.0),
-                    11.4,
-                    400,
-                    Theme::TEXT_MUTED,
-                    TextAlign::Left,
-                    true,
-                    false,
-                );
-                y += 102.0;
-            }
-            PlaybackBackend::AppleMusicNative => {}
-        }
-
-        // --- Group 1: Apple Music 账号与地区 (Shown for Apple Music Native & Web backends) ---
-        if active_be.is_apple_music() {
-        r.draw_text(
-            "Apple Music 账号与地区",
-            RectF::new(x0 + 4.0, y, cw, 22.0),
-            13.0,
-            600,
-            Theme::TEXT_MUTED,
-            TextAlign::Left,
-            true,
-            false,
-        );
-        y += 26.0;
-
-        let g_acct = RectF::new(x0, y, cw, 212.0);
-        r.fill_rounded_rect(g_acct, 14.0, Theme::BG_ELEVATED);
-        r.stroke_rounded_rect(g_acct, 14.0, Theme::SEPARATOR, 1.0);
-
-        // Row 1: Official Apple Music Desktop Client Login Status
-        r.draw_text(
-            "原装客户端账号",
-            RectF::new(x0 + 18.0, y + 14.0, 136.0, 26.0),
-            14.0,
-            600,
-            Theme::TEXT_PRIMARY,
-            TextAlign::Left,
-            true,
-            false,
-        );
-        let off_desc = if self.official_account.signed_in {
-            let mut parts = Vec::new();
-            parts.push("已读取登录".to_string());
-            if let Some(ref n) = self.official_account.display_name {
-                parts.push(n.clone());
-            }
-            if let Some(ref sf) = self.official_account.storefront {
-                parts.push(format!("{} 区", sf.to_uppercase()));
-            }
-            if self.official_account.subscription_active {
-                parts.push("订阅有效（可直接播放）".to_string());
-            }
-            parts.join(" · ")
-        } else {
-            "未检测到桌面版 Apple Music 登录记录".to_string()
-        };
-        r.draw_text(
-            &off_desc,
-            RectF::new(x0 + 154.0, y + 14.0, cw - 284.0, 26.0),
+            title,
+            RectF::new(cx + 18.0, y, cw - 36.0, 20.0),
             12.5,
-            500,
-            if self.official_account.signed_in {
-                Theme::SIGNAL_GREEN
-            } else {
-                Theme::TEXT_SECONDARY
-            },
-            TextAlign::Left,
-            true,
-            false,
-        );
-        let sync_btn = RectF::new(x0 + cw - 118.0, y + 13.0, 100.0, 28.0);
-        let sync_hov = sync_btn.contains(self.mouse_pos.0, self.mouse_pos.1);
-        r.draw_liquid_glass_button(
-            sync_btn,
-            8.5,
-            GlassBtnVariant::Regular,
-            sync_hov,
-            self.mouse_down,
-            self.mouse_pos,
-            self.glass_off(),
-        );
-        r.draw_text(
-            "同步原装端",
-            sync_btn,
-            12.0,
-            if sync_hov { 600 } else { 500 },
-            Theme::TEXT_PRIMARY,
-            TextAlign::Center,
-            true,
-            false,
-        );
-        self.hit_regions.push(HitRegion {
-            rect: sync_btn,
-            action: UiAction::SyncOfficialClientAccount,
-        });
-        r.draw_line(x0 + 18.0, y + 52.0, x0 + cw - 18.0, y + 52.0, Theme::SEPARATOR, 1.0);
-
-        // Row 2: Storefront Selector
-        r.draw_text(
-            "内容地区",
-            RectF::new(x0 + 18.0, y + 64.0, 110.0, 26.0),
-            14.0,
             600,
-            Theme::TEXT_PRIMARY,
+            Color::rgba(255, 255, 255, 0.50),
             TextAlign::Left,
             true,
             false,
         );
-        let regions = ["cn", "hk", "tw", "jp", "kr", "us", "gb", "sg"];
-        let mut sx = x0 + cw - 18.0 - (45.0 * (regions.len() as f32) + 6.0 * ((regions.len() - 1) as f32));
-        for &code in &regions {
-            let sel = self.settings.storefront == code;
-            let sr = RectF::new(sx, y + 64.0, 45.0, 26.0);
-            let shov = sr.contains(self.mouse_pos.0, self.mouse_pos.1);
-            r.draw_liquid_glass_button(
-                sr,
-                7.5,
-                if sel {
-                    GlassBtnVariant::Tinted(Theme::ACCENT_RED)
-                } else {
-                    GlassBtnVariant::Regular
-                },
-                shov,
-                self.mouse_down,
-                self.mouse_pos,
-                self.glass_off(),
-            );
-            r.draw_mono_text(
-                &code.to_uppercase(),
-                sr,
-                11.6,
-                600,
-                Theme::TEXT_PRIMARY,
-                TextAlign::Center,
-                true,
-            );
-            self.hit_regions.push(HitRegion {
-                rect: sr,
-                action: UiAction::SetStorefront(code.to_string()),
-            });
-            sx += 51.0;
-        }
-        r.draw_line(x0 + 18.0, y + 102.0, x0 + cw - 18.0, y + 102.0, Theme::SEPARATOR, 1.0);
+        y + 27.0
+    }
 
-        // Row 3: Personal Library Token Input Box + Liquid Glass Action Buttons
-        let tok_status = if self.settings.user_token.is_empty() {
-            "个人资料库授权 (Media-User-Token)：未配置".to_string()
-        } else {
-            format!(
-                "个人资料库授权：已持久保存 ({} 字符)",
-                self.settings.user_token.len()
-            )
-        };
+    fn draw_ipad_section_footer(
+        r: &mut D2DRenderer,
+        cx: f32,
+        y: f32,
+        cw: f32,
+        text: &str,
+        box_h: f32,
+    ) -> f32 {
         r.draw_text(
-            &tok_status,
-            RectF::new(x0 + 18.0, y + 112.0, cw - 330.0, 22.0),
-            13.6,
-            600,
-            Theme::TEXT_PRIMARY,
-            TextAlign::Left,
-            true,
-            false,
-        );
-
-        let mut bx = x0 + cw - 18.0;
-        for (lbl, bw, act) in [
-            ("清除", 52.0f32, UiAction::ClearUserToken),
-            ("验证", 52.0, UiAction::VerifyUserToken),
-            ("打开网页端", 84.0, UiAction::OpenWebAppleMusic),
-            ("粘贴保存", 84.0, UiAction::PasteUserToken),
-        ] {
-            bx -= bw;
-            let br = RectF::new(bx, y + 110.0, bw, 28.0);
-            let bhov = br.contains(self.mouse_pos.0, self.mouse_pos.1);
-            r.draw_liquid_glass_button(
-                br,
-                8.5,
-                if lbl == "粘贴保存" {
-                    GlassBtnVariant::Tinted(Theme::ACCENT_RED)
-                } else {
-                    GlassBtnVariant::Regular
-                },
-                bhov,
-                self.mouse_down,
-                self.mouse_pos,
-                self.glass_off(),
-            );
-            r.draw_text(
-                lbl,
-                br,
-                12.0,
-                if bhov || lbl == "粘贴保存" { 600 } else { 500 },
-                Theme::TEXT_PRIMARY,
-                TextAlign::Center,
-                true,
-                false,
-            );
-            self.hit_regions.push(HitRegion {
-                rect: br,
-                action: act,
-            });
-            bx -= 7.0;
-        }
-
-        // Interactive Clickable Token Input Box (hover highlight + click-to-Ctrl+V!)
-        let tbox = RectF::new(x0 + 18.0, y + 148.0, cw - 36.0, 36.0);
-        self.token_box_rect = tbox;
-        let tbox_hov = tbox.contains(self.mouse_pos.0, self.mouse_pos.1);
-        r.fill_rounded_rect(
-            tbox,
-            8.5,
-            if tbox_hov {
-                Color::rgba(22, 22, 28, 0.92)
-            } else {
-                Color::rgba(14, 14, 18, 0.85)
-            },
-        );
-        r.stroke_rounded_rect(
-            tbox,
-            8.5,
-            if self.token_box_focused {
-                Theme::ACCENT_RED
-            } else if tbox_hov {
-                Color::rgba(255, 255, 255, 0.34)
-            } else if !self.settings.user_token.is_empty() {
-                Theme::SIGNAL_GREEN.with_alpha(0.55)
-            } else {
-                Theme::SEPARATOR
-            },
-            if self.token_box_focused || tbox_hov { 1.4 } else { 1.0 },
-        );
-        let box_text = if !self.settings.user_token.is_empty() {
-            let masked = am_api::mask_user_token_preview(&self.settings.user_token);
-            if self.token_box_focused {
-                format!("{masked}   (按 Ctrl+V 可覆盖更新)")
-            } else {
-                format!("已保存：{masked}   (重启后自动保留 · 点击可按 Ctrl+V 更新)")
-            }
-        } else if self.token_box_focused {
-            "请按 Ctrl+V 粘贴 Media-User-Token 或完整 Cookie 字符串...".to_string()
-        } else {
-            "点击此处按 Ctrl+V 粘贴 Media-User-Token（用于同步云端歌单与收藏专辑）".to_string()
-        };
-        r.draw_mono_text(
-            &box_text,
-            tbox.inset(12.0, 0.0),
-            12.0,
-            if self.settings.user_token.is_empty() { 400 } else { 500 },
-            if !self.settings.user_token.is_empty() {
-                Theme::SIGNAL_GREEN
-            } else if self.token_box_focused || tbox_hov {
-                Theme::TEXT_PRIMARY
-            } else {
-                Theme::TEXT_SECONDARY
-            },
-            TextAlign::Left,
-            true,
-        );
-        self.hit_regions.push(HitRegion {
-            rect: tbox,
-            action: UiAction::FocusTokenBox,
-        });
-
-        if let Some(ref ar) = self.auth_result {
-            r.draw_text(
-                &ar.message,
-                RectF::new(x0 + 18.0, y + 188.0, cw - 36.0, 18.0),
-                11.4,
-                400,
-                if ar.user_token_ok {
-                    Theme::SIGNAL_GREEN
-                } else {
-                    Theme::TEXT_SECONDARY
-                },
-                TextAlign::Left,
-                true,
-                false,
-            );
-        }
-
-        y += 232.0;
-        } // end if active_be.is_apple_music()
-
-        // --- Group 1.5: 播放故障诊断与 DRM 修复 (Apple Music 原生模式专属) ---
-        if active_be == PlaybackBackend::AppleMusicNative {
-        r.draw_text(
-            "播放故障诊断与 DRM 修复",
-            RectF::new(x0 + 4.0, y, cw, 22.0),
-            13.0,
-            600,
-            Theme::TEXT_MUTED,
-            TextAlign::Left,
-            true,
-            false,
-        );
-        y += 26.0;
-
-        let g_drm = RectF::new(x0, y, cw, 102.0);
-        r.fill_rounded_rect(g_drm, 14.0, Theme::BG_ELEVATED);
-        r.stroke_rounded_rect(g_drm, 14.0, Theme::SEPARATOR, 1.0);
-
-        let drm_text_w = (cw - 294.0).max(160.0);
-        r.draw_text(
-            "原版 Apple Music 无法播放 / 点歌秒切修复",
-            RectF::new(x0 + 18.0, y + 14.0, drm_text_w, 22.0),
-            14.0,
-            600,
-            Theme::TEXT_PRIMARY,
-            TextAlign::Left,
-            true,
-            false,
-        );
-        let (sum_txt, sum_col) = if !self.drm_diag.checked {
-            (
-                "正在检测 Anisette / ADI 设备身份与权限状态...",
-                Theme::TEXT_SECONDARY,
-            )
-        } else if !self.drm_diag.healthy {
-            (self.drm_diag.summary.as_str(), Theme::ACCENT_RED)
-        } else if !self.drm_diag.hklm_redirections.is_empty() {
-            (self.drm_diag.summary.as_str(), Theme::SIGNAL_AMBER)
-        } else {
-            (self.drm_diag.summary.as_str(), Theme::SIGNAL_GREEN)
-        };
-        r.draw_text(
-            sum_txt,
-            RectF::new(x0 + 18.0, y + 44.0, cw - 36.0, 20.0),
-            12.2,
-            500,
-            sum_col,
-            TextAlign::Left,
-            true,
-            false,
-        );
-        let det_txt = if self.drm_diag.checked {
-            self.drm_diag.detail.as_str()
-        } else {
-            "支持无管理员权限快速检测，或一键备份并修复目录写入权限与第三方重定向"
-        };
-        r.draw_text(
-            det_txt,
-            RectF::new(x0 + 18.0, y + 68.0, cw - 36.0, 20.0),
-            11.4,
-            400,
-            Theme::TEXT_SECONDARY,
-            TextAlign::Left,
-            true,
-            false,
-        );
-
-        let need_fix = self.drm_diag.checked
-            && (!self.drm_diag.healthy || !self.drm_diag.hklm_redirections.is_empty());
-        let repair_lbl = if self.drm_repair_running {
-            "修复中..."
-        } else {
-            "一键修复"
-        };
-        let mut dx = x0 + cw - 18.0;
-        for (lbl, bw, tinted, act) in [
-            (repair_lbl, 86.0f32, need_fix, UiAction::RunDrmRepair),
-            ("重新检测", 78.0, false, UiAction::CheckDrmHealth),
-            ("项目主页", 78.0, false, UiAction::OpenDrmFixRepo),
-        ] {
-            dx -= bw;
-            let br = RectF::new(dx, y + 12.0, bw, 28.0);
-            let bhov = self.mouse_pos.1 >= TOP_BAR_GUARD_H
-                && br.contains(self.mouse_pos.0, self.mouse_pos.1);
-            r.draw_liquid_glass_button(
-                br,
-                8.5,
-                if tinted {
-                    GlassBtnVariant::Tinted(Theme::ACCENT_RED)
-                } else {
-                    GlassBtnVariant::Regular
-                },
-                bhov,
-                self.mouse_down,
-                self.mouse_pos,
-                self.glass_off(),
-            );
-            r.draw_text(
-                lbl,
-                br,
-                12.0,
-                if bhov || tinted { 600 } else { 500 },
-                Theme::TEXT_PRIMARY,
-                TextAlign::Center,
-                true,
-                false,
-            );
-            self.hit_regions.push(HitRegion {
-                rect: br,
-                action: act,
-            });
-            dx -= 7.0;
-        }
-
-        y += 122.0;
-        } // end if active_be == PlaybackBackend::AppleMusicNative
-
-        // --- Group 2: 音频与播放 (Restrained phrasing; Spatial/Atmos hidden by default below!) ---
-        r.draw_text(
-            "音频与播放",
-            RectF::new(x0 + 4.0, y, cw, 22.0),
-            13.0,
-            600,
-            Theme::TEXT_MUTED,
-            TextAlign::Left,
-            true,
-            false,
-        );
-        y += 26.0;
-
-        let g_aud = RectF::new(x0, y, cw, 212.0);
-        r.fill_rounded_rect(g_aud, 14.0, Theme::BG_ELEVATED);
-        r.stroke_rounded_rect(g_aud, 14.0, Theme::SEPARATOR, 1.0);
-
-        // Row 1: Streaming Quality
-        r.draw_text(
-            "音频质量",
-            RectF::new(x0 + 18.0, y + 16.0, 160.0, 26.0),
-            14.2,
-            600,
-            Theme::TEXT_PRIMARY,
-            TextAlign::Left,
-            true,
-            false,
-        );
-        let q_opts = [
-            ("Hi-Res 无损 (24/192)", true, 20i64, 146.0f32),
-            ("无损 (24/48)", true, 15, 108.0),
-            ("高质量 AAC", false, 10, 98.0),
-        ];
-        let mut qx = x0 + cw - 18.0 - (146.0 + 108.0 + 98.0 + 16.0);
-        for &(lbl, loss, qv, bw) in &q_opts {
-            let sel = if !loss {
-                !self.audio_prefs.lossless_enabled
-            } else {
-                self.audio_prefs.lossless_enabled && self.audio_prefs.streaming_audio_quality == qv
-            };
-            let br = RectF::new(qx, y + 15.0, bw, 28.0);
-            let bhov = br.contains(self.mouse_pos.0, self.mouse_pos.1);
-            r.draw_liquid_glass_button(
-                br,
-                8.5,
-                if sel {
-                    GlassBtnVariant::Tinted(Theme::ACCENT_RED)
-                } else {
-                    GlassBtnVariant::Regular
-                },
-                bhov,
-                self.mouse_down,
-                self.mouse_pos,
-                self.glass_off(),
-            );
-            r.draw_text(
-                lbl,
-                br,
-                12.0,
-                if sel || bhov { 600 } else { 400 },
-                Theme::TEXT_PRIMARY,
-                TextAlign::Center,
-                true,
-                false,
-            );
-            self.hit_regions.push(HitRegion {
-                rect: br,
-                action: UiAction::SetStreamingQuality {
-                    lossless: loss,
-                    quality: qv,
-                },
-            });
-            qx += bw + 8.0;
-        }
-        r.draw_line(x0 + 18.0, y + 56.0, x0 + cw - 18.0, y + 56.0, Theme::SEPARATOR, 1.0);
-
-        // Row 2: Output Audio Device
-        let def_dev = self
-            .devices
-            .iter()
-            .find(|d| d.is_default)
-            .map(|d| format!("{} ({:.1}kHz/{}bit)", d.name, d.sample_rate as f32 / 1000.0, d.bit_depth))
-            .unwrap_or_else(|| "系统默认输出设备".to_string());
-        r.draw_text(
-            "音频输出设备",
-            RectF::new(x0 + 18.0, y + 68.0, 140.0, 26.0),
-            14.2,
-            600,
-            Theme::TEXT_PRIMARY,
-            TextAlign::Left,
-            true,
-            false,
-        );
-        let dev_pill = RectF::new(x0 + cw - 338.0, y + 67.0, 320.0, 28.0);
-        let dev_hov = self.devices.len() > 1 && dev_pill.contains(self.mouse_pos.0, self.mouse_pos.1);
-        r.draw_liquid_glass_button(
-            dev_pill,
-            8.5,
-            GlassBtnVariant::Regular,
-            dev_hov,
-            self.mouse_down,
-            self.mouse_pos,
-            self.glass_off(),
-        );
-        r.draw_text(
-            &def_dev,
-            dev_pill.inset(10.0, 0.0),
-            12.0,
-            if dev_hov { 600 } else { 500 },
-            Theme::TEXT_PRIMARY,
-            TextAlign::Center,
-            true,
-            false,
-        );
-        if self.devices.len() > 1 {
-            let cur_i = self.devices.iter().position(|d| d.is_default).unwrap_or(0);
-            let next_id = self.devices[(cur_i + 1) % self.devices.len()].id.clone();
-            self.hit_regions.push(HitRegion {
-                rect: dev_pill,
-                action: UiAction::SelectOutputDevice(next_id),
-            });
-        }
-        r.draw_line(x0 + 18.0, y + 108.0, x0 + cw - 18.0, y + 108.0, Theme::SEPARATOR, 1.0);
-
-        // Row 3: Calm Playback Mode (`内置播放服务` vs `Apple Music 应用` + optional session release)
-        r.draw_text(
-            "播放方式",
-            RectF::new(x0 + 18.0, y + 118.0, 140.0, 24.0),
-            14.2,
-            600,
-            Theme::TEXT_PRIMARY,
-            TextAlign::Left,
-            true,
-            false,
-        );
-        let svc_sub = if self.agent_status.connected {
-            "内置服务已连接"
-        } else {
-            "按需自动连接"
-        };
-        r.draw_text(
-            svc_sub,
-            RectF::new(x0 + 18.0, y + 140.0, 150.0, 18.0),
+            text,
+            RectF::new(cx + 18.0, y + 6.0, cw - 36.0, box_h),
             11.8,
             400,
-            Theme::TEXT_SECONDARY,
+            Color::rgba(255, 255, 255, 0.44),
             TextAlign::Left,
-            true,
             false,
-        );
-        if self.agent_status.connected {
-            let rel_btn = RectF::new(x0 + 132.0, y + 137.0, 72.0, 23.0);
-            let rel_hov = rel_btn.contains(self.mouse_pos.0, self.mouse_pos.1);
-            r.draw_liquid_glass_button(
-                rel_btn,
-                6.5,
-                GlassBtnVariant::Regular,
-                rel_hov,
-                self.mouse_down,
-                self.mouse_pos,
-                self.glass_off(),
-            );
-            r.draw_text(
-                "释放会话",
-                rel_btn,
-                11.0,
-                if rel_hov { 600 } else { 500 },
-                if rel_hov {
-                    Theme::TEXT_PRIMARY
-                } else {
-                    Theme::TEXT_SECONDARY
-                },
-                TextAlign::Center,
-                true,
-                false,
-            );
-            self.hit_regions.push(HitRegion {
-                rect: rel_btn,
-                action: UiAction::DisconnectBuiltinService,
-            });
-        }
-
-        let m1 = RectF::new(x0 + cw - 246.0, y + 122.0, 110.0, 28.0);
-        let m2 = RectF::new(x0 + cw - 128.0, y + 122.0, 110.0, 28.0);
-        for (mr, lbl, val) in [(m1, "内置播放服务", true), (m2, "Apple Music 应用", false)] {
-            let sel = self.settings.use_builtin_service == val;
-            let mhov = mr.contains(self.mouse_pos.0, self.mouse_pos.1);
-            r.draw_liquid_glass_button(
-                mr,
-                8.5,
-                if sel {
-                    GlassBtnVariant::Tinted(Theme::ACCENT_RED)
-                } else {
-                    GlassBtnVariant::Regular
-                },
-                mhov,
-                self.mouse_down,
-                self.mouse_pos,
-                self.glass_off(),
-            );
-            r.draw_text(
-                lbl,
-                mr,
-                12.0,
-                if sel || mhov { 600 } else { 400 },
-                Theme::TEXT_PRIMARY,
-                TextAlign::Center,
-                true,
-                false,
-            );
-            self.hit_regions.push(HitRegion {
-                rect: mr,
-                action: UiAction::SetUseBuiltinService(val),
-            });
-        }
-        r.draw_line(x0 + 18.0, y + 164.0, x0 + cw - 18.0, y + 164.0, Theme::SEPARATOR, 1.0);
-
-        // Row 4: Sound Check & Crossfade compact toggles
-        self.draw_toggle_row(
-            r,
-            RectF::new(x0 + 18.0, y + 170.0, (cw - 52.0) * 0.5, 36.0),
-            "音量平衡",
-            "",
-            self.audio_prefs.sound_check_enabled,
-            UiAction::ToggleSoundCheck,
-        );
-        self.draw_toggle_row(
-            r,
-            RectF::new(x0 + cw * 0.5 + 8.0, y + 170.0, (cw - 52.0) * 0.5, 36.0),
-            "歌曲交叉渐入渐出",
-            "",
-            self.audio_prefs.crossfade_songs_enabled,
-            UiAction::ToggleCrossfade,
-        );
-
-        y += 232.0;
-
-        let mon_hz = self.current_monitor_hz.clamp(30, 500);
-        let viz_custom_open = self.settings.viz_fps_cap == FpsCap::Custom;
-        let lyr_custom_open = self.settings.lyrics_fps_cap == FpsCap::Custom;
-        let viz_extra = if viz_custom_open { 38.0 } else { 0.0 };
-        let lyr_extra = if lyr_custom_open { 38.0 } else { 0.0 };
-
-        // --- Group 3: 歌词显示与动效 ---
-        r.draw_text(
-            "歌词显示与动效",
-            RectF::new(x0 + 4.0, y, cw, 22.0),
-            13.0,
-            600,
-            Theme::TEXT_MUTED,
-            TextAlign::Left,
             true,
-            false,
         );
-        y += 26.0;
+        y + 6.0 + box_h + 14.0
+    }
 
-        let lyr_card_h = 504.0 + lyr_extra;
-        let g_lyr = RectF::new(x0, y, cw, lyr_card_h);
-        r.fill_rounded_rect(g_lyr, 14.0, Theme::BG_ELEVATED);
-        r.stroke_rounded_rect(g_lyr, 14.0, Theme::SEPARATOR, 1.0);
+    fn draw_ipad_card_box(r: &mut D2DRenderer, rect: RectF, single_row: bool) {
+        let rad = if single_row { 18.0 } else { 16.0 };
+        r.fill_rounded_rect(rect, rad, Color::rgb(28, 28, 30));
+        r.stroke_rounded_rect(rect, rad, Color::rgba(255, 255, 255, 0.065), 1.0);
+    }
 
-        let mut ry = y + 14.0;
-        let lyr_resolved = self
-            .settings
-            .lyrics_fps_cap
-            .resolved_label(mon_hz, self.settings.lyrics_custom_fps);
-        r.draw_text(
-            "歌词页面刷新率",
-            RectF::new(x0 + 18.0, ry, 240.0, 22.0),
-            14.2,
-            600,
-            Theme::TEXT_PRIMARY,
-            TextAlign::Left,
-            true,
-            false,
-        );
-        r.draw_text(
-            &format!("当前屏幕 {} Hz · 目标刷新率：{}", mon_hz, lyr_resolved),
-            RectF::new(x0 + 18.0, ry + 22.0, cw - 36.0, 18.0),
-            12.0,
-            400,
-            Theme::TEXT_SECONDARY,
-            TextAlign::Left,
-            true,
-            false,
-        );
-        let mut lfx = x0 + 18.0;
-        let lfy = ry + 46.0;
-        for cap in FpsCap::ALL {
-            let sel = self.settings.lyrics_fps_cap == cap;
-            let bw = match cap {
-                FpsCap::Hz60 | FpsCap::Hz72 => 52.0,
-                FpsCap::Adaptive60_72 => 116.0,
-                FpsCap::VSync => 78.0,
-                FpsCap::Custom => 68.0,
-            };
-            let br = RectF::new(lfx, lfy, bw, 28.0);
-            let bhov = self.mouse_pos.1 >= TOP_BAR_GUARD_H && br.contains(self.mouse_pos.0, self.mouse_pos.1);
-            r.draw_liquid_glass_button(
-                br,
-                8.5,
-                if sel {
-                    GlassBtnVariant::Tinted(Theme::ACCENT_RED)
-                } else {
-                    GlassBtnVariant::Regular
-                },
-                bhov,
-                self.mouse_down,
-                self.mouse_pos,
-                self.glass_off(),
-            );
-            r.draw_text(
-                cap.label(),
-                br,
-                12.0,
-                if sel || bhov { 600 } else { 400 },
-                Theme::TEXT_PRIMARY,
-                TextAlign::Center,
-                true,
-                false,
-            );
-            self.hit_regions.push(HitRegion {
-                rect: br,
-                action: UiAction::SetLyricsFpsCap(cap),
-            });
-            lfx += bw + 8.0;
-        }
-        ry += 82.0;
-
-        if lyr_custom_open {
-            let cur_fps = self.settings.lyrics_custom_fps.clamp(30, 360);
-            let dec_r = RectF::new(x0 + 18.0, ry + 2.0, 28.0, 24.0);
-            let dec_hov = self.mouse_pos.1 >= TOP_BAR_GUARD_H && dec_r.contains(self.mouse_pos.0, self.mouse_pos.1);
-            r.draw_liquid_glass_button(
-                dec_r,
-                7.0,
-                GlassBtnVariant::Regular,
-                dec_hov,
-                self.mouse_down,
-                self.mouse_pos,
-                self.glass_off(),
-            );
-            r.draw_text("-", dec_r, 13.0, 600, Theme::TEXT_PRIMARY, TextAlign::Center, true, false);
-            self.hit_regions.push(HitRegion {
-                rect: dec_r,
-                action: UiAction::SetLyricsCustomFps(cur_fps.saturating_sub(1).max(30)),
-            });
-
-            let bar_x = x0 + 54.0;
-            let bar_w = (cw - 176.0).max(120.0);
-            let fps_bar = RectF::new(bar_x, ry + 11.0, bar_w, 6.0);
-            let fps_hit = RectF::new(bar_x - 6.0, ry - 2.0, bar_w + 12.0, 32.0);
-            let fps_hov = fps_hit.contains(self.mouse_pos.0, self.mouse_pos.1)
-                || matches!(self.active_drag, Some(ActiveDrag::LyricsCustomFps(_)));
-            let f_norm = ((cur_fps as f32 - 30.0) / 330.0).clamp(0.0, 1.0);
-            r.fill_rounded_rect(fps_bar, 3.0, Color::rgba(255, 255, 255, 0.14));
-            if f_norm > 0.005 {
-                r.fill_rounded_rect(
-                    RectF::new(fps_bar.x, fps_bar.y, (fps_bar.w * f_norm).max(4.0), fps_bar.h),
-                    3.0,
-                    Theme::ACCENT_RED,
-                );
-            }
-            let fcx = fps_bar.x + fps_bar.w * f_norm;
-            let ftr = if fps_hov { 8.0 } else { 6.5 };
-            r.fill_circle(fcx, fps_bar.center_y(), ftr, Color::rgb(252, 252, 255));
-            self.hit_regions.push(HitRegion {
-                rect: fps_hit,
-                action: UiAction::ScrubLyricsCustomFps(fps_bar),
-            });
-
-            let inc_r = RectF::new(bar_x + bar_w + 8.0, ry + 2.0, 28.0, 24.0);
-            let inc_hov = self.mouse_pos.1 >= TOP_BAR_GUARD_H && inc_r.contains(self.mouse_pos.0, self.mouse_pos.1);
-            r.draw_liquid_glass_button(
-                inc_r,
-                7.0,
-                GlassBtnVariant::Regular,
-                inc_hov,
-                self.mouse_down,
-                self.mouse_pos,
-                self.glass_off(),
-            );
-            r.draw_text("+", inc_r, 13.0, 600, Theme::TEXT_PRIMARY, TextAlign::Center, true, false);
-            self.hit_regions.push(HitRegion {
-                rect: inc_r,
-                action: UiAction::SetLyricsCustomFps((cur_fps + 1).min(360)),
-            });
-
-            r.draw_text(
-                &format!("{} Hz", cur_fps),
-                RectF::new(inc_r.right() + 10.0, ry + 2.0, 64.0, 24.0),
-                12.5,
-                600,
-                Theme::TEXT_PRIMARY,
-                TextAlign::Right,
-                true,
-                false,
-            );
-            ry += 38.0;
-        }
-
-        r.draw_line(x0 + 18.0, ry + 4.0, x0 + cw - 18.0, ry + 4.0, Theme::SEPARATOR, 1.0);
-        ry += 10.0;
-        self.draw_toggle_row(
-            r,
-            RectF::new(x0 + 18.0, ry, cw - 36.0, 54.0),
-            "后台失焦时歌词页自动降频（60/72 自适应）",
-            "默认关闭（窗口失去焦点仍满帧渲染）；开启后失焦自动切换为 60/72 自适应省电",
-            self.settings.lyrics_limit_unfocused_fps,
-            UiAction::ToggleLyricsLimitUnfocusedFps,
-        );
-        ry += 58.0;
-
-        r.draw_line(x0 + 18.0, ry + 4.0, x0 + cw - 18.0, ry + 4.0, Theme::SEPARATOR, 1.0);
-        ry += 10.0;
-        self.draw_toggle_row(
-            r,
-            RectF::new(x0 + 18.0, ry, (cw - 52.0) * 0.5, 54.0),
-            "西文歌词按词律动",
-            "英文以完整单词为单位扫光与上浮，关闭后按单字母细分",
-            self.settings.lyrics_latin_by_word,
-            UiAction::ToggleLyricsLatinByWord,
-        );
-        self.draw_toggle_row(
-            r,
-            RectF::new(x0 + cw * 0.5 + 8.0, ry, (cw - 52.0) * 0.5, 54.0),
-            "自动检测歌词强调",
-            "开启时对长拖音自动触发光效；关闭仅保留歌词原标记强调",
-            self.settings.lyrics_auto_emphasis,
-            UiAction::ToggleLyricsAutoEmphasis,
-        );
-        ry += 60.0;
-
-        r.draw_line(x0 + 18.0, ry + 4.0, x0 + cw - 18.0, ry + 4.0, Theme::SEPARATOR, 1.0);
-        ry += 10.0;
-        self.draw_toggle_row(
-            r,
-            RectF::new(x0 + 18.0, ry, (cw - 52.0) * 0.5, 54.0),
-            "歌词进度边界弹性波浪",
-            "沿高亮前沿微倾上浮防中文字割裂，关闭则整字整体上浮",
-            self.settings.lyrics_frontier_wave,
-            UiAction::ToggleLyricsFrontierWave,
-        );
-        self.draw_toggle_row(
-            r,
-            RectF::new(x0 + cw * 0.5 + 8.0, ry, (cw - 52.0) * 0.5, 54.0),
-            "歌词页流动封面纹理 (FreeBlur)",
-            "开启后减轻背景模糊以保留流动封面轮廓；关闭为默认柔和扩散流光",
-            self.settings.lyrics_free_blur,
-            UiAction::ToggleLyricsBlurMode,
-        );
-        ry += 60.0;
-
-        r.draw_line(x0 + 18.0, ry + 4.0, x0 + cw - 18.0, ry + 4.0, Theme::SEPARATOR, 1.0);
-        ry += 10.0;
-        self.draw_toggle_row(
-            r,
-            RectF::new(x0 + 18.0, ry, (cw - 52.0) * 0.5, 54.0),
-            "末尾停留整词渐亮",
-            "高亮进度停在强调字词末尾时，整词发光逐渐增强至前沿亮度",
-            self.settings.lyrics_end_hold_glow,
-            UiAction::ToggleLyricsEndHoldGlow,
-        );
-        self.draw_toggle_row(
-            r,
-            RectF::new(x0 + cw * 0.5 + 8.0, ry, (cw - 52.0) * 0.5, 54.0),
-            "未唱歌词轻度降采样节能",
-            "关闭为原生 1× 高清景深模糊；开启后未唱行 0.75× 渲染节能",
-            self.settings.lyrics_blur_downsample,
-            UiAction::ToggleLyricsBlurDownsample,
-        );
-        ry += 58.0;
-
-        r.draw_line(x0 + 18.0, ry + 4.0, x0 + cw - 18.0, ry + 4.0, Theme::SEPARATOR, 1.0);
-        ry += 10.0;
-        self.draw_toggle_row(
-            r,
-            RectF::new(x0 + 18.0, ry, cw - 36.0, 54.0),
-            "歌词页沉浸模式",
-            "开启后隐藏歌词页四角所有控件，仅保留背景、封面、播放控制与歌词；鼠标移近角落自动渐显",
-            self.settings.lyrics_immersive_mode,
-            UiAction::ToggleLyricsImmersiveMode,
-        );
-        ry += 58.0;
-
-        r.draw_line(x0 + 18.0, ry + 4.0, x0 + cw - 18.0, ry + 4.0, Theme::SEPARATOR, 1.0);
-        ry += 10.0;
-        r.draw_text(
-            "非强调歌词附加发光 / 放大",
-            RectF::new(x0 + 18.0, ry, 260.0, 22.0),
-            14.0,
-            600,
-            Theme::TEXT_PRIMARY,
-            TextAlign::Left,
-            true,
-            false,
-        );
-        r.draw_text(
-            "默认仅上浮，仅强调词句高亮放大与发光",
-            RectF::new(x0 + 18.0, ry + 24.0, 290.0, 18.0),
-            11.8,
-            400,
-            Theme::TEXT_SECONDARY,
-            TextAlign::Left,
-            true,
-            false,
-        );
-        let fx_choices = [
-            (NonEmphasisLyricsEffect::None, "关闭（默认）", 92.0f32),
-            (NonEmphasisLyricsEffect::GlowOnly, "仅发光", 68.0),
-            (NonEmphasisLyricsEffect::ScaleOnly, "仅放大", 68.0),
-            (NonEmphasisLyricsEffect::Both, "发光 + 放大", 88.0),
-        ];
-        let total_fx_w: f32 = fx_choices.iter().map(|c| c.2).sum::<f32>() + 3.0 * 6.0;
-        let mut fx_x = (x0 + cw - 18.0 - total_fx_w).max(x0 + 280.0);
-        let fx_y = ry + 9.0;
-        for (opt, lbl, bw) in fx_choices {
-            let sel = self.settings.lyrics_non_emphasis_effect == opt;
-            let br = RectF::new(fx_x, fx_y, bw, 28.0);
-            let bhov = self.mouse_pos.1 >= TOP_BAR_GUARD_H && br.contains(self.mouse_pos.0, self.mouse_pos.1);
-            r.draw_liquid_glass_button(
-                br,
-                8.5,
-                if sel {
-                    GlassBtnVariant::Tinted(Theme::ACCENT_RED)
-                } else {
-                    GlassBtnVariant::Regular
-                },
-                bhov,
-                self.mouse_down,
-                self.mouse_pos,
-                self.glass_off(),
-            );
-            r.draw_text(
-                lbl,
-                br,
-                11.8,
-                if sel || bhov { 600 } else { 400 },
-                Theme::TEXT_PRIMARY,
-                TextAlign::Center,
-                true,
-                false,
-            );
-            self.hit_regions.push(HitRegion {
-                rect: br,
-                action: UiAction::SetLyricsNonEmphasisEffect(opt),
-            });
-            fx_x += bw + 6.0;
-        }
-
-        y += lyr_card_h + 22.0;
-
-        // --- Group 4: 可视化与动态封面 ---
-        r.draw_text(
-            "可视化与动态封面",
-            RectF::new(x0 + 4.0, y, cw, 22.0),
-            13.0,
-            600,
-            Theme::TEXT_MUTED,
-            TextAlign::Left,
-            true,
-            false,
-        );
-        y += 26.0;
-
-        let viz_card_h = 240.0 + viz_extra;
-        let g_viz = RectF::new(x0, y, cw, viz_card_h);
-        r.fill_rounded_rect(g_viz, 14.0, Theme::BG_ELEVATED);
-        r.stroke_rounded_rect(g_viz, 14.0, Theme::SEPARATOR, 1.0);
-
-        let mut vy = y + 14.0;
-        let viz_resolved = self
-            .settings
-            .viz_fps_cap
-            .resolved_label(mon_hz, self.settings.viz_custom_fps);
-        r.draw_text(
-            "可视化页面刷新率",
-            RectF::new(x0 + 18.0, vy, 240.0, 22.0),
-            14.2,
-            600,
-            Theme::TEXT_PRIMARY,
-            TextAlign::Left,
-            true,
-            false,
-        );
-        r.draw_text(
-            &format!("当前屏幕 {} Hz · 目标刷新率：{}", mon_hz, viz_resolved),
-            RectF::new(x0 + 18.0, vy + 22.0, cw - 36.0, 18.0),
-            12.0,
-            400,
-            Theme::TEXT_SECONDARY,
-            TextAlign::Left,
-            true,
-            false,
-        );
-        let mut fx = x0 + 18.0;
-        let fy = vy + 46.0;
-        for cap in FpsCap::ALL {
-            let sel = self.settings.viz_fps_cap == cap;
-            let bw = match cap {
-                FpsCap::Hz60 | FpsCap::Hz72 => 52.0,
-                FpsCap::Adaptive60_72 => 116.0,
-                FpsCap::VSync => 78.0,
-                FpsCap::Custom => 68.0,
-            };
-            let br = RectF::new(fx, fy, bw, 28.0);
-            let bhov = self.mouse_pos.1 >= TOP_BAR_GUARD_H && br.contains(self.mouse_pos.0, self.mouse_pos.1);
-            r.draw_liquid_glass_button(
-                br,
-                8.5,
-                if sel {
-                    GlassBtnVariant::Tinted(Theme::ACCENT_RED)
-                } else {
-                    GlassBtnVariant::Regular
-                },
-                bhov,
-                self.mouse_down,
-                self.mouse_pos,
-                self.glass_off(),
-            );
-            r.draw_text(
-                cap.label(),
-                br,
-                12.0,
-                if sel || bhov { 600 } else { 400 },
-                Theme::TEXT_PRIMARY,
-                TextAlign::Center,
-                true,
-                false,
-            );
-            self.hit_regions.push(HitRegion {
-                rect: br,
-                action: UiAction::SetVizFpsCap(cap),
-            });
-            fx += bw + 8.0;
-        }
-        vy += 82.0;
-
-        if viz_custom_open {
-            let cur_fps = self.settings.viz_custom_fps.clamp(30, 360);
-            let dec_r = RectF::new(x0 + 18.0, vy + 2.0, 28.0, 24.0);
-            let dec_hov = self.mouse_pos.1 >= TOP_BAR_GUARD_H && dec_r.contains(self.mouse_pos.0, self.mouse_pos.1);
-            r.draw_liquid_glass_button(
-                dec_r,
-                7.0,
-                GlassBtnVariant::Regular,
-                dec_hov,
-                self.mouse_down,
-                self.mouse_pos,
-                self.glass_off(),
-            );
-            r.draw_text("-", dec_r, 13.0, 600, Theme::TEXT_PRIMARY, TextAlign::Center, true, false);
-            self.hit_regions.push(HitRegion {
-                rect: dec_r,
-                action: UiAction::SetVizCustomFps(cur_fps.saturating_sub(1).max(30)),
-            });
-
-            let bar_x = x0 + 54.0;
-            let bar_w = (cw - 176.0).max(120.0);
-            let fps_bar = RectF::new(bar_x, vy + 11.0, bar_w, 6.0);
-            let fps_hit = RectF::new(bar_x - 6.0, vy - 2.0, bar_w + 12.0, 32.0);
-            let fps_hov = fps_hit.contains(self.mouse_pos.0, self.mouse_pos.1)
-                || matches!(self.active_drag, Some(ActiveDrag::VizCustomFps(_)));
-            let f_norm = ((cur_fps as f32 - 30.0) / 330.0).clamp(0.0, 1.0);
-            r.fill_rounded_rect(fps_bar, 3.0, Color::rgba(255, 255, 255, 0.14));
-            if f_norm > 0.005 {
-                r.fill_rounded_rect(
-                    RectF::new(fps_bar.x, fps_bar.y, (fps_bar.w * f_norm).max(4.0), fps_bar.h),
-                    3.0,
-                    Theme::ACCENT_RED,
-                );
-            }
-            let fcx = fps_bar.x + fps_bar.w * f_norm;
-            let ftr = if fps_hov { 8.0 } else { 6.5 };
-            r.fill_circle(fcx, fps_bar.center_y(), ftr, Color::rgb(252, 252, 255));
-            self.hit_regions.push(HitRegion {
-                rect: fps_hit,
-                action: UiAction::ScrubVizCustomFps(fps_bar),
-            });
-
-            let inc_r = RectF::new(bar_x + bar_w + 8.0, vy + 2.0, 28.0, 24.0);
-            let inc_hov = self.mouse_pos.1 >= TOP_BAR_GUARD_H && inc_r.contains(self.mouse_pos.0, self.mouse_pos.1);
-            r.draw_liquid_glass_button(
-                inc_r,
-                7.0,
-                GlassBtnVariant::Regular,
-                inc_hov,
-                self.mouse_down,
-                self.mouse_pos,
-                self.glass_off(),
-            );
-            r.draw_text("+", inc_r, 13.0, 600, Theme::TEXT_PRIMARY, TextAlign::Center, true, false);
-            self.hit_regions.push(HitRegion {
-                rect: inc_r,
-                action: UiAction::SetVizCustomFps((cur_fps + 1).min(360)),
-            });
-
-            r.draw_text(
-                &format!("{} Hz", cur_fps),
-                RectF::new(inc_r.right() + 10.0, vy + 2.0, 64.0, 24.0),
-                12.5,
-                600,
-                Theme::TEXT_PRIMARY,
-                TextAlign::Right,
-                true,
-                false,
-            );
-            vy += 38.0;
-        }
-
-        r.draw_line(x0 + 18.0, vy + 4.0, x0 + cw - 18.0, vy + 4.0, Theme::SEPARATOR, 1.0);
-        vy += 10.0;
-        self.draw_toggle_row(
-            r,
-            RectF::new(x0 + 18.0, vy, cw - 36.0, 54.0),
-            "实时频谱播放图标",
-            "未打开可视化页时，播放封面五条竖线与侧栏可视化图标仍随实际音频实时跳动；关闭可停用后台采样",
-            self.settings.live_eq_icon_spectrum,
-            UiAction::ToggleLiveEqIconSpectrum,
-        );
-        vy += 58.0;
-
-        r.draw_line(x0 + 18.0, vy + 4.0, x0 + cw - 18.0, vy + 4.0, Theme::SEPARATOR, 1.0);
-        vy += 10.0;
-        self.draw_toggle_row(
-            r,
-            RectF::new(x0 + 18.0, vy, cw - 36.0, 54.0),
-            "动态封面（实验性）",
-            "仅在主页与歌词页启用纯 Win32 硬件解码动态封面，新发现与广播保持静态高清封面",
-            self.settings.motion_artwork_enabled,
-            UiAction::ToggleMotionArtwork,
-        );
-
-        y += viz_card_h + 22.0;
-
-        // --- Group 5: 外观、性能与内存 ---
-        r.draw_text(
-            "外观、性能与内存",
-            RectF::new(x0 + 4.0, y, cw, 22.0),
-            13.0,
-            600,
-            Theme::TEXT_MUTED,
-            TextAlign::Left,
-            true,
-            false,
-        );
-        y += 26.0;
-
-        let perf_card_h = 224.0;
-        let g_perf = RectF::new(x0, y, cw, perf_card_h);
-        r.fill_rounded_rect(g_perf, 14.0, Theme::BG_ELEVATED);
-        r.stroke_rounded_rect(g_perf, 14.0, Theme::SEPARATOR, 1.0);
-
-        let mut py = y + 14.0;
-        let cur_rad = self.settings.window_corner_radius.clamp(0.0, 28.0);
-        r.draw_text(
-            "沉浸式窗口边框圆角",
-            RectF::new(x0 + 18.0, py, 176.0, 22.0),
-            14.0,
-            600,
-            Theme::TEXT_PRIMARY,
-            TextAlign::Left,
-            true,
-            false,
-        );
-        r.draw_text(
-            &format!(
-                "当前 {:.0} px · 可选直角或拖动滑杆精细调节圆角大小",
-                cur_rad
-            ),
-            RectF::new(x0 + 18.0, py + 22.0, 310.0, 18.0),
-            11.8,
-            400,
-            Theme::TEXT_SECONDARY,
-            TextAlign::Left,
-            true,
-            false,
-        );
-
-        let presets: &[(&str, f32, f32)] = &[
-            ("直角 0px", 0.0, 68.0),
-            ("默认 12px", 12.0, 74.0),
-            ("大圆角 22px", 22.0, 82.0),
-        ];
-        let mut rx_btn = x0 + 320.0;
-        for &(plbl, pval, pw) in presets {
-            let sel = (cur_rad - pval).abs() < 0.45;
-            let pr = RectF::new(rx_btn, py + 6.0, pw, 28.0);
-            let phov = pr.contains(self.mouse_pos.0, self.mouse_pos.1);
-            r.draw_liquid_glass_button(
-                pr,
-                8.5,
-                if sel {
-                    GlassBtnVariant::Tinted(Theme::ACCENT_RED)
-                } else {
-                    GlassBtnVariant::Regular
-                },
-                phov,
-                self.mouse_down,
-                self.mouse_pos,
-                self.glass_off(),
-            );
-            r.draw_text(
-                plbl,
-                pr,
-                11.8,
-                if sel || phov { 600 } else { 400 },
-                Theme::TEXT_PRIMARY,
-                TextAlign::Center,
-                true,
-                false,
-            );
-            self.hit_regions.push(HitRegion {
-                rect: pr,
-                action: UiAction::SetWindowCornerRadius(pval),
-            });
-            rx_btn += pw + 7.0;
-        }
-
-        let rad_bar_x = (rx_btn + 8.0).min(x0 + cw - 148.0);
-        let rad_bar_w = (x0 + cw - 22.0 - rad_bar_x).max(90.0);
-        let rad_bar = RectF::new(rad_bar_x, py + 17.0, rad_bar_w, 6.0);
-        let rad_hit = RectF::new(rad_bar.x - 6.0, py + 4.0, rad_bar.w + 12.0, 32.0);
-        let rad_hov = rad_hit.contains(self.mouse_pos.0, self.mouse_pos.1)
-            || matches!(self.active_drag, Some(ActiveDrag::WindowCornerRadius(_)));
-        let rad_norm = (cur_rad / 28.0).clamp(0.0, 1.0);
-        r.fill_rounded_rect(rad_bar, 3.0, Color::rgba(255, 255, 255, 0.14));
-        if rad_norm > 0.005 {
-            r.fill_rounded_rect(
-                RectF::new(rad_bar.x, rad_bar.y, (rad_bar.w * rad_norm).max(4.0), rad_bar.h),
-                3.0,
-                Theme::ACCENT_RED,
-            );
-        }
-        let thumb_cx = rad_bar.x + rad_bar.w * rad_norm;
-        let thumb_r = if rad_hov { 8.5 } else { 7.0 };
-        r.fill_circle(
-            thumb_cx,
-            rad_bar.center_y() + 1.5,
-            thumb_r + 1.0,
-            Color::rgba(0, 0, 0, 0.36),
-        );
-        r.fill_circle(
-            thumb_cx,
-            rad_bar.center_y(),
-            thumb_r,
-            Color::rgb(252, 252, 255),
-        );
-        if rad_hov {
-            r.stroke_circle(thumb_cx, rad_bar.center_y(), thumb_r + 1.5, Theme::ACCENT_RED, 1.2);
-        }
-        self.hit_regions.push(HitRegion {
-            rect: rad_hit,
-            action: UiAction::ScrubWindowCornerRadius(rad_bar),
-        });
-        py += 52.0;
-
-        r.draw_line(x0 + 18.0, py + 4.0, x0 + cw - 18.0, py + 4.0, Theme::SEPARATOR, 1.0);
-        py += 10.0;
-        self.draw_toggle_row(
-            r,
-            RectF::new(x0 + 18.0, py, (cw - 52.0) * 0.5, 56.0),
-            "液态玻璃材质",
-            "默认关闭；开启后侧栏与控件启用实时折射与流光边",
-            self.settings.liquid_glass_enabled,
-            UiAction::ToggleLiquidGlass,
-        );
-        self.draw_toggle_row(
-            r,
-            RectF::new(x0 + cw * 0.5 + 8.0, py, (cw - 52.0) * 0.5, 56.0),
-            "降低透明度",
-            "将侧栏与浮层切换为纯色表面（不影响歌词页流光背景）",
-            self.settings.reduce_transparency,
-            UiAction::ToggleReduceTransparency,
-        );
-        py += 62.0;
-
-        r.draw_line(x0 + 18.0, py + 4.0, x0 + cw - 18.0, py + 4.0, Theme::SEPARATOR, 1.0);
-        py += 10.0;
-        self.draw_toggle_row(
-            r,
-            RectF::new(x0 + 18.0, py, (cw - 52.0) * 0.5, 60.0),
-            "减弱动态效果",
-            "收敛弹簧、封面展开与粒子运动（不影响歌词页流光背景）",
-            self.settings.reduce_motion,
-            UiAction::ToggleReduceMotion,
-        );
-        self.draw_toggle_row(
-            r,
-            RectF::new(x0 + cw * 0.5 + 8.0, py, (cw - 52.0) * 0.5, 60.0),
-            "增强内存释放",
-            "高频回收封面/缓存并压缩工作集（推荐与减弱动态效果一并开启）",
-            self.settings.aggressive_memory_release,
-            UiAction::ToggleAggressiveMemoryRelease,
-        );
-
-        y += perf_card_h + 22.0;
-
-        // --- Group 4: Hidden-by-Default Spatial Audio & Flavor Disclosure (`空间音频风味等的开关和设置默认隐藏`!) ---
-        let disc_row = RectF::new(x0, y, 224.0, 30.0);
-        let disc_hov = disc_row.contains(self.mouse_pos.0, self.mouse_pos.1);
-        if disc_hov {
-            r.draw_liquid_glass_button(
-                disc_row,
-                9.0,
-                GlassBtnVariant::Subtle,
-                true,
-                self.mouse_down,
-                self.mouse_pos,
-                self.glass_off(),
-            );
-        }
-        r.draw_icon(
-            if self.show_advanced_spatial {
-                SfIcon::ChevronDown
-            } else {
-                SfIcon::ChevronRight
-            },
-            RectF::new(x0 + 8.0, y + 8.5, 13.0, 13.0),
-            if disc_hov {
-                Theme::TEXT_PRIMARY
-            } else {
-                Theme::TEXT_MUTED
-            },
-        );
-        r.draw_text(
-            "空间音频与声场选项",
-            RectF::new(x0 + 26.0, y, 194.0, 30.0),
-            12.8,
-            if disc_hov { 600 } else { 500 },
-            if disc_hov {
-                Theme::TEXT_PRIMARY
-            } else {
-                Theme::TEXT_MUTED
-            },
-            TextAlign::Left,
-            true,
-            false,
-        );
-        self.hit_regions.push(HitRegion {
-            rect: disc_row,
-            action: UiAction::ToggleAdvancedSpatialDisclosure,
-        });
-        y += 36.0;
-
-        if self.show_advanced_spatial {
-            let sp_card = RectF::new(x0, y, cw, 224.0);
-            r.fill_rounded_rect(sp_card, 14.0, Theme::BG_ELEVATED);
-            r.stroke_rounded_rect(sp_card, 14.0, Theme::SEPARATOR, 1.0);
-
-            // Row A: Dolby Atmos (collapsed inside spatial disclosure by default!)
-            r.draw_text(
-                "杜比全景声",
-                RectF::new(x0 + 18.0, y + 14.0, 160.0, 28.0),
-                14.0,
-                600,
-                Theme::TEXT_PRIMARY,
-                TextAlign::Left,
-                true,
-                false,
-            );
-            let mut ax = x0 + cw - 18.0 - (72.0 * 3.0 + 16.0);
-            for &(lbl, av) in &[("自动", 10i64), ("始终开启", 20), ("关闭", 30)] {
-                let sel = self.audio_prefs.dolby_atmos_setting == av;
-                let br = RectF::new(ax, y + 14.0, 72.0, 28.0);
-                let bhov = br.contains(self.mouse_pos.0, self.mouse_pos.1);
-                r.draw_liquid_glass_button(
-                    br,
-                    8.5,
-                    if sel {
-                        GlassBtnVariant::Tinted(Theme::ACCENT_RED)
-                    } else {
-                        GlassBtnVariant::Regular
-                    },
-                    bhov,
-                    self.mouse_down,
-                    self.mouse_pos,
-                    self.glass_off(),
-                );
-                r.draw_text(
-                    lbl,
-                    br,
-                    12.0,
-                    if sel || bhov { 600 } else { 400 },
-                    Theme::TEXT_PRIMARY,
-                    TextAlign::Center,
-                    true,
-                    false,
-                );
-                self.hit_regions.push(HitRegion {
-                    rect: br,
-                    action: UiAction::SetAtmosMode(av),
-                });
-                ax += 80.0;
-            }
-            r.draw_line(x0 + 18.0, y + 54.0, x0 + cw - 18.0, y + 54.0, Theme::SEPARATOR, 1.0);
-
-            // Row B: Binaural HRTF toggle + Bypass Liquid Glass button
-            self.draw_toggle_row(
-                r,
-                RectF::new(x0 + 18.0, y + 60.0, cw - 134.0, 44.0),
-                "本地双耳空间渲染 (HRTF)",
-                "对立体声信号进行外化头影与早期反射渲染（需两路可用输出端点）",
-                self.binaural.active,
-                UiAction::ToggleBinauralEnabled,
-            );
-            let byp_btn = RectF::new(x0 + cw - 102.0, y + 69.0, 84.0, 26.0);
-            let byp_hov = byp_btn.contains(self.mouse_pos.0, self.mouse_pos.1);
-            r.draw_liquid_glass_button(
-                byp_btn,
-                7.5,
-                if self.binaural.config.bypass {
-                    GlassBtnVariant::Tinted(Theme::SIGNAL_AMBER)
-                } else {
-                    GlassBtnVariant::Regular
-                },
-                byp_hov,
-                self.mouse_down,
-                self.mouse_pos,
-                self.glass_off(),
-            );
-            r.draw_text(
-                if self.binaural.config.bypass {
-                    "直通中"
-                } else {
-                    "直通对比"
-                },
-                byp_btn,
-                11.8,
-                if byp_hov || self.binaural.config.bypass { 600 } else { 500 },
-                Theme::TEXT_PRIMARY,
-                TextAlign::Center,
-                true,
-                false,
-            );
-            self.hit_regions.push(HitRegion {
-                rect: byp_btn,
-                action: UiAction::ToggleBinauralBypass,
-            });
-            r.draw_line(x0 + 18.0, y + 112.0, x0 + cw - 18.0, y + 112.0, Theme::SEPARATOR, 1.0);
-
-            // Row C: Spatial Flavor Presets (`影院空间`, `近场监听`, `音乐厅`, `人声聚焦`)
-            r.draw_text(
-                "声场风味预设",
-                RectF::new(x0 + 18.0, y + 124.0, 100.0, 28.0),
-                13.5,
-                500,
-                Theme::TEXT_PRIMARY,
-                TextAlign::Left,
-                true,
-                false,
-            );
-            let mut px = x0 + 124.0;
-            for &(pkey, plbl) in &[
-                ("apple_spatial", "影院空间"),
-                ("studio_nearfield", "近场监听"),
-                ("concert_hall", "音乐厅"),
-                ("intimate_vocal", "人声聚焦"),
-            ] {
-                let sel = self.binaural.config.preset == pkey;
-                let pr = RectF::new(px, y + 124.0, 82.0, 28.0);
-                let phov = pr.contains(self.mouse_pos.0, self.mouse_pos.1);
-                r.draw_liquid_glass_button(
-                    pr,
-                    8.5,
-                    if sel {
-                        GlassBtnVariant::Tinted(Theme::ACCENT_RED)
-                    } else {
-                        GlassBtnVariant::Regular
-                    },
-                    phov,
-                    self.mouse_down,
-                    self.mouse_pos,
-                    self.glass_off(),
-                );
-                r.draw_text(
-                    plbl,
-                    pr,
-                    12.0,
-                    if sel || phov { 600 } else { 400 },
-                    Theme::TEXT_PRIMARY,
-                    TextAlign::Center,
-                    true,
-                    false,
-                );
-                self.hit_regions.push(HitRegion {
-                    rect: pr,
-                    action: UiAction::SetBinauralPreset(pkey.to_string()),
-                });
-                px += 90.0;
-            }
-            r.draw_line(x0 + 18.0, y + 164.0, x0 + cw - 18.0, y + 164.0, Theme::SEPARATOR, 1.0);
-
-            // Row D: Fine Spatial Width & Room Ambience Sliders with Hover Thumbs
-            let half_w = (cw - 56.0) * 0.5;
-            let cur_w = self.binaural.config.spatial_width.clamp(0.6, 1.6);
-            let w_norm = (cur_w - 0.6) / 1.0;
-            r.draw_text(
-                &format!("声场宽度  {:.2}x", cur_w),
-                RectF::new(x0 + 18.0, y + 174.0, 120.0, 20.0),
-                12.5,
-                500,
-                Theme::TEXT_SECONDARY,
-                TextAlign::Left,
-                true,
-                false,
-            );
-            let w_bar = RectF::new(x0 + 18.0, y + 200.0, half_w, 6.0);
-            let w_hit = RectF::new(w_bar.x, y + 190.0, w_bar.w, 24.0);
-            let w_hov = w_hit.contains(self.mouse_pos.0, self.mouse_pos.1)
-                || matches!(self.active_drag, Some(ActiveDrag::BinauralWidth(_)));
-            r.fill_rounded_rect(w_bar, 3.0, Theme::BG_TERTIARY);
-            r.fill_rounded_rect(
-                RectF::new(w_bar.x, w_bar.y, (w_bar.w * w_norm).max(6.0), w_bar.h),
-                3.0,
-                Theme::ACCENT_RED,
-            );
-            r.fill_circle(
-                w_bar.x + w_bar.w * w_norm,
-                w_bar.center_y(),
-                if w_hov { 7.5 } else { 6.0 },
-                Color::rgb(252, 252, 255),
-            );
-            self.hit_regions.push(HitRegion {
-                rect: w_hit,
-                action: UiAction::ScrubBinauralWidth(w_bar),
-            });
-
-            let rx0 = x0 + cw * 0.5 + 10.0;
-            let cur_rm = self.binaural.config.room_ambience.clamp(0.0, 0.8);
-            let rm_norm = cur_rm / 0.8;
-            r.draw_text(
-                &format!("房间混响  {:.0}%", cur_rm * 100.0),
-                RectF::new(rx0, y + 174.0, 120.0, 20.0),
-                12.5,
-                500,
-                Theme::TEXT_SECONDARY,
-                TextAlign::Left,
-                true,
-                false,
-            );
-            let rm_bar = RectF::new(rx0, y + 200.0, half_w, 6.0);
-            let rm_hit = RectF::new(rm_bar.x, y + 190.0, rm_bar.w, 24.0);
-            let rm_hov = rm_hit.contains(self.mouse_pos.0, self.mouse_pos.1)
-                || matches!(self.active_drag, Some(ActiveDrag::BinauralRoom(_)));
-            r.fill_rounded_rect(rm_bar, 3.0, Theme::BG_TERTIARY);
-            r.fill_rounded_rect(
-                RectF::new(rm_bar.x, rm_bar.y, (rm_bar.w * rm_norm).max(6.0), rm_bar.h),
-                3.0,
-                Theme::ACCENT_RED,
-            );
-            r.fill_circle(
-                rm_bar.x + rm_bar.w * rm_norm,
-                rm_bar.center_y(),
-                if rm_hov { 7.5 } else { 6.0 },
-                Color::rgb(252, 252, 255),
-            );
-            self.hit_regions.push(HitRegion {
-                rect: rm_hit,
-                action: UiAction::ScrubBinauralRoom(rm_bar),
-            });
-
-            y += 238.0;
-        }
-
-        // --- Group 5: About & Check Updates (`关于与更新`) ---
-        y += 8.0;
-        r.draw_text(
-            "关于与更新",
-            RectF::new(x0 + 4.0, y, cw, 22.0),
-            13.0,
-            600,
-            Theme::TEXT_SECONDARY,
-            TextAlign::Left,
-            true,
-            false,
-        );
-        y += 26.0;
-
-        let about_card = RectF::new(x0, y, cw, 118.0);
-        r.fill_rounded_rect(about_card, 14.0, Theme::BG_ELEVATED);
-        r.stroke_rounded_rect(about_card, 14.0, Theme::SEPARATOR, 1.0);
-
-        r.draw_text(
-            &format!("AM Light v{APP_VERSION}  ·  MIT License"),
-            RectF::new(x0 + 18.0, y + 14.0, (cw - 240.0).max(160.0), 22.0),
-            14.2,
-            600,
-            Theme::TEXT_PRIMARY,
-            TextAlign::Left,
-            true,
-            false,
-        );
-        r.draw_text(
-            "歌词动效与同步参考了 LyricsBlossom 及其作者分享的资料",
-            RectF::new(x0 + 18.0, y + 38.0, (cw - 240.0).max(160.0), 18.0),
-            11.8,
-            400,
-            Theme::TEXT_SECONDARY,
-            TextAlign::Left,
-            true,
-            false,
-        );
-
-        let chk_lbl = if self.update_checking {
-            "正在检查..."
-        } else {
-            "检查更新"
-        };
-        let chk_btn = RectF::new(x0 + cw - 18.0 - 94.0, y + 15.0, 94.0, 30.0);
-        let chk_hov = !self.update_checking
-            && self.mouse_pos.1 >= TOP_BAR_GUARD_H
-            && chk_btn.contains(self.mouse_pos.0, self.mouse_pos.1);
-        r.draw_liquid_glass_button(
-            chk_btn,
-            9.0,
-            GlassBtnVariant::Tinted(Theme::ACCENT_RED),
-            chk_hov,
-            self.mouse_down,
-            self.mouse_pos,
-            self.glass_off(),
-        );
-        r.draw_text(
-            chk_lbl,
-            chk_btn,
-            12.2,
-            600,
-            Theme::TEXT_PRIMARY,
-            TextAlign::Center,
-            true,
-            false,
-        );
-        if !self.update_checking {
-            self.hit_regions.push(HitRegion {
-                rect: chk_btn,
-                action: UiAction::CheckForUpdates,
-            });
-        }
-
-        let repo_btn = RectF::new(chk_btn.x - 98.0, y + 15.0, 90.0, 30.0);
-        let repo_hov = self.mouse_pos.1 >= TOP_BAR_GUARD_H
-            && repo_btn.contains(self.mouse_pos.0, self.mouse_pos.1);
-        r.draw_liquid_glass_button(
-            repo_btn,
-            9.0,
-            GlassBtnVariant::Regular,
-            repo_hov,
-            self.mouse_down,
-            self.mouse_pos,
-            self.glass_off(),
-        );
-        r.draw_text(
-            "GitHub 仓库",
-            repo_btn,
-            12.0,
-            500,
-            Theme::TEXT_PRIMARY,
-            TextAlign::Center,
-            true,
-            false,
-        );
-        self.hit_regions.push(HitRegion {
-            rect: repo_btn,
-            action: UiAction::OpenUrl("https://github.com/N20xDuli/AM-Light".to_string()),
-        });
-
+    fn draw_ipad_divider(r: &mut D2DRenderer, cx: f32, cw: f32, div_y: f32) {
         r.draw_line(
-            x0 + 18.0,
-            y + 66.0,
-            x0 + cw - 18.0,
-            y + 66.0,
-            Theme::SEPARATOR,
+            cx + 18.0,
+            div_y,
+            cx + cw,
+            div_y,
+            Color::rgba(255, 255, 255, 0.085),
             1.0,
         );
-        let status_txt = self
-            .update_status_msg
-            .as_deref()
-            .unwrap_or("点击「检查更新」向 GitHub Releases 查询最新版本");
-        r.draw_text(
-            status_txt,
-            RectF::new(x0 + 18.0, y + 78.0, (cw - 170.0).max(160.0), 22.0),
-            12.2,
-            400,
-            if self.update_latest_url.is_some() {
-                Color::rgb(110, 232, 160)
-            } else {
-                Theme::TEXT_SECONDARY
-            },
-            TextAlign::Left,
-            true,
-            false,
-        );
-        if let Some(ref dl_url) = self.update_latest_url.clone() {
-            let dl_btn = RectF::new(x0 + cw - 18.0 - 122.0, y + 75.0, 122.0, 28.0);
-            let dl_hov = self.mouse_pos.1 >= TOP_BAR_GUARD_H
-                && dl_btn.contains(self.mouse_pos.0, self.mouse_pos.1);
-            r.draw_liquid_glass_button(
-                dl_btn,
-                8.5,
-                GlassBtnVariant::ProminentLight,
-                dl_hov,
-                self.mouse_down,
-                self.mouse_pos,
-                self.glass_off(),
-            );
-            r.draw_text(
-                "前往下载新版本",
-                dl_btn,
-                11.8,
-                600,
-                Color::rgb(16, 16, 20),
-                TextAlign::Center,
-                true,
-                false,
-            );
-            self.hit_regions.push(HitRegion {
-                rect: dl_btn,
-                action: UiAction::OpenUrl(dl_url.clone()),
-            });
-        }
-
-        y += 126.0;
-        y
     }
 
-    fn draw_toggle_row(
+    fn draw_ipad_pill_btn(
         &mut self,
         r: &mut D2DRenderer,
         rect: RectF,
+        label: &str,
+        accent_opt: Option<Color>,
+        destructive: bool,
+        action: Option<UiAction>,
+    ) {
+        let hov = action.is_some()
+            && self.mouse_pos.1 >= TOP_BAR_GUARD_H
+            && rect.contains(self.mouse_pos.0, self.mouse_pos.1);
+        let pressed = hov && self.mouse_down;
+        let (bg, fg, weight) = if let Some(acc) = accent_opt {
+            let a = if pressed {
+                0.76
+            } else if hov {
+                0.98
+            } else {
+                0.86
+            };
+            (acc.with_alpha(a), Color::rgb(255, 255, 255), 600)
+        } else if destructive {
+            let a = if pressed {
+                0.28
+            } else if hov {
+                0.22
+            } else {
+                0.13
+            };
+            (Color::rgba(255, 69, 58, a), Color::rgb(255, 92, 82), 500)
+        } else {
+            let a = if pressed {
+                0.20
+            } else if hov {
+                0.15
+            } else {
+                0.09
+            };
+            (
+                Color::rgba(255, 255, 255, a),
+                if action.is_some() {
+                    Theme::TEXT_PRIMARY
+                } else {
+                    Theme::TEXT_MUTED
+                },
+                if hov { 600 } else { 500 },
+            )
+        };
+        r.fill_rounded_rect(rect, 8.5, bg);
+        r.draw_text(
+            label,
+            rect.inset(4.0, 0.0),
+            12.0,
+            weight,
+            fg,
+            TextAlign::Center,
+            true,
+            false,
+        );
+        if let Some(act) = action {
+            self.hit_regions.push(HitRegion { rect, action: act });
+        }
+    }
+
+    fn draw_ipad_segmented<const N: usize>(
+        &mut self,
+        r: &mut D2DRenderer,
+        rect: RectF,
+        items: [(&str, bool, UiAction); N],
+        font_size: f32,
+        mono: bool,
+    ) {
+        r.fill_rounded_rect(rect, 9.5, Color::rgba(118, 118, 128, 0.24));
+        if N == 0 {
+            return;
+        }
+        let pad = 2.5f32;
+        let seg_w = ((rect.w - pad * 2.0) / (N as f32)).max(12.0);
+        let seg_h = (rect.h - pad * 2.0).max(16.0);
+        let mut sel_idx: Option<usize> = None;
+        for (i, &(_, sel, _)) in items.iter().enumerate() {
+            if sel {
+                sel_idx = Some(i);
+            }
+        }
+        // Subtle vertical separators between inactive adjacent segments (authentic iPadOS control)
+        for i in 1..N {
+            if sel_idx != Some(i - 1) && sel_idx != Some(i) {
+                let sx = rect.x + pad + (i as f32) * seg_w;
+                r.draw_line(
+                    sx,
+                    rect.y + 7.5,
+                    sx,
+                    rect.bottom() - 7.5,
+                    Color::rgba(255, 255, 255, 0.12),
+                    1.0,
+                );
+            }
+        }
+        for (i, (lbl, sel, act)) in items.into_iter().enumerate() {
+            let sr = RectF::new(
+                rect.x + pad + (i as f32) * seg_w,
+                rect.y + pad,
+                seg_w,
+                seg_h,
+            );
+            let hov = self.mouse_pos.1 >= TOP_BAR_GUARD_H
+                && sr.contains(self.mouse_pos.0, self.mouse_pos.1);
+            if sel {
+                r.fill_rounded_rect(sr, 7.2, Color::rgb(64, 64, 70));
+                r.stroke_rounded_rect(sr, 7.2, Color::rgba(255, 255, 255, 0.09), 1.0);
+            } else if hov {
+                r.fill_rounded_rect(sr, 7.2, Color::rgba(255, 255, 255, 0.07));
+            }
+            let fg = if sel || hov {
+                Color::rgb(255, 255, 255)
+            } else {
+                Color::rgba(255, 255, 255, 0.72)
+            };
+            if mono {
+                r.draw_mono_text(
+                    lbl,
+                    sr.inset(2.0, 0.0),
+                    font_size,
+                    if sel { 600 } else { 500 },
+                    fg,
+                    TextAlign::Center,
+                    true,
+                );
+            } else {
+                r.draw_text(
+                    lbl,
+                    sr.inset(3.0, 0.0),
+                    font_size,
+                    if sel { 600 } else { 400 },
+                    fg,
+                    TextAlign::Center,
+                    true,
+                    false,
+                );
+            }
+            self.hit_regions.push(HitRegion {
+                rect: sr,
+                action: act,
+            });
+        }
+    }
+
+    fn draw_ipad_slider(
+        &mut self,
+        r: &mut D2DRenderer,
+        bar: RectF,
+        hit: RectF,
+        norm: f32,
+        is_dragging: bool,
+        action: UiAction,
+    ) {
+        let n = norm.clamp(0.0, 1.0);
+        let hov = is_dragging
+            || (self.mouse_pos.1 >= TOP_BAR_GUARD_H
+                && hit.contains(self.mouse_pos.0, self.mouse_pos.1));
+        r.fill_rounded_rect(bar, bar.h * 0.5, Color::rgba(255, 255, 255, 0.16));
+        if n > 0.004 {
+            r.fill_rounded_rect(
+                RectF::new(bar.x, bar.y, (bar.w * n).max(bar.h), bar.h),
+                bar.h * 0.5,
+                Color::rgb(10, 132, 255),
+            );
+        }
+        let cx = bar.x + bar.w * n;
+        let cy = bar.center_y();
+        let rad = if hov { 9.2 } else { 8.0 };
+        r.fill_circle(cx, cy + 1.2, rad + 0.8, Color::rgba(0, 0, 0, 0.34));
+        r.fill_circle(cx, cy, rad, Color::rgb(255, 255, 255));
+        self.hit_regions.push(HitRegion { rect: hit, action });
+    }
+
+    fn draw_ipad_toggle_row(
+        &mut self,
+        r: &mut D2DRenderer,
+        rect: RectF,
+        anim_key: u64,
         title: &str,
         subtitle: &str,
         is_on: bool,
         action: UiAction,
     ) {
-        let is_hov = rect.contains(self.mouse_pos.0, self.mouse_pos.1);
-        if is_hov {
+        let hov = self.mouse_pos.1 >= TOP_BAR_GUARD_H
+            && rect.contains(self.mouse_pos.0, self.mouse_pos.1);
+        if hov {
             r.fill_rounded_rect(
-                RectF::new(rect.x - 6.0, rect.y + 1.0, rect.w + 12.0, rect.h - 2.0),
-                8.0,
+                RectF::new(rect.x + 6.0, rect.y + 3.0, rect.w - 12.0, rect.h - 6.0),
+                10.0,
                 Color::rgba(255, 255, 255, 0.045),
             );
         }
 
+        let text_x = rect.x + 18.0;
+        let text_w = (rect.w - 92.0).max(80.0);
         if subtitle.is_empty() {
             r.draw_text(
                 title,
-                RectF::new(rect.x, rect.y, rect.w - 56.0, rect.h),
-                13.8,
-                if is_hov { 600 } else { 500 },
+                RectF::new(text_x, rect.y, text_w, rect.h),
+                14.5,
+                400,
                 Theme::TEXT_PRIMARY,
                 TextAlign::Left,
                 true,
@@ -16523,9 +15606,9 @@ impl AppUi {
         } else {
             r.draw_text(
                 title,
-                RectF::new(rect.x, rect.y + 6.0, rect.w - 56.0, 20.0),
-                13.8,
-                600,
+                RectF::new(text_x, rect.y + 7.0, text_w, 20.0),
+                14.2,
+                500,
                 Theme::TEXT_PRIMARY,
                 TextAlign::Left,
                 true,
@@ -16533,45 +15616,2012 @@ impl AppUi {
             );
             r.draw_text(
                 subtitle,
-                RectF::new(rect.x, rect.y + 26.0, rect.w - 56.0, 18.0),
-                11.5,
+                RectF::new(text_x, rect.y + 27.0, text_w, 18.0),
+                11.6,
                 400,
-                Theme::TEXT_SECONDARY,
+                Color::rgba(255, 255, 255, 0.46),
                 TextAlign::Left,
                 true,
                 false,
             );
         }
 
-        let sw = RectF::new(rect.right() - 46.0, rect.center_y() - 13.0, 44.0, 26.0);
-        r.draw_liquid_glass_button(
-            sw,
-            13.0,
-            if is_on {
-                GlassBtnVariant::Tinted(Theme::SIGNAL_GREEN)
+        // Smooth animated iOS 48x28 green pill switch (`#34C759`), 0 idle CPU once settled!
+        let tgt = if is_on { 1.0f32 } else { 0.0f32 };
+        let entry = self.toggle_slide_anims.entry(anim_key).or_insert(tgt);
+        let pos = if self.settings.reduce_motion {
+            *entry = tgt;
+            tgt
+        } else if (*entry - tgt).abs() < 0.004 {
+            *entry = tgt;
+            tgt
+        } else {
+            let k = (1.0 - (-22.0 * self.frame_dt).exp()).clamp(0.08, 1.0);
+            *entry += (tgt - *entry) * k;
+            if (*entry - tgt).abs() < 0.004 {
+                *entry = tgt;
             } else {
-                GlassBtnVariant::Regular
-            },
-            is_hov,
-            self.mouse_down && is_hov,
-            self.mouse_pos,
-            self.glass_off(),
-        );
-        let knob_x = if is_on { sw.right() - 13.0 } else { sw.x + 13.0 };
-        r.fill_circle(
-            knob_x,
-            sw.center_y() + 1.0,
-            10.8,
-            Color::rgba(0, 0, 0, 0.30),
-        );
-        r.fill_circle(
-            knob_x,
-            sw.center_y(),
-            if is_hov { 10.8 } else { 10.2 },
-            Color::rgb(255, 255, 255),
-        );
+                self.has_settling_toggle = true;
+            }
+            *entry
+        };
+
+        let sw = RectF::new(rect.right() - 18.0 - 48.0, rect.center_y() - 14.0, 48.0, 28.0);
+        let off_col = if hov {
+            Color::rgba(134, 134, 142, 0.44)
+        } else {
+            Color::rgba(120, 120, 128, 0.36)
+        };
+        let on_col = Color::rgb(52, 199, 89);
+        let track_col = off_col.lerp(on_col, pos);
+        r.fill_rounded_rect(sw, 14.0, track_col);
+
+        let knob_x = sw.x + 14.0 + pos * (sw.w - 28.0);
+        let knob_y = sw.center_y();
+        r.fill_circle(knob_x, knob_y + 1.0, 11.8, Color::rgba(0, 0, 0, 0.24));
+        r.fill_circle(knob_x, knob_y, 11.5, Color::rgb(255, 255, 255));
 
         self.hit_regions.push(HitRegion { rect, action });
+    }
+
+    fn draw_ipad_action_link_row(
+        &mut self,
+        r: &mut D2DRenderer,
+        rect: RectF,
+        title: &str,
+        right_detail: &str,
+        link_color: Color,
+        show_chevron: bool,
+        action: Option<UiAction>,
+    ) {
+        let hov = action.is_some()
+            && self.mouse_pos.1 >= TOP_BAR_GUARD_H
+            && rect.contains(self.mouse_pos.0, self.mouse_pos.1);
+        if hov {
+            r.fill_rounded_rect(
+                RectF::new(rect.x + 6.0, rect.y + 3.0, rect.w - 12.0, rect.h - 6.0),
+                10.0,
+                Color::rgba(255, 255, 255, 0.045),
+            );
+        }
+        let right_pad = if show_chevron { 38.0 } else { 18.0 };
+        let detail_w = if right_detail.is_empty() {
+            0.0
+        } else {
+            (rect.w * 0.48).min(300.0)
+        };
+        r.draw_text(
+            title,
+            RectF::new(
+                rect.x + 18.0,
+                rect.y,
+                (rect.w - 36.0 - detail_w - if show_chevron { 18.0 } else { 0.0 }).max(100.0),
+                rect.h,
+            ),
+            14.5,
+            400,
+            if action.is_some() {
+                link_color
+            } else {
+                Color::rgba(255, 255, 255, 0.42)
+            },
+            TextAlign::Left,
+            true,
+            false,
+        );
+        if !right_detail.is_empty() {
+            r.draw_text(
+                right_detail,
+                RectF::new(
+                    rect.right() - right_pad - detail_w,
+                    rect.y,
+                    detail_w,
+                    rect.h,
+                ),
+                13.0,
+                400,
+                Color::rgba(255, 255, 255, 0.46),
+                TextAlign::Right,
+                true,
+                false,
+            );
+        }
+        if show_chevron {
+            r.draw_icon(
+                SfIcon::ChevronRight,
+                RectF::new(rect.right() - 28.0, rect.center_y() - 6.5, 13.0, 13.0),
+                Color::rgba(255, 255, 255, 0.34),
+            );
+        }
+        if let Some(act) = action {
+            self.hit_regions.push(HitRegion { rect, action: act });
+        }
+    }
+
+    fn draw_ipad_value_row(
+        &mut self,
+        r: &mut D2DRenderer,
+        rect: RectF,
+        title: &str,
+        value: &str,
+        chevron: Option<SfIcon>,
+        action: Option<UiAction>,
+    ) {
+        let hov = action.is_some()
+            && self.mouse_pos.1 >= TOP_BAR_GUARD_H
+            && rect.contains(self.mouse_pos.0, self.mouse_pos.1);
+        if hov {
+            r.fill_rounded_rect(
+                RectF::new(rect.x + 6.0, rect.y + 3.0, rect.w - 12.0, rect.h - 6.0),
+                10.0,
+                Color::rgba(255, 255, 255, 0.045),
+            );
+        }
+        let has_chev = chevron.is_some();
+        let right_edge = rect.right() - if has_chev { 36.0 } else { 18.0 };
+        let title_w = 188.0f32.min(rect.w * 0.44);
+        r.draw_text(
+            title,
+            RectF::new(rect.x + 18.0, rect.y, title_w, rect.h),
+            14.5,
+            400,
+            Theme::TEXT_PRIMARY,
+            TextAlign::Left,
+            true,
+            false,
+        );
+        if !value.is_empty() {
+            let val_x = rect.x + 18.0 + title_w + 8.0;
+            let val_w = (right_edge - val_x).max(60.0);
+            r.draw_text(
+                value,
+                RectF::new(val_x, rect.y, val_w, rect.h),
+                13.2,
+                400,
+                Color::rgba(255, 255, 255, 0.50),
+                TextAlign::Right,
+                true,
+                false,
+            );
+        }
+        if let Some(ic) = chevron {
+            r.draw_icon(
+                ic,
+                RectF::new(rect.right() - 28.0, rect.center_y() - 6.5, 13.0, 13.0),
+                if hov {
+                    Color::rgba(255, 255, 255, 0.65)
+                } else {
+                    Color::rgba(255, 255, 255, 0.34)
+                },
+            );
+        }
+        if let Some(act) = action {
+            self.hit_regions.push(HitRegion { rect, action: act });
+        }
+    }
+
+    fn draw_settings_page(&mut self, r: &mut D2DRenderer, x0: f32, mut y: f32, w: f32) -> f32 {
+        let cw = w.min(700.0);
+        let cx = x0 + ((w - cw) * 0.5).max(0.0);
+        let view_h = r.logical_height();
+        let ios_blue = Color::rgb(10, 132, 255);
+        let active_be = self.settings.playback_backend;
+        let be_accent = active_be.accent_color();
+        self.token_box_rect = RectF::default();
+
+        // Centered iPadOS Settings Title
+        if y + 36.0 >= -40.0 && y <= view_h + 40.0 {
+            r.draw_text(
+                "设置",
+                RectF::new(cx, y, cw, 34.0),
+                22.0,
+                700,
+                Theme::TEXT_PRIMARY,
+                TextAlign::Center,
+                true,
+                false,
+            );
+        }
+        y += 46.0;
+
+        // --------------------------------------------------------------------
+        // Section 1: 播放后端与音乐源 + 界面语言
+        // --------------------------------------------------------------------
+        {
+            let card_h = 104.0f32;
+            let foot_h = 32.0f32;
+            let sec_h = 27.0 + card_h + 6.0 + foot_h + 14.0;
+            if y + sec_h >= -60.0 && y <= view_h + 60.0 {
+                let cy = Self::draw_ipad_section_header(r, cx, y, cw, "播放后端与音乐源");
+                let card = RectF::new(cx, cy, cw, card_h);
+                Self::draw_ipad_card_box(r, card, false);
+
+                // Row 1: 5-segment Playback Backend control
+                let be_items: [(&str, bool, UiAction); 5] = std::array::from_fn(|i| {
+                    let be = PlaybackBackend::ALL[i];
+                    (
+                        be.short_label(),
+                        active_be == be,
+                        UiAction::SetPlaybackBackend(be),
+                    )
+                });
+                self.draw_ipad_segmented(
+                    r,
+                    RectF::new(cx + 18.0, cy + 10.0, cw - 36.0, 32.0),
+                    be_items,
+                    12.2,
+                    false,
+                );
+                Self::draw_ipad_divider(r, cx, cw, cy + 52.0);
+
+                // Row 2: 界面语言 + 6-segment control
+                let lbl_w = 104.0f32;
+                r.draw_text(
+                    "界面语言",
+                    RectF::new(cx + 18.0, cy + 52.0, lbl_w, 52.0),
+                    14.5,
+                    400,
+                    Theme::TEXT_PRIMARY,
+                    TextAlign::Left,
+                    true,
+                    false,
+                );
+                let lang_items: [(&str, bool, UiAction); 6] = std::array::from_fn(|i| {
+                    let lang = AppLanguage::ALL[i];
+                    (
+                        lang.autonym(),
+                        self.settings.language == lang,
+                        UiAction::SetAppLanguage(lang),
+                    )
+                });
+                let seg_x = cx + 18.0 + lbl_w + 8.0;
+                let seg_w = (cx + cw - 18.0 - seg_x).max(260.0);
+                self.draw_ipad_segmented(
+                    r,
+                    RectF::new(seg_x, cy + 62.0, seg_w, 32.0),
+                    lang_items,
+                    11.8,
+                    false,
+                );
+
+                Self::draw_ipad_section_footer(
+                    r,
+                    cx,
+                    cy + card_h,
+                    cw,
+                    active_be.description(),
+                    foot_h,
+                );
+            }
+            y += sec_h;
+        }
+
+        // --------------------------------------------------------------------
+        // Section 2: Backend-Adaptive Account & Engine Card
+        // --------------------------------------------------------------------
+        match active_be {
+            PlaybackBackend::AppleMusicWeb => {
+                let card_h = 98.0f32;
+                let foot_h = 32.0f32;
+                let sec_h = 27.0 + card_h + 6.0 + foot_h + 14.0;
+                if y + sec_h >= -60.0 && y <= view_h + 60.0 {
+                    let cy = Self::draw_ipad_section_header(
+                        r,
+                        cx,
+                        y,
+                        cw,
+                        "网页版 Apple Music 播放引擎 (Edge MusicKit JS)",
+                    );
+                    let card = RectF::new(cx, cy, cw, card_h);
+                    Self::draw_ipad_card_box(r, card, false);
+
+                    let st_col = if self.web_am_status.authorized {
+                        Theme::SIGNAL_GREEN
+                    } else if self.web_am_status.running {
+                        Theme::SIGNAL_AMBER
+                    } else {
+                        Color::rgba(255, 255, 255, 0.56)
+                    };
+                    r.draw_text(
+                        &self.web_am_status.status_text,
+                        RectF::new(cx + 18.0, cy, cw - 36.0, 48.0),
+                        13.0,
+                        500,
+                        st_col,
+                        TextAlign::Left,
+                        true,
+                        false,
+                    );
+                    Self::draw_ipad_divider(r, cx, cw, cy + 48.0);
+
+                    let vis_lbl = if self.web_am_status.window_visible {
+                        "隐藏网页窗口"
+                    } else {
+                        "显示网页窗口"
+                    };
+                    let mut wx = cx + 18.0;
+                    for (lbl, bw, acc, dest, act) in [
+                        ("启动 / 网页登录", 124.0f32, Some(be_accent), false, UiAction::StartWebAmLogin),
+                        (vis_lbl, 102.0, None, false, UiAction::ToggleWebAmWindow),
+                        ("同步网页 Token", 112.0, None, false, UiAction::SyncWebAmToken),
+                        ("关闭引擎", 80.0, None, true, UiAction::ShutdownWebAm),
+                    ] {
+                        let br = RectF::new(wx, cy + 59.0, bw, 28.0);
+                        self.draw_ipad_pill_btn(r, br, lbl, acc, dest, Some(act));
+                        wx += bw + 8.0;
+                    }
+
+                    Self::draw_ipad_section_footer(
+                        r,
+                        cx,
+                        cy + card_h,
+                        cw,
+                        "使用本机 Edge 独立配置文件运行 MusicKit JS（支持 Widevine 完整曲库与电台，登录后自动同步个人资料库 Token）",
+                        foot_h,
+                    );
+                }
+                y += sec_h;
+            }
+            PlaybackBackend::NetEase => {
+                let has_qr = self.netease_qr.is_some();
+                let card_h = if has_qr { 326.0f32 } else { 158.0f32 };
+                let foot_h = 32.0f32;
+                let sec_h = 27.0 + card_h + 6.0 + foot_h + 14.0;
+                if y + sec_h >= -60.0 && y <= view_h + 60.0 {
+                    let cy = Self::draw_ipad_section_header(r, cx, y, cw, "网易云音乐账号与音质");
+                    let card = RectF::new(cx, cy, cw, card_h);
+                    Self::draw_ipad_card_box(r, card, false);
+
+                    // Row 1: Account status + VIP pill
+                    r.draw_text(
+                        "网易云账号",
+                        RectF::new(cx + 18.0, cy + 8.0, 120.0, 22.0),
+                        14.5,
+                        500,
+                        Theme::TEXT_PRIMARY,
+                        TextAlign::Left,
+                        true,
+                        false,
+                    );
+                    let mut st_x = cx + 18.0;
+                    let st_y = cy + 31.0;
+                    if self.netease_account.logged_in {
+                        let vip_lbl = if self.netease_account.vip_label.trim().is_empty() {
+                            if self.netease_account.is_vip {
+                                "黑胶 VIP"
+                            } else {
+                                "普通用户"
+                            }
+                        } else {
+                            self.netease_account.vip_label.as_str()
+                        };
+                        let pill_w = (vip_lbl.chars().count() as f32 * 9.6 + 18.0).clamp(62.0, 144.0);
+                        let pill = RectF::new(st_x, st_y + 1.0, pill_w, 20.0);
+                        if self.netease_account.is_vip {
+                            r.fill_rounded_rect(pill, 10.0, Color::rgba(232, 178, 68, 0.22));
+                            r.stroke_rounded_rect(pill, 10.0, Color::rgba(246, 198, 96, 0.55), 1.0);
+                            r.draw_text(
+                                vip_lbl,
+                                pill,
+                                10.8,
+                                700,
+                                Color::rgb(252, 214, 124),
+                                TextAlign::Center,
+                                true,
+                                false,
+                            );
+                        } else {
+                            r.fill_rounded_rect(pill, 10.0, Color::rgba(255, 255, 255, 0.08));
+                            r.draw_text(
+                                vip_lbl,
+                                pill,
+                                10.8,
+                                500,
+                                Color::rgba(255, 255, 255, 0.62),
+                                TextAlign::Center,
+                                true,
+                                false,
+                            );
+                        }
+                        st_x = pill.right() + 8.0;
+                    }
+                    r.draw_text(
+                        &self.netease_account.message,
+                        RectF::new(st_x, st_y, (cx + cw - 18.0 - st_x).max(120.0), 22.0),
+                        12.2,
+                        400,
+                        if self.netease_account.logged_in {
+                            Theme::SIGNAL_GREEN
+                        } else {
+                            Color::rgba(255, 255, 255, 0.52)
+                        },
+                        TextAlign::Left,
+                        true,
+                        false,
+                    );
+                    Self::draw_ipad_divider(r, cx, cw, cy + 58.0);
+
+                    // Row 2: Action pills
+                    let mut nx = cx + 18.0;
+                    for (lbl, bw, acc, dest, act) in [
+                        ("扫码登录", 78.0f32, Some(be_accent), false, UiAction::StartNetEaseQrLogin),
+                        ("粘贴 Cookie", 88.0, None, false, UiAction::PasteNetEaseCookie),
+                        (
+                            "一起听",
+                            66.0,
+                            if self.listen_together.in_room {
+                                Some(be_accent)
+                            } else {
+                                None
+                            },
+                            false,
+                            UiAction::OpenListenTogetherModal,
+                        ),
+                        ("网页端", 60.0, None, false, UiAction::OpenWebNetEase),
+                        ("退出", 52.0, None, true, UiAction::ClearNetEaseAuth),
+                    ] {
+                        let br = RectF::new(nx, cy + 69.0, bw, 28.0);
+                        self.draw_ipad_pill_btn(r, br, lbl, acc, dest, Some(act));
+                        nx += bw + 8.0;
+                    }
+
+                    // Optional Inline QR Panel
+                    let mut q_row_y = cy + 106.0;
+                    let mut qr_btn_origin: Option<(f32, f32)> = None;
+                    if let Some(ref qr) = self.netease_qr {
+                        Self::draw_ipad_divider(r, cx, cw, q_row_y);
+                        let qr_box = RectF::new(cx + 22.0, q_row_y + 12.0, 144.0, 144.0);
+                        r.fill_rounded_rect(qr_box, 10.0, Color::rgba(255, 255, 255, 0.98));
+                        if qr.qr_width > 0 && qr.qr_modules.len() == qr.qr_width * qr.qr_width {
+                            let quiet = 10.0;
+                            let cell = (qr_box.w - quiet * 2.0) / (qr.qr_width as f32);
+                            let dark = Color::rgb(14, 16, 20);
+                            for row_i in 0..qr.qr_width {
+                                for col_i in 0..qr.qr_width {
+                                    if qr.qr_modules[row_i * qr.qr_width + col_i] {
+                                        r.fill_rect(
+                                            RectF::new(
+                                                qr_box.x + quiet + (col_i as f32) * cell,
+                                                qr_box.y + quiet + (row_i as f32) * cell,
+                                                cell + 0.25,
+                                                cell + 0.25,
+                                            ),
+                                            dark,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        let info_x = qr_box.right() + 18.0;
+                        let info_w = (cx + cw - 18.0 - info_x).max(160.0);
+                        r.draw_text(
+                            "打开手机「网易云音乐」扫一扫",
+                            RectF::new(info_x, q_row_y + 18.0, info_w, 22.0),
+                            14.5,
+                            600,
+                            Theme::TEXT_PRIMARY,
+                            TextAlign::Left,
+                            true,
+                            false,
+                        );
+                        r.draw_text(
+                            &qr.status_text,
+                            RectF::new(info_x, q_row_y + 46.0, info_w, 22.0),
+                            12.8,
+                            500,
+                            if qr.status_code == 802 {
+                                Theme::SIGNAL_GREEN
+                            } else if qr.status_code == 800 {
+                                Theme::ACCENT_RED
+                            } else {
+                                Theme::SIGNAL_AMBER
+                            },
+                            TextAlign::Left,
+                            true,
+                            false,
+                        );
+                        r.draw_text(
+                            "扫码确认后自动获取 MUSIC_U 并同步你的自建/收藏歌单、每日推荐与 VIP 音质。",
+                            RectF::new(info_x, q_row_y + 74.0, info_w, 36.0),
+                            11.6,
+                            400,
+                            Color::rgba(255, 255, 255, 0.50),
+                            TextAlign::Left,
+                            false,
+                            true,
+                        );
+                        qr_btn_origin = Some((info_x, q_row_y + 120.0));
+                        q_row_y += 168.0;
+                    }
+                    if let Some((bx0, by0)) = qr_btn_origin {
+                        let ref_btn = RectF::new(bx0, by0, 96.0, 28.0);
+                        self.draw_ipad_pill_btn(
+                            r,
+                            ref_btn,
+                            "刷新二维码",
+                            None,
+                            false,
+                            Some(UiAction::StartNetEaseQrLogin),
+                        );
+                        let cls_btn = RectF::new(ref_btn.right() + 8.0, by0, 68.0, 28.0);
+                        self.draw_ipad_pill_btn(
+                            r,
+                            cls_btn,
+                            "收起",
+                            None,
+                            false,
+                            Some(UiAction::CancelNetEaseQrLogin),
+                        );
+                    }
+
+                    Self::draw_ipad_divider(r, cx, cw, q_row_y);
+                    r.draw_text(
+                        "网易云音质",
+                        RectF::new(cx + 18.0, q_row_y, 120.0, 52.0),
+                        14.5,
+                        400,
+                        Theme::TEXT_PRIMARY,
+                        TextAlign::Left,
+                        true,
+                        false,
+                    );
+                    let ne_q_items: [(&str, bool, UiAction); 4] = std::array::from_fn(|i| {
+                        let q = NetEaseQuality::ALL[i];
+                        (
+                            q.label(),
+                            self.settings.netease_quality == q,
+                            UiAction::SetNetEaseQuality(q),
+                        )
+                    });
+                    let q_seg_w = (cw - 160.0).min(420.0).max(240.0);
+                    self.draw_ipad_segmented(
+                        r,
+                        RectF::new(cx + cw - 18.0 - q_seg_w, q_row_y + 10.0, q_seg_w, 32.0),
+                        ne_q_items,
+                        11.8,
+                        false,
+                    );
+
+                    Self::draw_ipad_section_footer(
+                        r,
+                        cx,
+                        cy + card_h,
+                        cw,
+                        "音频通过 MediaFoundation + WASAPI 原生直出，自动优先加载网易云精确曲目 ID 逐字歌词 (YRC) 与翻译。",
+                        foot_h,
+                    );
+                }
+                y += sec_h;
+            }
+            PlaybackBackend::QQMusic => {
+                let card_h = 158.0f32;
+                let foot_h = 32.0f32;
+                let sec_h = 27.0 + card_h + 6.0 + foot_h + 14.0;
+                if y + sec_h >= -60.0 && y <= view_h + 60.0 {
+                    let cy = Self::draw_ipad_section_header(r, cx, y, cw, "QQ 音乐账号与音质");
+                    let card = RectF::new(cx, cy, cw, card_h);
+                    Self::draw_ipad_card_box(r, card, false);
+
+                    r.draw_text(
+                        "QQ 音乐账号",
+                        RectF::new(cx + 18.0, cy + 8.0, 120.0, 22.0),
+                        14.5,
+                        500,
+                        Theme::TEXT_PRIMARY,
+                        TextAlign::Left,
+                        true,
+                        false,
+                    );
+                    r.draw_text(
+                        &self.qq_account.message,
+                        RectF::new(cx + 18.0, cy + 31.0, cw - 36.0, 22.0),
+                        12.2,
+                        400,
+                        if self.qq_account.logged_in {
+                            Theme::SIGNAL_GREEN
+                        } else {
+                            Color::rgba(255, 255, 255, 0.52)
+                        },
+                        TextAlign::Left,
+                        true,
+                        false,
+                    );
+                    Self::draw_ipad_divider(r, cx, cw, cy + 58.0);
+
+                    let mut qbx = cx + 18.0;
+                    for (lbl, bw, acc, dest, act) in [
+                        ("粘贴 Cookie", 92.0f32, Some(be_accent), false, UiAction::PasteQQCookie),
+                        ("打开 y.qq.com", 98.0, None, false, UiAction::OpenWebQQMusic),
+                        ("清除", 56.0, None, true, UiAction::ClearQQAuth),
+                    ] {
+                        let br = RectF::new(qbx, cy + 69.0, bw, 28.0);
+                        self.draw_ipad_pill_btn(r, br, lbl, acc, dest, Some(act));
+                        qbx += bw + 8.0;
+                    }
+                    Self::draw_ipad_divider(r, cx, cw, cy + 106.0);
+
+                    r.draw_text(
+                        "QQ 音乐音质",
+                        RectF::new(cx + 18.0, cy + 106.0, 120.0, 52.0),
+                        14.5,
+                        400,
+                        Theme::TEXT_PRIMARY,
+                        TextAlign::Left,
+                        true,
+                        false,
+                    );
+                    let qq_q_items: [(&str, bool, UiAction); 4] = std::array::from_fn(|i| {
+                        let q = QQQuality::ALL[i];
+                        (
+                            q.label(),
+                            self.settings.qq_quality == q,
+                            UiAction::SetQQQuality(q),
+                        )
+                    });
+                    let q_seg_w = (cw - 160.0).min(420.0).max(240.0);
+                    self.draw_ipad_segmented(
+                        r,
+                        RectF::new(cx + cw - 18.0 - q_seg_w, cy + 116.0, q_seg_w, 32.0),
+                        qq_q_items,
+                        11.8,
+                        false,
+                    );
+
+                    Self::draw_ipad_section_footer(
+                        r,
+                        cx,
+                        cy + card_h,
+                        cw,
+                        "粘贴包含 uin 与 qm_keyst 的浏览器 Cookie 可同步个人「我喜欢」与歌单；若选高音质无权限会自动平滑降级播放。",
+                        foot_h,
+                    );
+                }
+                y += sec_h;
+            }
+            PlaybackBackend::ExternalSmtc => {
+                let card_h = 52.0f32;
+                let foot_h = 32.0f32;
+                let sec_h = 27.0 + card_h + 6.0 + foot_h + 14.0;
+                if y + sec_h >= -60.0 && y <= view_h + 60.0 {
+                    let cy = Self::draw_ipad_section_header(
+                        r,
+                        cx,
+                        y,
+                        cw,
+                        "通用外置播放器接管 (Windows SMTC)",
+                    );
+                    let card = RectF::new(cx, cy, cw, card_h);
+                    Self::draw_ipad_card_box(r, card, true);
+
+                    let live_lbl = if self.smtc.active && !self.smtc.title.is_empty() {
+                        format!(
+                            "当前接管：{} — {} ({})",
+                            self.smtc.title,
+                            self.smtc.artist,
+                            if self.smtc.app_id.is_empty() {
+                                "系统媒体"
+                            } else {
+                                &self.smtc.app_id
+                            }
+                        )
+                    } else {
+                        "尚未检测到活跃的外部媒体会话（在 Spotify / 网易云客户端 / QQ 音乐客户端 / 浏览器播放即可自动接管）".to_string()
+                    };
+                    r.draw_text(
+                        &live_lbl,
+                        RectF::new(cx + 18.0, cy, cw - 36.0, card_h),
+                        13.0,
+                        500,
+                        if self.smtc.active {
+                            Theme::SIGNAL_GREEN
+                        } else {
+                            Color::rgba(255, 255, 255, 0.56)
+                        },
+                        TextAlign::Left,
+                        true,
+                        false,
+                    );
+                    Self::draw_ipad_section_footer(
+                        r,
+                        cx,
+                        cy + card_h,
+                        cw,
+                        "此模式不会抢占音频焦点，完整保留 AM Light 的逐字滚动歌词与实时音频可视化分析。",
+                        foot_h,
+                    );
+                }
+                y += sec_h;
+            }
+            PlaybackBackend::AppleMusicNative => {}
+        }
+
+        // Apple Music Account & Storefront Card (Native + Web)
+        if active_be.is_apple_music() {
+            let has_auth_msg = self.auth_result.is_some();
+            let card_h = if has_auth_msg { 224.0f32 } else { 204.0f32 };
+            let sec_h = 27.0 + card_h + 20.0;
+            if y + sec_h >= -60.0 && y <= view_h + 60.0 {
+                let cy = Self::draw_ipad_section_header(r, cx, y, cw, "Apple Music 账号与地区");
+                let card = RectF::new(cx, cy, cw, card_h);
+                Self::draw_ipad_card_box(r, card, false);
+
+                // Row 1: Official Apple Music Desktop Client status + Sync pill
+                r.draw_text(
+                    "原装客户端账号",
+                    RectF::new(cx + 18.0, cy + 7.0, cw - 144.0, 20.0),
+                    14.2,
+                    500,
+                    Theme::TEXT_PRIMARY,
+                    TextAlign::Left,
+                    true,
+                    false,
+                );
+                let off_desc = if self.official_account.signed_in {
+                    let mut parts = Vec::new();
+                    parts.push("已读取登录".to_string());
+                    if let Some(ref n) = self.official_account.display_name {
+                        parts.push(n.clone());
+                    }
+                    if let Some(ref sf) = self.official_account.storefront {
+                        parts.push(format!("{} 区", sf.to_uppercase()));
+                    }
+                    if self.official_account.subscription_active {
+                        parts.push("订阅有效（可直接播放）".to_string());
+                    }
+                    parts.join(" · ")
+                } else {
+                    "未检测到桌面版 Apple Music 登录记录".to_string()
+                };
+                r.draw_text(
+                    &off_desc,
+                    RectF::new(cx + 18.0, cy + 28.0, cw - 144.0, 18.0),
+                    11.8,
+                    400,
+                    if self.official_account.signed_in {
+                        Theme::SIGNAL_GREEN
+                    } else {
+                        Color::rgba(255, 255, 255, 0.48)
+                    },
+                    TextAlign::Left,
+                    true,
+                    false,
+                );
+                let sync_btn = RectF::new(cx + cw - 18.0 - 94.0, cy + 13.0, 94.0, 28.0);
+                self.draw_ipad_pill_btn(
+                    r,
+                    sync_btn,
+                    "同步原装端",
+                    None,
+                    false,
+                    Some(UiAction::SyncOfficialClientAccount),
+                );
+                Self::draw_ipad_divider(r, cx, cw, cy + 54.0);
+
+                // Row 2: Storefront 8-segment control
+                r.draw_text(
+                    "内容地区",
+                    RectF::new(cx + 18.0, cy + 54.0, 108.0, 52.0),
+                    14.5,
+                    400,
+                    Theme::TEXT_PRIMARY,
+                    TextAlign::Left,
+                    true,
+                    false,
+                );
+                let regions: [(&str, &str); 8] = [
+                    ("cn", "CN"),
+                    ("hk", "HK"),
+                    ("tw", "TW"),
+                    ("jp", "JP"),
+                    ("kr", "KR"),
+                    ("us", "US"),
+                    ("gb", "GB"),
+                    ("sg", "SG"),
+                ];
+                let reg_items: [(&str, bool, UiAction); 8] = std::array::from_fn(|i| {
+                    let (code, lbl) = regions[i];
+                    (
+                        lbl,
+                        self.settings.storefront == code,
+                        UiAction::SetStorefront(code.to_string()),
+                    )
+                });
+                let reg_w = (cw - 144.0).min(384.0).max(260.0);
+                self.draw_ipad_segmented(
+                    r,
+                    RectF::new(cx + cw - 18.0 - reg_w, cy + 64.0, reg_w, 32.0),
+                    reg_items,
+                    11.4,
+                    true,
+                );
+                Self::draw_ipad_divider(r, cx, cw, cy + 106.0);
+
+                // Row 3: Personal Library Token + Flat Dark Input Box
+                let tok_y = cy + 115.0;
+                let tok_status = if self.settings.user_token.is_empty() {
+                    "个人资料库授权 (Media-User-Token)：未配置".to_string()
+                } else {
+                    format!(
+                        "个人资料库授权：已持久保存 ({} 字符)",
+                        self.settings.user_token.len()
+                    )
+                };
+                r.draw_text(
+                    &tok_status,
+                    RectF::new(cx + 18.0, tok_y, (cw - 320.0).max(160.0), 26.0),
+                    13.2,
+                    500,
+                    Theme::TEXT_PRIMARY,
+                    TextAlign::Left,
+                    true,
+                    false,
+                );
+                let mut bx = cx + cw - 18.0;
+                for (lbl, bw, acc, dest, act) in [
+                    ("清除", 48.0f32, None, true, UiAction::ClearUserToken),
+                    ("验证", 48.0, None, false, UiAction::VerifyUserToken),
+                    ("打开网页端", 80.0, None, false, UiAction::OpenWebAppleMusic),
+                    ("粘贴保存", 76.0, Some(Theme::ACCENT_RED), false, UiAction::PasteUserToken),
+                ] {
+                    bx -= bw;
+                    let br = RectF::new(bx, tok_y - 1.0, bw, 27.0);
+                    self.draw_ipad_pill_btn(r, br, lbl, acc, dest, Some(act));
+                    bx -= 6.0;
+                }
+
+                let tbox = RectF::new(cx + 18.0, cy + 150.0, cw - 36.0, 36.0);
+                self.token_box_rect = tbox;
+                let tbox_hov = self.mouse_pos.1 >= TOP_BAR_GUARD_H
+                    && tbox.contains(self.mouse_pos.0, self.mouse_pos.1);
+                r.fill_rounded_rect(
+                    tbox,
+                    9.0,
+                    if tbox_hov {
+                        Color::rgb(22, 22, 26)
+                    } else {
+                        Color::rgb(16, 16, 18)
+                    },
+                );
+                r.stroke_rounded_rect(
+                    tbox,
+                    9.0,
+                    if self.token_box_focused {
+                        ios_blue
+                    } else if tbox_hov {
+                        Color::rgba(255, 255, 255, 0.24)
+                    } else if !self.settings.user_token.is_empty() {
+                        Theme::SIGNAL_GREEN.with_alpha(0.45)
+                    } else {
+                        Color::rgba(255, 255, 255, 0.10)
+                    },
+                    if self.token_box_focused || tbox_hov { 1.3 } else { 1.0 },
+                );
+                let box_text = if !self.settings.user_token.is_empty() {
+                    let masked = am_api::mask_user_token_preview(&self.settings.user_token);
+                    if self.token_box_focused {
+                        format!("{masked}   (按 Ctrl+V 可覆盖更新)")
+                    } else {
+                        format!("已保存：{masked}   (重启后自动保留 · 点击可按 Ctrl+V 更新)")
+                    }
+                } else if self.token_box_focused {
+                    "请按 Ctrl+V 粘贴 Media-User-Token 或完整 Cookie 字符串...".to_string()
+                } else {
+                    "点击此处按 Ctrl+V 粘贴 Media-User-Token（用于同步云端歌单与收藏专辑）".to_string()
+                };
+                r.draw_mono_text(
+                    &box_text,
+                    tbox.inset(12.0, 0.0),
+                    11.8,
+                    if self.settings.user_token.is_empty() { 400 } else { 500 },
+                    if !self.settings.user_token.is_empty() {
+                        Theme::SIGNAL_GREEN
+                    } else if self.token_box_focused || tbox_hov {
+                        Theme::TEXT_PRIMARY
+                    } else {
+                        Color::rgba(255, 255, 255, 0.50)
+                    },
+                    TextAlign::Left,
+                    true,
+                );
+                self.hit_regions.push(HitRegion {
+                    rect: tbox,
+                    action: UiAction::FocusTokenBox,
+                });
+
+                if let Some(ref ar) = self.auth_result {
+                    r.draw_text(
+                        &ar.message,
+                        RectF::new(cx + 18.0, cy + 194.0, cw - 36.0, 18.0),
+                        11.6,
+                        400,
+                        if ar.user_token_ok {
+                            Theme::SIGNAL_GREEN
+                        } else {
+                            Color::rgba(255, 255, 255, 0.56)
+                        },
+                        TextAlign::Left,
+                        true,
+                        false,
+                    );
+                }
+            }
+            y += sec_h;
+        }
+
+        // Apple Music Native DRM Diagnostics Card
+        if active_be == PlaybackBackend::AppleMusicNative {
+            let card_h = 104.0f32;
+            let sec_h = 27.0 + card_h + 20.0;
+            if y + sec_h >= -60.0 && y <= view_h + 60.0 {
+                let cy = Self::draw_ipad_section_header(r, cx, y, cw, "播放故障诊断与 DRM 修复");
+                let card = RectF::new(cx, cy, cw, card_h);
+                Self::draw_ipad_card_box(r, card, false);
+
+                r.draw_text(
+                    "原版 Apple Music 无法播放 / 点歌秒切修复",
+                    RectF::new(cx + 18.0, cy, (cw - 280.0).max(150.0), 48.0),
+                    14.0,
+                    500,
+                    Theme::TEXT_PRIMARY,
+                    TextAlign::Left,
+                    true,
+                    false,
+                );
+                let need_fix = self.drm_diag.checked
+                    && (!self.drm_diag.healthy || !self.drm_diag.hklm_redirections.is_empty());
+                let repair_lbl = if self.drm_repair_running {
+                    "修复中..."
+                } else {
+                    "一键修复"
+                };
+                let mut dx = cx + cw - 18.0;
+                for (lbl, bw, acc, act) in [
+                    ("项目主页", 72.0f32, None, UiAction::OpenDrmFixRepo),
+                    ("重新检测", 72.0, None, UiAction::CheckDrmHealth),
+                    (
+                        repair_lbl,
+                        80.0,
+                        if need_fix { Some(Theme::ACCENT_RED) } else { None },
+                        UiAction::RunDrmRepair,
+                    ),
+                ] {
+                    dx -= bw;
+                    let br = RectF::new(dx, cy + 10.0, bw, 28.0);
+                    self.draw_ipad_pill_btn(r, br, lbl, acc, false, Some(act));
+                    dx -= 6.0;
+                }
+                Self::draw_ipad_divider(r, cx, cw, cy + 48.0);
+
+                let (sum_txt, sum_col) = if !self.drm_diag.checked {
+                    (
+                        "正在检测 Anisette / ADI 设备身份与权限状态...",
+                        Color::rgba(255, 255, 255, 0.56),
+                    )
+                } else if !self.drm_diag.healthy {
+                    (self.drm_diag.summary.as_str(), Theme::ACCENT_RED)
+                } else if !self.drm_diag.hklm_redirections.is_empty() {
+                    (self.drm_diag.summary.as_str(), Theme::SIGNAL_AMBER)
+                } else {
+                    (self.drm_diag.summary.as_str(), Theme::SIGNAL_GREEN)
+                };
+                r.draw_text(
+                    sum_txt,
+                    RectF::new(cx + 18.0, cy + 56.0, cw - 36.0, 20.0),
+                    12.2,
+                    500,
+                    sum_col,
+                    TextAlign::Left,
+                    true,
+                    false,
+                );
+                let det_txt = if self.drm_diag.checked {
+                    self.drm_diag.detail.as_str()
+                } else {
+                    "支持无管理员权限快速检测，或一键备份并修复目录写入权限与第三方重定向"
+                };
+                r.draw_text(
+                    det_txt,
+                    RectF::new(cx + 18.0, cy + 77.0, cw - 36.0, 18.0),
+                    11.4,
+                    400,
+                    Color::rgba(255, 255, 255, 0.46),
+                    TextAlign::Left,
+                    true,
+                    false,
+                );
+            }
+            y += sec_h;
+        }
+
+        // --------------------------------------------------------------------
+        // Section 3: 音频 (Authentic iPadOS Settings -> Music Audio Group)
+        // --------------------------------------------------------------------
+        {
+            let card_h = 52.0 + 48.0 + 54.0 + 48.0 + 48.0;
+            let foot_h = 20.0f32;
+            let sec_h = 27.0 + card_h + 6.0 + foot_h + 14.0;
+            if y + sec_h >= -60.0 && y <= view_h + 60.0 {
+                let cy = Self::draw_ipad_section_header(r, cx, y, cw, "音频");
+                let card = RectF::new(cx, cy, cw, card_h);
+                Self::draw_ipad_card_box(r, card, false);
+                let mut ry = cy;
+
+                // Row 1: Streaming Quality 3-segment control
+                r.draw_text(
+                    "音频质量",
+                    RectF::new(cx + 18.0, ry, 132.0, 52.0),
+                    14.5,
+                    400,
+                    Theme::TEXT_PRIMARY,
+                    TextAlign::Left,
+                    true,
+                    false,
+                );
+                let q_seg_w = (cw - 170.0).min(380.0).max(240.0);
+                let q_items = [
+                    (
+                        "Hi-Res 24/192",
+                        self.audio_prefs.lossless_enabled
+                            && self.audio_prefs.streaming_audio_quality == 20,
+                        UiAction::SetStreamingQuality {
+                            lossless: true,
+                            quality: 20,
+                        },
+                    ),
+                    (
+                        "无损 24/48",
+                        self.audio_prefs.lossless_enabled
+                            && self.audio_prefs.streaming_audio_quality == 15,
+                        UiAction::SetStreamingQuality {
+                            lossless: true,
+                            quality: 15,
+                        },
+                    ),
+                    (
+                        "高质量 AAC",
+                        !self.audio_prefs.lossless_enabled,
+                        UiAction::SetStreamingQuality {
+                            lossless: false,
+                            quality: 10,
+                        },
+                    ),
+                ];
+                self.draw_ipad_segmented(
+                    r,
+                    RectF::new(cx + cw - 18.0 - q_seg_w, ry + 10.0, q_seg_w, 32.0),
+                    q_items,
+                    11.8,
+                    false,
+                );
+                ry += 52.0;
+                Self::draw_ipad_divider(r, cx, cw, ry);
+
+                // Row 2: Output Audio Device value row + chevron
+                let def_dev = self
+                    .devices
+                    .iter()
+                    .find(|d| d.is_default)
+                    .map(|d| {
+                        format!(
+                            "{} ({:.1}kHz/{}bit)",
+                            d.name,
+                            d.sample_rate as f32 / 1000.0,
+                            d.bit_depth
+                        )
+                    })
+                    .unwrap_or_else(|| "系统默认输出设备".to_string());
+                let next_dev_act = if self.devices.len() > 1 {
+                    let cur_i = self.devices.iter().position(|d| d.is_default).unwrap_or(0);
+                    let next_id = self.devices[(cur_i + 1) % self.devices.len()].id.clone();
+                    Some(UiAction::SelectOutputDevice(next_id))
+                } else {
+                    None
+                };
+                self.draw_ipad_value_row(
+                    r,
+                    RectF::new(cx, ry, cw, 48.0),
+                    "音频输出设备",
+                    &def_dev,
+                    if next_dev_act.is_some() {
+                        Some(SfIcon::ChevronRight)
+                    } else {
+                        None
+                    },
+                    next_dev_act,
+                );
+                ry += 48.0;
+                Self::draw_ipad_divider(r, cx, cw, ry);
+
+                // Row 3: Playback Mode (`内置播放服务` / `Apple Music 应用`) + optional session release
+                r.draw_text(
+                    "播放方式",
+                    RectF::new(cx + 18.0, ry + 7.0, 120.0, 20.0),
+                    14.2,
+                    400,
+                    Theme::TEXT_PRIMARY,
+                    TextAlign::Left,
+                    true,
+                    false,
+                );
+                let svc_sub = if self.agent_status.connected {
+                    "内置服务已连接"
+                } else {
+                    "按需自动连接"
+                };
+                r.draw_text(
+                    svc_sub,
+                    RectF::new(cx + 18.0, ry + 28.0, 112.0, 18.0),
+                    11.6,
+                    400,
+                    Color::rgba(255, 255, 255, 0.46),
+                    TextAlign::Left,
+                    true,
+                    false,
+                );
+                if self.agent_status.connected {
+                    let rel_btn = RectF::new(cx + 128.0, ry + 24.0, 68.0, 22.0);
+                    self.draw_ipad_pill_btn(
+                        r,
+                        rel_btn,
+                        "释放会话",
+                        None,
+                        false,
+                        Some(UiAction::DisconnectBuiltinService),
+                    );
+                }
+                let mode_w = 248.0f32.min(cw - 220.0).max(196.0);
+                self.draw_ipad_segmented(
+                    r,
+                    RectF::new(cx + cw - 18.0 - mode_w, ry + 11.0, mode_w, 32.0),
+                    [
+                        (
+                            "内置播放服务",
+                            self.settings.use_builtin_service,
+                            UiAction::SetUseBuiltinService(true),
+                        ),
+                        (
+                            "Apple Music 应用",
+                            !self.settings.use_builtin_service,
+                            UiAction::SetUseBuiltinService(false),
+                        ),
+                    ],
+                    11.8,
+                    false,
+                );
+                ry += 54.0;
+                Self::draw_ipad_divider(r, cx, cw, ry);
+
+                // Row 4: Sound Check toggle
+                self.draw_ipad_toggle_row(
+                    r,
+                    RectF::new(cx, ry, cw, 48.0),
+                    101,
+                    "音量平衡",
+                    "",
+                    self.audio_prefs.sound_check_enabled,
+                    UiAction::ToggleSoundCheck,
+                );
+                ry += 48.0;
+                Self::draw_ipad_divider(r, cx, cw, ry);
+
+                // Row 5: Crossfade toggle
+                self.draw_ipad_toggle_row(
+                    r,
+                    RectF::new(cx, ry, cw, 48.0),
+                    102,
+                    "歌曲交叉渐入渐出",
+                    "",
+                    self.audio_prefs.crossfade_songs_enabled,
+                    UiAction::ToggleCrossfade,
+                );
+
+                Self::draw_ipad_section_footer(
+                    r,
+                    cx,
+                    cy + card_h,
+                    cw,
+                    "更改音频质量后将在下一首播放或重新缓冲时生效。",
+                    foot_h,
+                );
+            }
+            y += sec_h;
+        }
+
+        // --------------------------------------------------------------------
+        // Section 4: 外观与显示 (Liquid Glass, Transparency, Motion, Corner Radius)
+        // --------------------------------------------------------------------
+        {
+            let card_h = 48.0 * 3.0 + 82.0;
+            let foot_h = 32.0f32;
+            let sec_h = 27.0 + card_h + 6.0 + foot_h + 14.0;
+            if y + sec_h >= -60.0 && y <= view_h + 60.0 {
+                let cy = Self::draw_ipad_section_header(r, cx, y, cw, "外观与显示");
+                let card = RectF::new(cx, cy, cw, card_h);
+                Self::draw_ipad_card_box(r, card, false);
+                let mut py = cy;
+
+                self.draw_ipad_toggle_row(
+                    r,
+                    RectF::new(cx, py, cw, 48.0),
+                    201,
+                    "液态玻璃材质",
+                    "",
+                    self.settings.liquid_glass_enabled,
+                    UiAction::ToggleLiquidGlass,
+                );
+                py += 48.0;
+                Self::draw_ipad_divider(r, cx, cw, py);
+
+                self.draw_ipad_toggle_row(
+                    r,
+                    RectF::new(cx, py, cw, 48.0),
+                    202,
+                    "降低透明度",
+                    "",
+                    self.settings.reduce_transparency,
+                    UiAction::ToggleReduceTransparency,
+                );
+                py += 48.0;
+                Self::draw_ipad_divider(r, cx, cw, py);
+
+                self.draw_ipad_toggle_row(
+                    r,
+                    RectF::new(cx, py, cw, 48.0),
+                    203,
+                    "减弱动态效果",
+                    "",
+                    self.settings.reduce_motion,
+                    UiAction::ToggleReduceMotion,
+                );
+                py += 48.0;
+                Self::draw_ipad_divider(r, cx, cw, py);
+
+                // Row 4: Window Corner Radius presets + flat slider
+                let cur_rad = self.settings.window_corner_radius.clamp(0.0, 28.0);
+                r.draw_text(
+                    "沉浸式窗口边框圆角",
+                    RectF::new(cx + 18.0, py + 11.0, 220.0, 22.0),
+                    14.2,
+                    400,
+                    Theme::TEXT_PRIMARY,
+                    TextAlign::Left,
+                    true,
+                    false,
+                );
+                r.draw_mono_text(
+                    &format!("{:.0} px", cur_rad),
+                    RectF::new(cx + cw - 92.0, py + 11.0, 74.0, 22.0),
+                    12.8,
+                    500,
+                    Color::rgba(255, 255, 255, 0.52),
+                    TextAlign::Right,
+                    true,
+                );
+                let rad_seg_w = 248.0f32.min(cw * 0.44);
+                self.draw_ipad_segmented(
+                    r,
+                    RectF::new(cx + 18.0, py + 41.0, rad_seg_w, 30.0),
+                    [
+                        ("直角 0px", (cur_rad - 0.0).abs() < 0.45, UiAction::SetWindowCornerRadius(0.0)),
+                        ("默认 12px", (cur_rad - 12.0).abs() < 0.45, UiAction::SetWindowCornerRadius(12.0)),
+                        ("大圆角 22px", (cur_rad - 22.0).abs() < 0.45, UiAction::SetWindowCornerRadius(22.0)),
+                    ],
+                    11.5,
+                    false,
+                );
+                let rad_bar_x = cx + 18.0 + rad_seg_w + 16.0;
+                let rad_bar_w = (cx + cw - 24.0 - rad_bar_x).max(80.0);
+                let rad_bar = RectF::new(rad_bar_x, py + 54.0, rad_bar_w, 4.0);
+                let rad_hit = RectF::new(rad_bar.x - 6.0, py + 40.0, rad_bar.w + 12.0, 32.0);
+                self.draw_ipad_slider(
+                    r,
+                    rad_bar,
+                    rad_hit,
+                    cur_rad / 28.0,
+                    matches!(self.active_drag, Some(ActiveDrag::WindowCornerRadius(_))),
+                    UiAction::ScrubWindowCornerRadius(rad_bar),
+                );
+
+                Self::draw_ipad_section_footer(
+                    r,
+                    cx,
+                    cy + card_h,
+                    cw,
+                    "液态玻璃默认开启，作用于侧栏与浮层控件；设置页始终使用纯黑静态界面以节省 GPU 资源。",
+                    foot_h,
+                );
+            }
+            y += sec_h;
+        }
+
+        // --------------------------------------------------------------------
+        // Section 5: 性能与缓存 (SWR Page Cache, Memory Release, Refresh, Clear)
+        // --------------------------------------------------------------------
+        {
+            let card_h = 48.0 * 4.0;
+            let foot_h = 32.0f32;
+            let sec_h = 27.0 + card_h + 6.0 + foot_h + 14.0;
+            if y + sec_h >= -60.0 && y <= view_h + 60.0 {
+                let cy = Self::draw_ipad_section_header(r, cx, y, cw, "性能与缓存");
+                let card = RectF::new(cx, cy, cw, card_h);
+                Self::draw_ipad_card_box(r, card, false);
+                let mut py = cy;
+
+                self.draw_ipad_toggle_row(
+                    r,
+                    RectF::new(cx, py, cw, 48.0),
+                    301,
+                    "页面缓存与加载加速",
+                    "",
+                    self.settings.page_cache_enabled,
+                    UiAction::TogglePageCache,
+                );
+                py += 48.0;
+                Self::draw_ipad_divider(r, cx, cw, py);
+
+                self.draw_ipad_toggle_row(
+                    r,
+                    RectF::new(cx, py, cw, 48.0),
+                    302,
+                    "增强内存释放",
+                    "",
+                    self.settings.aggressive_memory_release,
+                    UiAction::ToggleAggressiveMemoryRelease,
+                );
+                py += 48.0;
+                Self::draw_ipad_divider(r, cx, cw, py);
+
+                self.draw_ipad_action_link_row(
+                    r,
+                    RectF::new(cx, py, cw, 48.0),
+                    "刷新当前页",
+                    "F5",
+                    ios_blue,
+                    false,
+                    Some(UiAction::RefreshCurrentView),
+                );
+                py += 48.0;
+                Self::draw_ipad_divider(r, cx, cw, py);
+
+                let cache_cnt = format!("已缓存 {} 项", self.detail_mem_cache.len());
+                self.draw_ipad_action_link_row(
+                    r,
+                    RectF::new(cx, py, cw, 48.0),
+                    "清空缓存",
+                    &cache_cnt,
+                    ios_blue,
+                    false,
+                    Some(UiAction::ClearPageCache),
+                );
+
+                Self::draw_ipad_section_footer(
+                    r,
+                    cx,
+                    cy + card_h,
+                    cw,
+                    "开启后自动预热侧栏并秒开歌单/专辑详情（后台静默更新）；关闭则每次重新拉取。",
+                    foot_h,
+                );
+            }
+            y += sec_h;
+        }
+
+        let mon_hz = self.current_monitor_hz.clamp(30, 500);
+        let lyr_custom_open = self.settings.lyrics_fps_cap == FpsCap::Custom;
+        let viz_custom_open = self.settings.viz_fps_cap == FpsCap::Custom;
+        let lyr_extra = if lyr_custom_open { 40.0f32 } else { 0.0f32 };
+        let viz_extra = if viz_custom_open { 40.0f32 } else { 0.0f32 };
+
+        // --------------------------------------------------------------------
+        // Section 6: 歌词显示与动效
+        // --------------------------------------------------------------------
+        {
+            let card_h = 82.0 + lyr_extra + 48.0 * 8.0 + 52.0;
+            let foot_h = 32.0f32;
+            let sec_h = 27.0 + card_h + 6.0 + foot_h + 14.0;
+            if y + sec_h >= -60.0 && y <= view_h + 60.0 {
+                let cy = Self::draw_ipad_section_header(r, cx, y, cw, "歌词显示与动效");
+                let card = RectF::new(cx, cy, cw, card_h);
+                Self::draw_ipad_card_box(r, card, false);
+                let mut ry = cy;
+
+                // Row 1: Lyrics FPS Cap
+                let lyr_resolved = self
+                    .settings
+                    .lyrics_fps_cap
+                    .resolved_label(mon_hz, self.settings.lyrics_custom_fps);
+                r.draw_text(
+                    "歌词页面刷新率",
+                    RectF::new(cx + 18.0, ry + 11.0, 220.0, 22.0),
+                    14.5,
+                    400,
+                    Theme::TEXT_PRIMARY,
+                    TextAlign::Left,
+                    true,
+                    false,
+                );
+                r.draw_text(
+                    &format!("当前屏幕 {} Hz · 目标刷新率：{}", mon_hz, lyr_resolved),
+                    RectF::new(cx + 220.0, ry + 12.0, cw - 238.0, 20.0),
+                    11.8,
+                    400,
+                    Color::rgba(255, 255, 255, 0.48),
+                    TextAlign::Right,
+                    true,
+                    false,
+                );
+                let lyr_cap_items: [(&str, bool, UiAction); 5] = std::array::from_fn(|i| {
+                    let cap = FpsCap::ALL[i];
+                    (
+                        cap.label(),
+                        self.settings.lyrics_fps_cap == cap,
+                        UiAction::SetLyricsFpsCap(cap),
+                    )
+                });
+                self.draw_ipad_segmented(
+                    r,
+                    RectF::new(cx + 18.0, ry + 41.0, cw - 36.0, 32.0),
+                    lyr_cap_items,
+                    11.8,
+                    false,
+                );
+                ry += 82.0;
+
+                if lyr_custom_open {
+                    let cur_fps = self.settings.lyrics_custom_fps.clamp(30, 360);
+                    let dec_r = RectF::new(cx + 18.0, ry + 4.0, 28.0, 26.0);
+                    self.draw_ipad_pill_btn(
+                        r,
+                        dec_r,
+                        "-",
+                        None,
+                        false,
+                        Some(UiAction::SetLyricsCustomFps(cur_fps.saturating_sub(1).max(30))),
+                    );
+                    let bar_x = cx + 56.0;
+                    let bar_w = (cw - 178.0).max(120.0);
+                    let fps_bar = RectF::new(bar_x, ry + 15.0, bar_w, 4.0);
+                    let fps_hit = RectF::new(bar_x - 6.0, ry + 1.0, bar_w + 12.0, 32.0);
+                    self.draw_ipad_slider(
+                        r,
+                        fps_bar,
+                        fps_hit,
+                        (cur_fps as f32 - 30.0) / 330.0,
+                        matches!(self.active_drag, Some(ActiveDrag::LyricsCustomFps(_))),
+                        UiAction::ScrubLyricsCustomFps(fps_bar),
+                    );
+                    let inc_r = RectF::new(bar_x + bar_w + 10.0, ry + 4.0, 28.0, 26.0);
+                    self.draw_ipad_pill_btn(
+                        r,
+                        inc_r,
+                        "+",
+                        None,
+                        false,
+                        Some(UiAction::SetLyricsCustomFps((cur_fps + 1).min(360))),
+                    );
+                    r.draw_mono_text(
+                        &format!("{} Hz", cur_fps),
+                        RectF::new(inc_r.right() + 8.0, ry + 4.0, 62.0, 26.0),
+                        12.4,
+                        500,
+                        Color::rgba(255, 255, 255, 0.65),
+                        TextAlign::Right,
+                        true,
+                    );
+                    ry += 40.0;
+                }
+
+                for (k, title, on, act) in [
+                    (
+                        401u64,
+                        "后台失焦时歌词页自动降频（60/72 自适应）",
+                        self.settings.lyrics_limit_unfocused_fps,
+                        UiAction::ToggleLyricsLimitUnfocusedFps,
+                    ),
+                    (
+                        402,
+                        "歌词页沉浸模式",
+                        self.settings.lyrics_immersive_mode,
+                        UiAction::ToggleLyricsImmersiveMode,
+                    ),
+                    (
+                        403,
+                        "歌词页流动封面纹理 (FreeBlur)",
+                        self.settings.lyrics_free_blur,
+                        UiAction::ToggleLyricsBlurMode,
+                    ),
+                    (
+                        404,
+                        "西文歌词按词律动",
+                        self.settings.lyrics_latin_by_word,
+                        UiAction::ToggleLyricsLatinByWord,
+                    ),
+                    (
+                        405,
+                        "自动检测歌词强调",
+                        self.settings.lyrics_auto_emphasis,
+                        UiAction::ToggleLyricsAutoEmphasis,
+                    ),
+                    (
+                        406,
+                        "歌词进度边界弹性波浪",
+                        self.settings.lyrics_frontier_wave,
+                        UiAction::ToggleLyricsFrontierWave,
+                    ),
+                    (
+                        407,
+                        "末尾停留整词渐亮",
+                        self.settings.lyrics_end_hold_glow,
+                        UiAction::ToggleLyricsEndHoldGlow,
+                    ),
+                    (
+                        408,
+                        "未唱歌词轻度降采样节能",
+                        self.settings.lyrics_blur_downsample,
+                        UiAction::ToggleLyricsBlurDownsample,
+                    ),
+                ] {
+                    Self::draw_ipad_divider(r, cx, cw, ry);
+                    self.draw_ipad_toggle_row(r, RectF::new(cx, ry, cw, 48.0), k, title, "", on, act);
+                    ry += 48.0;
+                }
+
+                Self::draw_ipad_divider(r, cx, cw, ry);
+                r.draw_text(
+                    "非强调歌词附加发光 / 放大",
+                    RectF::new(cx + 18.0, ry, 210.0, 52.0),
+                    14.2,
+                    400,
+                    Theme::TEXT_PRIMARY,
+                    TextAlign::Left,
+                    true,
+                    false,
+                );
+                let fx_w = (cw - 246.0).min(340.0).max(220.0);
+                self.draw_ipad_segmented(
+                    r,
+                    RectF::new(cx + cw - 18.0 - fx_w, ry + 10.0, fx_w, 32.0),
+                    [
+                        (
+                            "关闭",
+                            self.settings.lyrics_non_emphasis_effect == NonEmphasisLyricsEffect::None,
+                            UiAction::SetLyricsNonEmphasisEffect(NonEmphasisLyricsEffect::None),
+                        ),
+                        (
+                            "仅发光",
+                            self.settings.lyrics_non_emphasis_effect == NonEmphasisLyricsEffect::GlowOnly,
+                            UiAction::SetLyricsNonEmphasisEffect(NonEmphasisLyricsEffect::GlowOnly),
+                        ),
+                        (
+                            "仅放大",
+                            self.settings.lyrics_non_emphasis_effect == NonEmphasisLyricsEffect::ScaleOnly,
+                            UiAction::SetLyricsNonEmphasisEffect(NonEmphasisLyricsEffect::ScaleOnly),
+                        ),
+                        (
+                            "发光 + 放大",
+                            self.settings.lyrics_non_emphasis_effect == NonEmphasisLyricsEffect::Both,
+                            UiAction::SetLyricsNonEmphasisEffect(NonEmphasisLyricsEffect::Both),
+                        ),
+                    ],
+                    11.5,
+                    false,
+                );
+
+                Self::draw_ipad_section_footer(
+                    r,
+                    cx,
+                    cy + card_h,
+                    cw,
+                    "沉浸模式隐藏歌词页四角控件并在鼠标靠近时自动渐显；开启降采样可将未唱行景深降至 0.75× 节能。",
+                    foot_h,
+                );
+            }
+            y += sec_h;
+        }
+
+        // --------------------------------------------------------------------
+        // Section 7: 可视化与动态封面
+        // --------------------------------------------------------------------
+        {
+            let card_h = 82.0 + viz_extra + 48.0 * 2.0;
+            let foot_h = 32.0f32;
+            let sec_h = 27.0 + card_h + 6.0 + foot_h + 14.0;
+            if y + sec_h >= -60.0 && y <= view_h + 60.0 {
+                let cy = Self::draw_ipad_section_header(r, cx, y, cw, "可视化与动态封面");
+                let card = RectF::new(cx, cy, cw, card_h);
+                Self::draw_ipad_card_box(r, card, false);
+                let mut vy = cy;
+
+                let viz_resolved = self
+                    .settings
+                    .viz_fps_cap
+                    .resolved_label(mon_hz, self.settings.viz_custom_fps);
+                r.draw_text(
+                    "可视化页面刷新率",
+                    RectF::new(cx + 18.0, vy + 11.0, 220.0, 22.0),
+                    14.5,
+                    400,
+                    Theme::TEXT_PRIMARY,
+                    TextAlign::Left,
+                    true,
+                    false,
+                );
+                r.draw_text(
+                    &format!("当前屏幕 {} Hz · 目标刷新率：{}", mon_hz, viz_resolved),
+                    RectF::new(cx + 220.0, vy + 12.0, cw - 238.0, 20.0),
+                    11.8,
+                    400,
+                    Color::rgba(255, 255, 255, 0.48),
+                    TextAlign::Right,
+                    true,
+                    false,
+                );
+                let viz_cap_items: [(&str, bool, UiAction); 5] = std::array::from_fn(|i| {
+                    let cap = FpsCap::ALL[i];
+                    (
+                        cap.label(),
+                        self.settings.viz_fps_cap == cap,
+                        UiAction::SetVizFpsCap(cap),
+                    )
+                });
+                self.draw_ipad_segmented(
+                    r,
+                    RectF::new(cx + 18.0, vy + 41.0, cw - 36.0, 32.0),
+                    viz_cap_items,
+                    11.8,
+                    false,
+                );
+                vy += 82.0;
+
+                if viz_custom_open {
+                    let cur_fps = self.settings.viz_custom_fps.clamp(30, 360);
+                    let dec_r = RectF::new(cx + 18.0, vy + 4.0, 28.0, 26.0);
+                    self.draw_ipad_pill_btn(
+                        r,
+                        dec_r,
+                        "-",
+                        None,
+                        false,
+                        Some(UiAction::SetVizCustomFps(cur_fps.saturating_sub(1).max(30))),
+                    );
+                    let bar_x = cx + 56.0;
+                    let bar_w = (cw - 178.0).max(120.0);
+                    let fps_bar = RectF::new(bar_x, vy + 15.0, bar_w, 4.0);
+                    let fps_hit = RectF::new(bar_x - 6.0, vy + 1.0, bar_w + 12.0, 32.0);
+                    self.draw_ipad_slider(
+                        r,
+                        fps_bar,
+                        fps_hit,
+                        (cur_fps as f32 - 30.0) / 330.0,
+                        matches!(self.active_drag, Some(ActiveDrag::VizCustomFps(_))),
+                        UiAction::ScrubVizCustomFps(fps_bar),
+                    );
+                    let inc_r = RectF::new(bar_x + bar_w + 10.0, vy + 4.0, 28.0, 26.0);
+                    self.draw_ipad_pill_btn(
+                        r,
+                        inc_r,
+                        "+",
+                        None,
+                        false,
+                        Some(UiAction::SetVizCustomFps((cur_fps + 1).min(360))),
+                    );
+                    r.draw_mono_text(
+                        &format!("{} Hz", cur_fps),
+                        RectF::new(inc_r.right() + 8.0, vy + 4.0, 62.0, 26.0),
+                        12.4,
+                        500,
+                        Color::rgba(255, 255, 255, 0.65),
+                        TextAlign::Right,
+                        true,
+                    );
+                    vy += 40.0;
+                }
+
+                Self::draw_ipad_divider(r, cx, cw, vy);
+                self.draw_ipad_toggle_row(
+                    r,
+                    RectF::new(cx, vy, cw, 48.0),
+                    501,
+                    "实时频谱播放图标",
+                    "",
+                    self.settings.live_eq_icon_spectrum,
+                    UiAction::ToggleLiveEqIconSpectrum,
+                );
+                vy += 48.0;
+                Self::draw_ipad_divider(r, cx, cw, vy);
+                self.draw_ipad_toggle_row(
+                    r,
+                    RectF::new(cx, vy, cw, 48.0),
+                    502,
+                    "动态封面（实验性）",
+                    "",
+                    self.settings.motion_artwork_enabled,
+                    UiAction::ToggleMotionArtwork,
+                );
+
+                Self::draw_ipad_section_footer(
+                    r,
+                    cx,
+                    cy + card_h,
+                    cw,
+                    "仅在主页与歌词页启用纯 Win32 硬件解码动态封面；关闭实时频谱播放图标可停用后台采样。",
+                    foot_h,
+                );
+            }
+            y += sec_h;
+        }
+
+        // --------------------------------------------------------------------
+        // Section 8: Hidden-by-Default Spatial Audio & Flavor Disclosure
+        // --------------------------------------------------------------------
+        {
+            let expanded_h = 52.0 + 54.0 + 52.0 + 72.0;
+            let card_h = if self.show_advanced_spatial {
+                48.0 + expanded_h
+            } else {
+                48.0
+            };
+            let sec_h = card_h + 22.0;
+            if y + sec_h >= -60.0 && y <= view_h + 60.0 {
+                let card = RectF::new(cx, y, cw, card_h);
+                Self::draw_ipad_card_box(r, card, !self.show_advanced_spatial);
+
+                self.draw_ipad_value_row(
+                    r,
+                    RectF::new(cx, y, cw, 48.0),
+                    "空间音频与声场选项",
+                    if self.show_advanced_spatial { "已展开" } else { "" },
+                    Some(if self.show_advanced_spatial {
+                        SfIcon::ChevronDown
+                    } else {
+                        SfIcon::ChevronRight
+                    }),
+                    Some(UiAction::ToggleAdvancedSpatialDisclosure),
+                );
+
+                if self.show_advanced_spatial {
+                    let mut sy = y + 48.0;
+                    Self::draw_ipad_divider(r, cx, cw, sy);
+
+                    // Row A: Atmos mode (strictly inside `if self.show_advanced_spatial`)
+                    r.draw_text(
+                        "杜比全景声",
+                        RectF::new(cx + 18.0, sy, 140.0, 52.0),
+                        14.5,
+                        400,
+                        Theme::TEXT_PRIMARY,
+                        TextAlign::Left,
+                        true,
+                        false,
+                    );
+                    let at_w = 248.0f32.min(cw - 176.0).max(180.0);
+                    self.draw_ipad_segmented(
+                        r,
+                        RectF::new(cx + cw - 18.0 - at_w, sy + 10.0, at_w, 32.0),
+                        [
+                            ("自动", self.audio_prefs.dolby_atmos_setting == 10, UiAction::SetAtmosMode(10)),
+                            ("始终开启", self.audio_prefs.dolby_atmos_setting == 20, UiAction::SetAtmosMode(20)),
+                            ("关闭", self.audio_prefs.dolby_atmos_setting == 30, UiAction::SetAtmosMode(30)),
+                        ],
+                        12.0,
+                        false,
+                    );
+                    sy += 52.0;
+                    Self::draw_ipad_divider(r, cx, cw, sy);
+
+                    // Row B: Binaural HRTF toggle + Bypass pill
+                    self.draw_ipad_toggle_row(
+                        r,
+                        RectF::new(cx, sy, cw - 92.0, 54.0),
+                        601,
+                        "本地双耳空间渲染 (HRTF)",
+                        "外化头影与早期反射渲染（需两路可用输出端点）",
+                        self.binaural.active,
+                        UiAction::ToggleBinauralEnabled,
+                    );
+                    let byp_btn = RectF::new(cx + cw - 18.0 - 78.0, sy + 13.0, 78.0, 28.0);
+                    self.draw_ipad_pill_btn(
+                        r,
+                        byp_btn,
+                        if self.binaural.config.bypass {
+                            "直通中"
+                        } else {
+                            "直通对比"
+                        },
+                        if self.binaural.config.bypass {
+                            Some(Theme::SIGNAL_AMBER)
+                        } else {
+                            None
+                        },
+                        false,
+                        Some(UiAction::ToggleBinauralBypass),
+                    );
+                    sy += 54.0;
+                    Self::draw_ipad_divider(r, cx, cw, sy);
+
+                    // Row C: Spatial Flavor Presets
+                    r.draw_text(
+                        "声场风味预设",
+                        RectF::new(cx + 18.0, sy, 128.0, 52.0),
+                        14.2,
+                        400,
+                        Theme::TEXT_PRIMARY,
+                        TextAlign::Left,
+                        true,
+                        false,
+                    );
+                    let sp_w = (cw - 166.0).min(360.0).max(220.0);
+                    self.draw_ipad_segmented(
+                        r,
+                        RectF::new(cx + cw - 18.0 - sp_w, sy + 10.0, sp_w, 32.0),
+                        [
+                            (
+                                "影院空间",
+                                self.binaural.config.preset == "apple_spatial",
+                                UiAction::SetBinauralPreset("apple_spatial".to_string()),
+                            ),
+                            (
+                                "近场监听",
+                                self.binaural.config.preset == "studio_nearfield",
+                                UiAction::SetBinauralPreset("studio_nearfield".to_string()),
+                            ),
+                            (
+                                "音乐厅",
+                                self.binaural.config.preset == "concert_hall",
+                                UiAction::SetBinauralPreset("concert_hall".to_string()),
+                            ),
+                            (
+                                "人声聚焦",
+                                self.binaural.config.preset == "intimate_vocal",
+                                UiAction::SetBinauralPreset("intimate_vocal".to_string()),
+                            ),
+                        ],
+                        11.6,
+                        false,
+                    );
+                    sy += 52.0;
+                    Self::draw_ipad_divider(r, cx, cw, sy);
+
+                    // Row D: Spatial Width & Room Ambience flat sliders
+                    let half_w = (cw - 56.0) * 0.5;
+                    let cur_w = self.binaural.config.spatial_width.clamp(0.6, 1.6);
+                    r.draw_text(
+                        &format!("声场宽度  {:.2}x", cur_w),
+                        RectF::new(cx + 18.0, sy + 12.0, half_w, 20.0),
+                        12.4,
+                        500,
+                        Color::rgba(255, 255, 255, 0.56),
+                        TextAlign::Left,
+                        true,
+                        false,
+                    );
+                    let w_bar = RectF::new(cx + 18.0, sy + 42.0, half_w, 4.0);
+                    let w_hit = RectF::new(w_bar.x - 4.0, sy + 30.0, w_bar.w + 8.0, 28.0);
+                    self.draw_ipad_slider(
+                        r,
+                        w_bar,
+                        w_hit,
+                        (cur_w - 0.6) / 1.0,
+                        matches!(self.active_drag, Some(ActiveDrag::BinauralWidth(_))),
+                        UiAction::ScrubBinauralWidth(w_bar),
+                    );
+
+                    let rx0 = cx + cw * 0.5 + 10.0;
+                    let cur_rm = self.binaural.config.room_ambience.clamp(0.0, 0.8);
+                    r.draw_text(
+                        &format!("房间混响  {:.0}%", cur_rm * 100.0),
+                        RectF::new(rx0, sy + 12.0, half_w, 20.0),
+                        12.4,
+                        500,
+                        Color::rgba(255, 255, 255, 0.56),
+                        TextAlign::Left,
+                        true,
+                        false,
+                    );
+                    let rm_bar = RectF::new(rx0, sy + 42.0, half_w, 4.0);
+                    let rm_hit = RectF::new(rm_bar.x - 4.0, sy + 30.0, rm_bar.w + 8.0, 28.0);
+                    self.draw_ipad_slider(
+                        r,
+                        rm_bar,
+                        rm_hit,
+                        cur_rm / 0.8,
+                        matches!(self.active_drag, Some(ActiveDrag::BinauralRoom(_))),
+                        UiAction::ScrubBinauralRoom(rm_bar),
+                    );
+                }
+            }
+            y += sec_h;
+        }
+
+        // --------------------------------------------------------------------
+        // Section 9: 关于与更新
+        // --------------------------------------------------------------------
+        {
+            let has_dl = self.update_latest_url.is_some();
+            let card_h = if has_dl { 48.0 * 4.0 } else { 48.0 * 3.0 };
+            let foot_h = 22.0f32;
+            let sec_h = 27.0 + card_h + 6.0 + foot_h + 14.0;
+            if y + sec_h >= -60.0 && y <= view_h + 60.0 {
+                let cy = Self::draw_ipad_section_header(r, cx, y, cw, "关于与更新");
+                let card = RectF::new(cx, cy, cw, card_h);
+                Self::draw_ipad_card_box(r, card, false);
+                let mut ay = cy;
+
+                self.draw_ipad_value_row(
+                    r,
+                    RectF::new(cx, ay, cw, 48.0),
+                    "AM Light",
+                    &format!("v{APP_VERSION} · MIT License"),
+                    None,
+                    None,
+                );
+                ay += 48.0;
+                Self::draw_ipad_divider(r, cx, cw, ay);
+
+                let chk_lbl = if self.update_checking {
+                    "正在检查..."
+                } else {
+                    "检查更新"
+                };
+                let status_detail = self
+                    .update_status_msg
+                    .clone()
+                    .unwrap_or_else(|| "GitHub Releases".to_string());
+                self.draw_ipad_action_link_row(
+                    r,
+                    RectF::new(cx, ay, cw, 48.0),
+                    chk_lbl,
+                    &status_detail,
+                    ios_blue,
+                    false,
+                    if self.update_checking {
+                        None
+                    } else {
+                        Some(UiAction::CheckForUpdates)
+                    },
+                );
+                ay += 48.0;
+
+                if let Some(dl_url) = self.update_latest_url.clone() {
+                    Self::draw_ipad_divider(r, cx, cw, ay);
+                    self.draw_ipad_action_link_row(
+                        r,
+                        RectF::new(cx, ay, cw, 48.0),
+                        "前往下载新版本",
+                        "",
+                        Color::rgb(52, 199, 89),
+                        true,
+                        Some(UiAction::OpenUrl(dl_url)),
+                    );
+                    ay += 48.0;
+                }
+
+                Self::draw_ipad_divider(r, cx, cw, ay);
+                self.draw_ipad_action_link_row(
+                    r,
+                    RectF::new(cx, ay, cw, 48.0),
+                    "GitHub 仓库",
+                    "N20xDuli/AM-Light",
+                    ios_blue,
+                    true,
+                    Some(UiAction::OpenUrl(
+                        "https://github.com/N20xDuli/AM-Light".to_string(),
+                    )),
+                );
+
+                Self::draw_ipad_section_footer(
+                    r,
+                    cx,
+                    cy + card_h,
+                    cw,
+                    "歌词动效与同步参考了 LyricsBlossom 及其作者分享的资料",
+                    foot_h,
+                );
+            }
+            y += sec_h;
+        }
+
+        y
     }
 
     // ========================================================================
@@ -16598,21 +17648,34 @@ impl AppUi {
             rect: pop,
             action: UiAction::SwallowClick,
         });
+        let open_t = if self.settings.reduce_motion {
+            1.0
+        } else {
+            self.queue_popover_open_spring.value.clamp(0.0, 1.0)
+        };
+        let anim_pop = Self::morph_popover_rect(pop, pop.right() - 28.0, pop.bottom(), open_t);
         if self.glass_off() {
             r.fill_rounded_rect(
-                RectF::new(pop.x + 2.0, pop.y + 6.0, pop.w - 4.0, pop.h),
+                RectF::new(anim_pop.x + 2.0, anim_pop.y + 6.0, anim_pop.w - 4.0, anim_pop.h),
                 18.0,
-                Color::rgba(0, 0, 0, 0.38),
+                Color::rgba(0, 0, 0, 0.38 * open_t),
             );
         }
         r.draw_liquid_glass(
-            pop,
+            anim_pop,
             18.0,
             20.0,
-            Color::rgba(22, 24, 30, 0.44),
-            Theme::GLASS_RIM_LIGHT,
+            Color::rgba(22, 24, 30, 0.44 * open_t),
+            Theme::GLASS_RIM_LIGHT.with_alpha(Theme::GLASS_RIM_LIGHT.a * open_t),
             self.glass_off(),
         );
+        let pushed_pop_alpha = if open_t < 0.992 {
+            r.push_clip(anim_pop);
+            r.push_opacity_layer(anim_pop, (open_t * 1.25).clamp(0.0, 1.0))
+        } else {
+            false
+        };
+        let pushed_pop_clip = open_t < 0.992;
         r.draw_text(
             &format!("待播清单 ({})", q.len()),
             RectF::new(pop.x + 16.0, pop.y + 12.0, pop.w - 32.0, 22.0),
@@ -16637,6 +17700,12 @@ impl AppUi {
                 true,
                 false,
             );
+            if pushed_pop_alpha {
+                r.pop_layer();
+            }
+            if pushed_pop_clip {
+                r.pop_clip();
+            }
             return;
         }
 
@@ -16731,6 +17800,12 @@ impl AppUi {
                 Color::rgba(255, 255, 255, 0.36),
             );
         }
+        if pushed_pop_alpha {
+            r.pop_layer();
+        }
+        if pushed_pop_clip {
+            r.pop_clip();
+        }
     }
 
     fn draw_more_popover(&mut self, r: &mut D2DRenderer, area: RectF) {
@@ -16760,21 +17835,34 @@ impl AppUi {
             rect: pop,
             action: UiAction::SwallowClick,
         });
+        let open_t = if self.settings.reduce_motion {
+            1.0
+        } else {
+            self.more_popover_open_spring.value.clamp(0.0, 1.0)
+        };
+        let anim_pop = Self::morph_popover_rect(pop, pop.right() - 28.0, pop.bottom(), open_t);
         if self.glass_off() {
             r.fill_rounded_rect(
-                RectF::new(pop.x + 2.0, pop.y + 6.0, pop.w - 4.0, pop.h),
+                RectF::new(anim_pop.x + 2.0, anim_pop.y + 6.0, anim_pop.w - 4.0, anim_pop.h),
                 18.0,
-                Color::rgba(0, 0, 0, 0.38),
+                Color::rgba(0, 0, 0, 0.38 * open_t),
             );
         }
         r.draw_liquid_glass(
-            pop,
+            anim_pop,
             18.0,
             20.0,
-            Color::rgba(22, 24, 30, 0.56),
-            Theme::GLASS_RIM_LIGHT,
+            Color::rgba(22, 24, 30, 0.56 * open_t),
+            Theme::GLASS_RIM_LIGHT.with_alpha(Theme::GLASS_RIM_LIGHT.a * open_t),
             self.glass_off(),
         );
+        let pushed_more_clip = open_t < 0.992;
+        let pushed_more_alpha = if pushed_more_clip {
+            r.push_clip(anim_pop);
+            r.push_opacity_layer(anim_pop, (open_t * 1.25).clamp(0.0, 1.0))
+        } else {
+            false
+        };
 
         let vol = self
             .smtc
@@ -16874,6 +17962,12 @@ impl AppUi {
             rect: set_btn,
             action: UiAction::Navigate(PageRoute::Settings),
         });
+        if pushed_more_alpha {
+            r.pop_layer();
+        }
+        if pushed_more_clip {
+            r.pop_clip();
+        }
     }
 
     fn draw_context_menu(&mut self, r: &mut D2DRenderer, win_rect: RectF) {
@@ -16881,42 +17975,67 @@ impl AppUi {
             return;
         };
 
-        let mut rows: Vec<(String, UiAction, bool)> = Vec::new();
+        enum CtxMenuItem {
+            Action {
+                label: String,
+                action: UiAction,
+                accent: bool,
+                toggle_state: Option<bool>,
+            },
+            Divider,
+            LyricsOffsetStepper,
+        }
+
+        let mut items: Vec<CtxMenuItem> = Vec::new();
         let mut playlist_track_opt: Option<AgentTrackInput> = None;
+        let is_now_playing = matches!(cm.target, ContextMenuTarget::NowPlaying);
 
         match &cm.target {
             ContextMenuTarget::Track(tr) => {
                 playlist_track_opt = Some(tr.clone());
-                rows.push(("下一首播放".to_string(), UiAction::PlayNextTrack(tr.clone()), false));
-                rows.push((
-                    if cm.show_playlist_submenu {
+                items.push(CtxMenuItem::Action {
+                    label: "下一首播放".to_string(),
+                    action: UiAction::PlayNextTrack(tr.clone()),
+                    accent: false,
+                    toggle_state: None,
+                });
+                items.push(CtxMenuItem::Action {
+                    label: if cm.show_playlist_submenu {
                         "添加到歌单 ▾".to_string()
                     } else {
                         "添加到歌单 ›".to_string()
                     },
-                    UiAction::ToggleContextPlaylistSubmenu,
-                    false,
-                ));
+                    action: UiAction::ToggleContextPlaylistSubmenu,
+                    accent: false,
+                    toggle_state: None,
+                });
                 let eff_id = tr.effective_adam_id();
                 if !eff_id.is_empty() && self.settings.playback_backend.is_apple_music() {
-                    rows.push(("添加到资料库".to_string(), UiAction::AddSongToLibrary(eff_id), false));
+                    items.push(CtxMenuItem::Action {
+                        label: "添加到资料库".to_string(),
+                        action: UiAction::AddSongToLibrary(eff_id),
+                        accent: false,
+                        toggle_state: None,
+                    });
                 }
                 if !tr.artist_name.trim().is_empty() {
-                    rows.push((
-                        format!("前往艺人 · {}", tr.artist_name),
-                        UiAction::GoToArtistByName(tr.artist_name.clone()),
-                        false,
-                    ));
+                    items.push(CtxMenuItem::Action {
+                        label: format!("前往艺人 · {}", tr.artist_name),
+                        action: UiAction::GoToArtistByName(tr.artist_name.clone()),
+                        accent: false,
+                        toggle_state: None,
+                    });
                 }
                 if !tr.album_name.trim().is_empty() {
-                    rows.push((
-                        format!("前往专辑 · {}", tr.album_name),
-                        UiAction::GoToAlbumByName {
+                    items.push(CtxMenuItem::Action {
+                        label: format!("前往专辑 · {}", tr.album_name),
+                        action: UiAction::GoToAlbumByName {
                             album_name: tr.album_name.clone(),
                             artist_name: tr.artist_name.clone(),
                         },
-                        false,
-                    ));
+                        accent: false,
+                        toggle_state: None,
+                    });
                 }
             }
             ContextMenuTarget::Container {
@@ -16931,46 +18050,51 @@ impl AppUi {
                     "artists" | "library-artists" | "ne-artist" | "qq-artist"
                 );
                 if !tracks.is_empty() {
-                    rows.push((
-                        "立即播放全部".to_string(),
-                        UiAction::PlayDetailTracks {
+                    items.push(CtxMenuItem::Action {
+                        label: "立即播放全部".to_string(),
+                        action: UiAction::PlayDetailTracks {
                             start_index: 0,
                             shuffle: false,
                         },
-                        false,
-                    ));
-                    rows.push((
-                        "随机播放".to_string(),
-                        UiAction::PlayDetailTracks {
+                        accent: false,
+                        toggle_state: None,
+                    });
+                    items.push(CtxMenuItem::Action {
+                        label: "随机播放".to_string(),
+                        action: UiAction::PlayDetailTracks {
                             start_index: 0,
                             shuffle: true,
                         },
-                        false,
-                    ));
+                        accent: false,
+                        toggle_state: None,
+                    });
                     if !is_artist {
-                        rows.push((
-                            "跨平台复制歌单...".to_string(),
-                            UiAction::OpenPlaylistTransferModal,
-                            true,
-                        ));
+                        items.push(CtxMenuItem::Action {
+                            label: "跨平台复制歌单...".to_string(),
+                            action: UiAction::OpenPlaylistTransferModal,
+                            accent: true,
+                            toggle_state: None,
+                        });
                     }
                 }
                 if !kind.starts_with("library-") && !is_artist {
-                    rows.push((
-                        "添加到资料库".to_string(),
-                        UiAction::AddContainerToLibrary {
+                    items.push(CtxMenuItem::Action {
+                        label: "添加到资料库".to_string(),
+                        action: UiAction::AddContainerToLibrary {
                             kind: kind.clone(),
                             id: id.clone(),
                         },
-                        false,
-                    ));
+                        accent: false,
+                        toggle_state: None,
+                    });
                 }
                 if kind.contains("album") && !subtitle.trim().is_empty() {
-                    rows.push((
-                        format!("前往艺人 · {subtitle}"),
-                        UiAction::GoToArtistByName(subtitle.clone()),
-                        false,
-                    ));
+                    items.push(CtxMenuItem::Action {
+                        label: format!("前往艺人 · {subtitle}"),
+                        action: UiAction::GoToArtistByName(subtitle.clone()),
+                        accent: false,
+                        toggle_state: None,
+                    });
                 }
             }
             ContextMenuTarget::NowPlaying => {
@@ -16988,61 +18112,109 @@ impl AppUi {
                 if !np_tr.id.is_empty() {
                     playlist_track_opt = Some(np_tr);
                 }
+                let mut had_track_rows = false;
                 if !self.smtc.artist.trim().is_empty() {
-                    rows.push((
-                        format!("前往艺人 · {}", self.smtc.artist),
-                        UiAction::GoToArtistByName(self.smtc.artist.clone()),
-                        false,
-                    ));
+                    items.push(CtxMenuItem::Action {
+                        label: format!("前往艺人 · {}", self.smtc.artist),
+                        action: UiAction::GoToArtistByName(self.smtc.artist.clone()),
+                        accent: false,
+                        toggle_state: None,
+                    });
+                    had_track_rows = true;
                 }
                 if !self.smtc.album.trim().is_empty() {
-                    rows.push((
-                        format!("前往专辑 · {}", self.smtc.album),
-                        UiAction::GoToAlbumByName {
+                    items.push(CtxMenuItem::Action {
+                        label: format!("前往专辑 · {}", self.smtc.album),
+                        action: UiAction::GoToAlbumByName {
                             album_name: self.smtc.album.clone(),
                             artist_name: self.smtc.artist.clone(),
                         },
-                        false,
-                    ));
+                        accent: false,
+                        toggle_state: None,
+                    });
+                    had_track_rows = true;
                 }
                 if playlist_track_opt.is_some() {
-                    rows.push((
-                        if cm.show_playlist_submenu {
+                    items.push(CtxMenuItem::Action {
+                        label: if cm.show_playlist_submenu {
                             "添加到歌单 ▾".to_string()
                         } else {
                             "添加到歌单 ›".to_string()
                         },
-                        UiAction::ToggleContextPlaylistSubmenu,
-                        false,
-                    ));
+                        action: UiAction::ToggleContextPlaylistSubmenu,
+                        accent: false,
+                        toggle_state: None,
+                    });
+                    had_track_rows = true;
                 }
                 if let Some(aid) = self.smtc.adam_id.clone().filter(|s| !s.is_empty()) {
                     if self.settings.playback_backend.is_apple_music() {
-                        rows.push(("添加到资料库".to_string(), UiAction::AddSongToLibrary(aid), false));
+                        items.push(CtxMenuItem::Action {
+                            label: "添加到资料库".to_string(),
+                            action: UiAction::AddSongToLibrary(aid),
+                            accent: false,
+                            toggle_state: None,
+                        });
+                        had_track_rows = true;
                     }
                 }
-                rows.push((
-                    if self.settings.lyrics_immersive_mode {
-                        "关闭歌词沉浸模式".to_string()
+                if had_track_rows {
+                    items.push(CtxMenuItem::Divider);
+                }
+                // Inline Lyrics Offset Stepper (`歌词偏移  [-]  0.0s  [+]`)
+                items.push(CtxMenuItem::LyricsOffsetStepper);
+                // Persisted Lyrics Layout Switches
+                items.push(CtxMenuItem::Action {
+                    label: "左侧放大显示".to_string(),
+                    action: UiAction::ToggleLyricsLeftEnlarged,
+                    accent: false,
+                    toggle_state: Some(self.settings.lyrics_left_enlarged),
+                });
+                items.push(CtxMenuItem::Action {
+                    label: "歌词中轴居中".to_string(),
+                    action: UiAction::ToggleLyricsCenterAxis,
+                    accent: false,
+                    toggle_state: Some(self.settings.lyrics_center_axis),
+                });
+                items.push(CtxMenuItem::Divider);
+                // 4 Consolidated Bottom-Right Controls
+                items.push(CtxMenuItem::Action {
+                    label: format!("歌词来源：{}", self.lyrics_view.source_pref.label()),
+                    action: UiAction::CycleLyricsSourceFromMenu,
+                    accent: false,
+                    toggle_state: None,
+                });
+                items.push(CtxMenuItem::Action {
+                    label: if self.settings.lyrics_free_blur {
+                        "背景风格：流光".to_string()
                     } else {
-                        "开启歌词沉浸模式".to_string()
+                        "背景风格：柔焦".to_string()
                     },
-                    UiAction::ToggleLyricsImmersiveMode,
-                    true,
-                ));
-                rows.push((
-                    "导入本地歌词 (.lrc / .ttml)...".to_string(),
-                    UiAction::ImportLocalLyricsFromMenu,
-                    false,
-                ));
+                    action: UiAction::ToggleLyricsBlurMode,
+                    accent: false,
+                    toggle_state: None,
+                });
+                items.push(CtxMenuItem::Action {
+                    label: "歌词沉浸模式".to_string(),
+                    action: UiAction::ToggleLyricsImmersiveMode,
+                    accent: false,
+                    toggle_state: Some(self.settings.lyrics_immersive_mode),
+                });
+                items.push(CtxMenuItem::Action {
+                    label: "导入本地歌词 (.lrc / .ttml)...".to_string(),
+                    action: UiAction::ImportLocalLyricsFromMenu,
+                    accent: false,
+                    toggle_state: None,
+                });
             }
         }
 
-        let pls_shown: Vec<MediaCardItem> = if cm.show_playlist_submenu && playlist_track_opt.is_some() {
-            self.sidebar_playlists.iter().take(6).cloned().collect()
-        } else {
-            Vec::new()
-        };
+        let pls_shown: Vec<MediaCardItem> =
+            if cm.show_playlist_submenu && playlist_track_opt.is_some() {
+                self.sidebar_playlists.iter().take(6).cloned().collect()
+            } else {
+                Vec::new()
+            };
         let sub_h = if cm.show_playlist_submenu && playlist_track_opt.is_some() {
             if pls_shown.is_empty() {
                 34.0
@@ -17053,18 +18225,43 @@ impl AppUi {
             0.0
         };
 
-        let menu_w = 246.0f32;
-        let row_h = 34.0f32;
-        let menu_h = 16.0 + (rows.len() as f32) * row_h + sub_h;
+        let menu_w = if is_now_playing { 282.0f32 } else { 246.0f32 };
+        let row_h = if is_now_playing { 33.0f32 } else { 34.0f32 };
+        let div_h = 9.0f32;
+        let step_h = 38.0f32;
+        let items_h: f32 = items
+            .iter()
+            .map(|it| match it {
+                CtxMenuItem::Action { .. } => row_h,
+                CtxMenuItem::Divider => div_h,
+                CtxMenuItem::LyricsOffsetStepper => step_h,
+            })
+            .sum();
+        let raw_menu_h = 16.0 + items_h + sub_h;
+        let max_menu_h = (win_rect.h - 24.0).max(120.0);
+        let menu_h = raw_menu_h.min(max_menu_h);
+
         let mut mx = cm.anchor.right() - menu_w;
         if mx < win_rect.x + 12.0 {
             mx = cm.anchor.x;
         }
-        mx = mx.clamp(win_rect.x + 12.0, (win_rect.right() - menu_w - 12.0).max(win_rect.x + 12.0));
+        mx = mx.clamp(
+            win_rect.x + 12.0,
+            (win_rect.right() - menu_w - 12.0).max(win_rect.x + 12.0),
+        );
         let mut my = cm.anchor.bottom() + 6.0;
-        if my + menu_h > win_rect.bottom() - 16.0 {
-            my = (cm.anchor.y - menu_h - 6.0).max(win_rect.y + 12.0);
+        if my + menu_h > win_rect.bottom() - 12.0 {
+            let above = cm.anchor.y - menu_h - 6.0;
+            if above >= win_rect.y + 12.0 {
+                my = above;
+            } else {
+                my = (win_rect.bottom() - menu_h - 12.0).max(win_rect.y + 12.0);
+            }
         }
+        my = my.clamp(
+            win_rect.y + 12.0,
+            (win_rect.bottom() - menu_h - 12.0).max(win_rect.y + 12.0),
+        );
         let menu_r = RectF::new(mx, my, menu_w, menu_h);
 
         // Fullscreen click-outside catcher so clicking anywhere outside cleanly dismisses the menu
@@ -17077,93 +18274,294 @@ impl AppUi {
             action: UiAction::SwallowClick,
         });
 
+        let open_t = if self.settings.reduce_motion {
+            1.0
+        } else {
+            self.context_menu_open_spring.value.clamp(0.0, 1.0)
+        };
+        let anim_menu_r = Self::morph_popover_rect(
+            menu_r,
+            cm.anchor.center_x(),
+            cm.anchor.center_y(),
+            open_t,
+        );
         r.fill_rounded_rect(
-            RectF::new(menu_r.x + 2.0, menu_r.y + 6.0, menu_r.w - 4.0, menu_r.h),
+            RectF::new(
+                anim_menu_r.x + 2.0,
+                anim_menu_r.y + 6.0,
+                anim_menu_r.w - 4.0,
+                anim_menu_r.h,
+            ),
             16.0,
-            Color::rgba(0, 0, 0, 0.44),
+            Color::rgba(0, 0, 0, 0.44 * open_t),
         );
         r.draw_liquid_glass(
-            menu_r,
+            anim_menu_r,
             16.0,
             18.0,
-            Color::rgba(22, 24, 32, 0.72),
-            Theme::GLASS_RIM_LIGHT,
+            Color::rgba(22, 24, 32, 0.72 * open_t),
+            Theme::GLASS_RIM_LIGHT.with_alpha(Theme::GLASS_RIM_LIGHT.a * open_t),
             self.glass_off(),
         );
 
-        let mut cy = menu_r.y + 8.0;
-        for (lbl, act, accent) in rows {
-            let is_pl_toggle = matches!(act, UiAction::ToggleContextPlaylistSubmenu);
-            let rr = RectF::new(menu_r.x + 8.0, cy, menu_r.w - 16.0, row_h - 2.0);
-            let hov = rr.contains(self.mouse_pos.0, self.mouse_pos.1);
-            if hov {
-                r.fill_rounded_rect(rr, 9.0, Color::rgba(255, 255, 255, 0.14));
-            }
-            r.draw_text(
-                &lbl,
-                rr.inset(12.0, 0.0),
-                13.0,
-                if hov || accent { 600 } else { 500 },
-                if accent {
-                    Theme::ACCENT_RED.lerp(Theme::TEXT_PRIMARY, 0.25)
-                } else {
-                    Theme::TEXT_PRIMARY
-                },
-                TextAlign::Left,
-                true,
-                false,
-            );
-            self.hit_regions.push(HitRegion {
-                rect: rr,
-                action: act,
-            });
-            cy += row_h;
+        let pushed_cm_clip = open_t < 0.992;
+        let pushed_cm_alpha = if pushed_cm_clip {
+            r.push_clip(anim_menu_r);
+            r.push_opacity_layer(anim_menu_r, (open_t * 1.25).clamp(0.0, 1.0))
+        } else {
+            false
+        };
+        let clipped = raw_menu_h > max_menu_h + 0.5;
+        if clipped {
+            r.push_clip(menu_r.inset(0.0, 4.0));
+        }
 
-            if is_pl_toggle && cm.show_playlist_submenu {
-                if let Some(ref tr) = playlist_track_opt {
-                    if pls_shown.is_empty() {
-                        r.draw_text(
-                            "暂无可写入歌单（请先登录）",
-                            RectF::new(menu_r.x + 20.0, cy, menu_r.w - 32.0, 28.0),
-                            11.5,
-                            400,
-                            Theme::TEXT_MUTED,
-                            TextAlign::Left,
-                            true,
-                            false,
-                        );
-                        cy += 34.0;
+        let mut cy = menu_r.y + 8.0;
+        for item in items {
+            match item {
+                CtxMenuItem::Divider => {
+                    r.draw_line(
+                        menu_r.x + 14.0,
+                        cy + div_h * 0.5,
+                        menu_r.right() - 14.0,
+                        cy + div_h * 0.5,
+                        Color::rgba(255, 255, 255, 0.11),
+                        1.0,
+                    );
+                    cy += div_h;
+                }
+                CtxMenuItem::LyricsOffsetStepper => {
+                    let row_r = RectF::new(menu_r.x + 8.0, cy, menu_r.w - 16.0, step_h);
+                    r.draw_text(
+                        "歌词偏移",
+                        RectF::new(row_r.x + 12.0, row_r.y, 114.0, row_r.h),
+                        13.0,
+                        500,
+                        Theme::TEXT_PRIMARY,
+                        TextAlign::Left,
+                        true,
+                        false,
+                    );
+
+                    let btn_h = 26.0f32;
+                    let btn_y = row_r.center_y() - btn_h * 0.5;
+                    let plus_r = RectF::new(row_r.right() - 6.0 - 28.0, btn_y, 28.0, btn_h);
+                    let val_r = RectF::new(plus_r.x - 4.0 - 58.0, btn_y, 58.0, btn_h);
+                    let minus_r = RectF::new(val_r.x - 4.0 - 28.0, btn_y, 28.0, btn_h);
+
+                    let minus_hov = minus_r.contains(self.mouse_pos.0, self.mouse_pos.1);
+                    r.draw_liquid_glass_button(
+                        minus_r,
+                        7.5,
+                        GlassBtnVariant::Regular,
+                        minus_hov,
+                        self.mouse_down,
+                        self.mouse_pos,
+                        self.glass_off(),
+                    );
+                    r.draw_text(
+                        "-",
+                        minus_r,
+                        14.0,
+                        700,
+                        Theme::TEXT_PRIMARY,
+                        TextAlign::Center,
+                        true,
+                        false,
+                    );
+                    self.hit_regions.push(HitRegion {
+                        rect: minus_r,
+                        action: UiAction::NudgeLyricsOffset(-0.1),
+                    });
+
+                    let off = self.lyrics_view.sync_offset_sec;
+                    let off_nonzero = off.abs() >= 0.04;
+                    let off_txt = if !off_nonzero {
+                        "0.0s".to_string()
                     } else {
-                        for pl in &pls_shown {
-                            let pr = RectF::new(menu_r.x + 18.0, cy, menu_r.w - 28.0, 28.0);
-                            let phov = pr.contains(self.mouse_pos.0, self.mouse_pos.1);
-                            if phov {
-                                r.fill_rounded_rect(pr, 7.0, Theme::ACCENT_RED.with_alpha(0.26));
+                        format!("{off:+.1}s")
+                    };
+                    let val_hov = val_r.contains(self.mouse_pos.0, self.mouse_pos.1);
+                    r.fill_rounded_rect(
+                        val_r,
+                        7.5,
+                        if val_hov {
+                            Color::rgba(255, 255, 255, 0.16)
+                        } else if off_nonzero {
+                            Theme::ACCENT_RED.with_alpha(0.22)
+                        } else {
+                            Color::rgba(255, 255, 255, 0.08)
+                        },
+                    );
+                    r.draw_mono_text(
+                        &off_txt,
+                        val_r,
+                        12.0,
+                        600,
+                        if off_nonzero {
+                            Theme::ACCENT_RED.lerp(Theme::TEXT_PRIMARY, 0.40)
+                        } else {
+                            Theme::TEXT_PRIMARY
+                        },
+                        TextAlign::Center,
+                        true,
+                    );
+                    self.hit_regions.push(HitRegion {
+                        rect: val_r,
+                        action: UiAction::ResetLyricsOffset,
+                    });
+
+                    let plus_hov = plus_r.contains(self.mouse_pos.0, self.mouse_pos.1);
+                    r.draw_liquid_glass_button(
+                        plus_r,
+                        7.5,
+                        GlassBtnVariant::Regular,
+                        plus_hov,
+                        self.mouse_down,
+                        self.mouse_pos,
+                        self.glass_off(),
+                    );
+                    r.draw_text(
+                        "+",
+                        plus_r,
+                        14.0,
+                        700,
+                        Theme::TEXT_PRIMARY,
+                        TextAlign::Center,
+                        true,
+                        false,
+                    );
+                    self.hit_regions.push(HitRegion {
+                        rect: plus_r,
+                        action: UiAction::NudgeLyricsOffset(0.1),
+                    });
+
+                    cy += step_h;
+                }
+                CtxMenuItem::Action {
+                    label: lbl,
+                    action: act,
+                    accent,
+                    toggle_state,
+                } => {
+                    let is_pl_toggle = matches!(act, UiAction::ToggleContextPlaylistSubmenu);
+                    let rr = RectF::new(menu_r.x + 8.0, cy, menu_r.w - 16.0, row_h - 2.0);
+                    let hov = rr.contains(self.mouse_pos.0, self.mouse_pos.1);
+                    if hov {
+                        r.fill_rounded_rect(rr, 9.0, Color::rgba(255, 255, 255, 0.14));
+                    }
+                    let text_r = if toggle_state.is_some() {
+                        RectF::new(rr.x + 12.0, rr.y, (rr.w - 58.0).max(60.0), rr.h)
+                    } else {
+                        rr.inset(12.0, 0.0)
+                    };
+                    r.draw_text(
+                        &lbl,
+                        text_r,
+                        13.0,
+                        if hov || accent { 600 } else { 500 },
+                        if accent {
+                            Theme::ACCENT_RED.lerp(Theme::TEXT_PRIMARY, 0.25)
+                        } else {
+                            Theme::TEXT_PRIMARY
+                        },
+                        TextAlign::Left,
+                        true,
+                        false,
+                    );
+                    if let Some(is_on) = toggle_state {
+                        let sw = RectF::new(rr.right() - 40.0, rr.center_y() - 9.0, 32.0, 18.0);
+                        r.fill_rounded_rect(
+                            sw,
+                            9.0,
+                            if is_on {
+                                Theme::SIGNAL_GREEN.with_alpha(0.90)
+                            } else {
+                                Color::rgba(255, 255, 255, 0.16)
+                            },
+                        );
+                        let knob_x = if is_on { sw.right() - 9.0 } else { sw.x + 9.0 };
+                        r.fill_circle(
+                            knob_x,
+                            sw.center_y(),
+                            6.6,
+                            if is_on {
+                                Color::rgb(255, 255, 255)
+                            } else {
+                                Color::rgba(255, 255, 255, 0.78)
+                            },
+                        );
+                    }
+                    self.hit_regions.push(HitRegion {
+                        rect: rr,
+                        action: act,
+                    });
+                    cy += row_h;
+
+                    if is_pl_toggle && cm.show_playlist_submenu {
+                        if let Some(ref tr) = playlist_track_opt {
+                            if pls_shown.is_empty() {
+                                r.draw_text(
+                                    "暂无可写入歌单（请先登录）",
+                                    RectF::new(menu_r.x + 20.0, cy, menu_r.w - 32.0, 28.0),
+                                    11.5,
+                                    400,
+                                    Theme::TEXT_MUTED,
+                                    TextAlign::Left,
+                                    true,
+                                    false,
+                                );
+                                cy += 34.0;
+                            } else {
+                                for pl in &pls_shown {
+                                    let pr =
+                                        RectF::new(menu_r.x + 18.0, cy, menu_r.w - 28.0, 28.0);
+                                    let phov = pr.contains(self.mouse_pos.0, self.mouse_pos.1);
+                                    if phov {
+                                        r.fill_rounded_rect(
+                                            pr,
+                                            7.0,
+                                            Theme::ACCENT_RED.with_alpha(0.26),
+                                        );
+                                    }
+                                    r.draw_text(
+                                        &format!("+ {}", pl.title),
+                                        pr.inset(8.0, 0.0),
+                                        12.0,
+                                        if phov { 600 } else { 400 },
+                                        Theme::TEXT_SECONDARY.lerp(
+                                            Theme::TEXT_PRIMARY,
+                                            if phov { 1.0 } else { 0.45 },
+                                        ),
+                                        TextAlign::Left,
+                                        true,
+                                        false,
+                                    );
+                                    self.hit_regions.push(HitRegion {
+                                        rect: pr,
+                                        action: UiAction::AddTrackToPlaylist {
+                                            playlist_id: pl.id.clone(),
+                                            playlist_name: pl.title.clone(),
+                                            track: tr.clone(),
+                                        },
+                                    });
+                                    cy += 30.0;
+                                }
+                                cy += 10.0;
                             }
-                            r.draw_text(
-                                &format!("+ {}", pl.title),
-                                pr.inset(8.0, 0.0),
-                                12.0,
-                                if phov { 600 } else { 400 },
-                                Theme::TEXT_SECONDARY.lerp(Theme::TEXT_PRIMARY, if phov { 1.0 } else { 0.45 }),
-                                TextAlign::Left,
-                                true,
-                                false,
-                            );
-                            self.hit_regions.push(HitRegion {
-                                rect: pr,
-                                action: UiAction::AddTrackToPlaylist {
-                                    playlist_id: pl.id.clone(),
-                                    playlist_name: pl.title.clone(),
-                                    track: tr.clone(),
-                                },
-                            });
-                            cy += 30.0;
                         }
-                        cy += 10.0;
                     }
                 }
             }
+        }
+        if clipped {
+            r.pop_clip();
+        }
+        if pushed_cm_alpha {
+            r.pop_layer();
+        }
+        if pushed_cm_clip {
+            r.pop_clip();
         }
     }
 
@@ -18022,8 +19420,13 @@ impl AppUi {
     }
 
     fn draw_listen_together_modal(&mut self, r: &mut D2DRenderer, win_rect: RectF) {
+        let open_t = if self.settings.reduce_motion {
+            1.0
+        } else {
+            self.lt_modal_open_spring.value.clamp(0.0, 1.0)
+        };
         // Backdrop scrim (click outside to dismiss)
-        r.fill_rect(win_rect, Color::rgba(4, 6, 12, 0.56));
+        r.fill_rect(win_rect, Color::rgba(4, 6, 12, 0.56 * open_t));
         self.hit_regions.push(HitRegion {
             rect: win_rect,
             action: UiAction::CloseListenTogetherModal,
@@ -18043,19 +19446,33 @@ impl AppUi {
             action: UiAction::SwallowClick,
         });
 
+        let anim_modal =
+            Self::morph_popover_rect(modal, modal.center_x(), modal.center_y(), open_t);
         r.fill_rounded_rect(
-            RectF::new(modal.x + 4.0, modal.y + 10.0, modal.w - 8.0, modal.h),
+            RectF::new(
+                anim_modal.x + 4.0,
+                anim_modal.y + 10.0,
+                anim_modal.w - 8.0,
+                anim_modal.h,
+            ),
             20.0,
-            Color::rgba(0, 0, 0, 0.52),
+            Color::rgba(0, 0, 0, 0.52 * open_t),
         );
         r.draw_liquid_glass(
-            modal,
+            anim_modal,
             20.0,
             22.0,
-            Color::rgba(20, 22, 30, 0.88),
-            Theme::GLASS_RIM_LIGHT,
+            Color::rgba(20, 22, 30, 0.88 * open_t),
+            Theme::GLASS_RIM_LIGHT.with_alpha(Theme::GLASS_RIM_LIGHT.a * open_t),
             self.glass_off(),
         );
+        let pushed_lt_clip = open_t < 0.992;
+        let pushed_lt_alpha = if pushed_lt_clip {
+            r.push_clip(anim_modal);
+            r.push_opacity_layer(anim_modal, (open_t * 1.25).clamp(0.0, 1.0))
+        } else {
+            false
+        };
 
         let px = modal.x + 24.0;
         let pw = modal.w - 48.0;
@@ -18168,6 +19585,12 @@ impl AppUi {
                 rect: go_btn,
                 action: UiAction::Navigate(PageRoute::Settings),
             });
+            if pushed_lt_alpha {
+                r.pop_layer();
+            }
+            if pushed_lt_clip {
+                r.pop_clip();
+            }
             return;
         }
 
@@ -18948,6 +20371,12 @@ impl AppUi {
                 2.0,
                 Color::rgba(255, 255, 255, 0.34),
             );
+        }
+        if pushed_lt_alpha {
+            r.pop_layer();
+        }
+        if pushed_lt_clip {
+            r.pop_clip();
         }
     }
 

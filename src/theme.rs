@@ -135,15 +135,16 @@ impl Theme {
     pub const SIDEBAR_SELECTED: Color = Color::rgba(255, 255, 255, 0.095);
 
     /// Floating MiniPlayer & Floating Toolbar Liquid Glass tint (`liquid-glass.md › Regular`)
-    /// Ultra-clear Apple Tahoe crystal optical glaze — allows vibrant refracted covers to shine through!
-    pub const GLASS_REGULAR_FILL: Color = Color::rgba(20, 22, 28, 0.30);
+    /// Crystal-clear iPadOS 26 translucent optical glaze — lets vibrant refracted covers shine right
+    /// through while optical icon/text shadows preserve crisp legibility over bright album art!
+    pub const GLASS_REGULAR_FILL: Color = Color::rgba(16, 18, 24, 0.20);
     pub const GLASS_OPAQUE_FALLBACK: Color = Color::rgb(34, 34, 40);
-    /// Specular 1px top/outer glass highlight rim
-    pub const GLASS_RIM_LIGHT: Color = Color::rgba(255, 255, 255, 0.38);
-    pub const GLASS_RIM_SUBTLE: Color = Color::rgba(255, 255, 255, 0.12);
-    /// Floating button circle (`<`, `Shuffle`, `+`, `•••`)
-    pub const GLASS_BTN_FILL: Color = Color::rgba(34, 36, 46, 0.44);
-    pub const GLASS_BTN_HOVER: Color = Color::rgba(58, 62, 76, 0.58);
+    /// Specular 1px top/bottom vertical glass highlight rim
+    pub const GLASS_RIM_LIGHT: Color = Color::rgba(255, 255, 255, 0.44);
+    pub const GLASS_RIM_SUBTLE: Color = Color::rgba(255, 255, 255, 0.14);
+    /// Floating button circle (`<`, `>`, `•••`, window controls)
+    pub const GLASS_BTN_FILL: Color = Color::rgba(18, 20, 26, 0.24);
+    pub const GLASS_BTN_HOVER: Color = Color::rgba(36, 40, 50, 0.34);
 
     // --- Foreground Labels & Separators (`color.md`, `accessibility.md` >= 4.5:1) ---
     /// Primary Label (`#F5F5F7` -> 17.3:1 on BG_PRIMARY)

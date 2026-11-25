@@ -2512,31 +2512,19 @@ pub async fn fetch_official_radio_shelves(
 
     let mut shelves: Vec<EditorialShelf> = Vec::new();
 
-    // 1. Personal / Recent / Recommended Stations (all format="tracks" -> instant lossless playback!)
+    // 1. Personal / Recent / Recommended Stations + 2. Live Radio + 3. Station Genres — all in PARALLEL!
     let loc = crate::i18n::am_api_locale();
-    if utok.is_some() {
-        let sf_r = sf.to_string();
-        let ut_r = utok.clone();
+
+    let personal_fut = async {
+        let Some(utok_ref) = utok.as_ref() else {
+            return None;
+        };
         let rec_recent_path = format!("v1/me/recent/radio-stations?limit=12&l={loc}");
-        let recent_handle = tokio::spawn(async move {
-            fetch_am_api(
-                rec_recent_path,
-                ut_r,
-                None,
-                Some(sf_r),
-            )
-            .await
-        });
-        let rec_res = fetch_am_api(
-            format!("v1/me/recommendations?limit=15&l={loc}"),
-            utok.clone(),
-            None,
-            Some(sf.to_string()),
-        )
-        .await;
-        let recent_res = recent_handle
-            .await
-            .unwrap_or_else(|e| Err(format!("task join error: {e}")));
+        let rec_path = format!("v1/me/recommendations?limit=15&l={loc}");
+        let (recent_res, rec_res) = tokio::join!(
+            fetch_am_api(rec_recent_path, Some(utok_ref.clone()), None, Some(sf.to_string())),
+            fetch_am_api(rec_path, Some(utok_ref.clone()), None, Some(sf.to_string())),
+        );
 
         let mut seen = HashSet::new();
         let mut personal_items: Vec<EditorialItem> = Vec::new();
@@ -2546,7 +2534,11 @@ pub async fn fetch_official_radio_shelves(
                     if let Some(mut it) = parse_amp_resource_to_editorial_item(v, sf, 600) {
                         it.motion_video_url = None;
                         it.motion_tall_video_url = None;
-                        it.badge = if v.pointer("/attributes/isLive").and_then(Value::as_bool).unwrap_or(false) {
+                        it.badge = if v
+                            .pointer("/attributes/isLive")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                        {
                             "LIVE".to_string()
                         } else {
                             String::new()
@@ -2590,108 +2582,115 @@ pub async fn fetch_official_radio_shelves(
                 }
             }
         }
-        if !personal_items.is_empty() {
-            shelves.push(EditorialShelf {
-                title: "你的专属与常用电台".to_string(),
-                subtitle: "Personal & Recommended Stations".to_string(),
-                kind: EditorialShelfKind::RadioStationRow,
-                items: personal_items,
-            });
-        }
-    }
+        (!personal_items.is_empty()).then(|| EditorialShelf {
+            title: "你的专属与常用电台".to_string(),
+            subtitle: "Personal & Recommended Stations".to_string(),
+            kind: EditorialShelfKind::RadioStationRow,
+            items: personal_items,
+        })
+    };
 
-    // 2. Official Apple Music Live Radio stations (with storefront fallback if `cn` returns empty)
-    let mut live_items: Vec<EditorialItem> = Vec::new();
-    for live_sf in [sf, "jp", "us"] {
-        let p = format!(
-            "v1/catalog/{live_sf}/stations?filter[featured]=apple-music-live-radio&l={loc}"
-        );
-        if let Ok(lj) = fetch_am_api(p, utok.clone(), None, Some(live_sf.to_string())).await {
-            if let Some(arr) = lj.get("data").and_then(Value::as_array) {
-                for v in arr {
-                    if let Some(mut it) = parse_amp_resource_to_editorial_item(v, live_sf, 600) {
-                        it.motion_video_url = None;
-                        it.motion_tall_video_url = None;
-                        it.badge = "LIVE".to_string();
-                        if it.subtitle.is_empty() || it.subtitle == "广播电台" {
-                            if let Some(tag) = v
-                                .pointer("/attributes/editorialNotes/tagline")
-                                .or_else(|| v.pointer("/attributes/editorialNotes/short"))
-                                .and_then(Value::as_str)
-                            {
-                                let t = tag.trim();
-                                if !t.is_empty() {
-                                    it.subtitle = t.to_string();
+    let live_fut = async {
+        let mut live_items: Vec<EditorialItem> = Vec::new();
+        for live_sf in [sf, "jp", "us"] {
+            let p = format!(
+                "v1/catalog/{live_sf}/stations?filter[featured]=apple-music-live-radio&l={loc}"
+            );
+            if let Ok(lj) = fetch_am_api(p, utok.clone(), None, Some(live_sf.to_string())).await {
+                if let Some(arr) = lj.get("data").and_then(Value::as_array) {
+                    for v in arr {
+                        if let Some(mut it) = parse_amp_resource_to_editorial_item(v, live_sf, 600) {
+                            it.motion_video_url = None;
+                            it.motion_tall_video_url = None;
+                            it.badge = "LIVE".to_string();
+                            if it.subtitle.is_empty() || it.subtitle == "广播电台" {
+                                if let Some(tag) = v
+                                    .pointer("/attributes/editorialNotes/tagline")
+                                    .or_else(|| v.pointer("/attributes/editorialNotes/short"))
+                                    .and_then(Value::as_str)
+                                {
+                                    let t = tag.trim();
+                                    if !t.is_empty() {
+                                        it.subtitle = t.to_string();
+                                    }
                                 }
                             }
+                            live_items.push(it);
                         }
-                        live_items.push(it);
                     }
                 }
             }
+            if !live_items.is_empty() {
+                break;
+            }
         }
-        if !live_items.is_empty() {
-            break;
-        }
-    }
-    if !live_items.is_empty() {
-        shelves.push(EditorialShelf {
+        (!live_items.is_empty()).then(|| EditorialShelf {
             title: "Apple Music 广播电台".to_string(),
             subtitle: "Featured Live Radio".to_string(),
             kind: EditorialShelfKind::RadioStationRow,
             items: live_items,
-        });
-    }
+        })
+    };
 
-    // 3. Official Station Genres & their track-based algorithmic stations (all support next-tracks!)
-    let mut genres: Vec<(String, String, String)> = Vec::new();
-    for g_sf in [sf, "jp", "us"] {
-        let gp = format!("v1/catalog/{g_sf}/station-genres?limit=8&l={loc}");
-        if let Ok(gj) = fetch_am_api(gp, utok.clone(), None, Some(g_sf.to_string())).await {
-            if let Some(arr) = gj.get("data").and_then(Value::as_array) {
-                for g in arr.iter().take(4) {
-                    let gid = g.get("id").and_then(Value::as_str).unwrap_or("").trim();
-                    let gname = g
-                        .pointer("/attributes/name")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .trim();
-                    if !gid.is_empty() && !gname.is_empty() {
-                        genres.push((g_sf.to_string(), gid.to_string(), gname.to_string()));
+    let genres_fut = async {
+        let mut genres: Vec<(String, String, String)> = Vec::new();
+        for g_sf in [sf, "jp", "us"] {
+            let gp = format!("v1/catalog/{g_sf}/station-genres?limit=8&l={loc}");
+            if let Ok(gj) = fetch_am_api(gp, utok.clone(), None, Some(g_sf.to_string())).await {
+                if let Some(arr) = gj.get("data").and_then(Value::as_array) {
+                    for g in arr.iter().take(4) {
+                        let gid = g.get("id").and_then(Value::as_str).unwrap_or("").trim();
+                        let gname = g
+                            .pointer("/attributes/name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .trim();
+                        if !gid.is_empty() && !gname.is_empty() {
+                            genres.push((g_sf.to_string(), gid.to_string(), gname.to_string()));
+                        }
                     }
                 }
             }
-        }
-        if !genres.is_empty() {
-            break;
-        }
-    }
-
-    let mut genre_futs = Vec::new();
-    for (g_sf, gid, gname) in genres {
-        let ut = utok.clone();
-        genre_futs.push(async move {
-            let sp = format!("v1/catalog/{g_sf}/station-genres/{gid}/stations?limit=12&l={loc}");
-            let json = fetch_am_api(sp, ut, None, Some(g_sf.clone())).await.ok()?;
-            let arr = json.get("data").and_then(Value::as_array)?;
-            let mut items = Vec::new();
-            for v in arr {
-                if let Some(mut it) = parse_amp_resource_to_editorial_item(v, &g_sf, 600) {
-                    it.motion_video_url = None;
-                    it.motion_tall_video_url = None;
-                    it.badge.clear();
-                    items.push(it);
-                }
+            if !genres.is_empty() {
+                break;
             }
-            (!items.is_empty()).then(|| EditorialShelf {
-                title: format!("{gname} 电台"),
-                subtitle: "Station Genre".to_string(),
-                kind: EditorialShelfKind::RadioStationRow,
-                items,
-            })
-        });
+        }
+
+        let mut genre_futs = Vec::new();
+        for (g_sf, gid, gname) in genres {
+            let ut = utok.clone();
+            genre_futs.push(async move {
+                let sp = format!("v1/catalog/{g_sf}/station-genres/{gid}/stations?limit=12&l={loc}");
+                let json = fetch_am_api(sp, ut, None, Some(g_sf.clone())).await.ok()?;
+                let arr = json.get("data").and_then(Value::as_array)?;
+                let mut items = Vec::new();
+                for v in arr {
+                    if let Some(mut it) = parse_amp_resource_to_editorial_item(v, &g_sf, 600) {
+                        it.motion_video_url = None;
+                        it.motion_tall_video_url = None;
+                        it.badge.clear();
+                        items.push(it);
+                    }
+                }
+                (!items.is_empty()).then(|| EditorialShelf {
+                    title: format!("{gname} 电台"),
+                    subtitle: "Station Genre".to_string(),
+                    kind: EditorialShelfKind::RadioStationRow,
+                    items,
+                })
+            });
+        }
+        futures_join_all_bounded(genre_futs).await
+    };
+
+    let (personal_opt, live_opt, genre_shelves) = tokio::join!(personal_fut, live_fut, genres_fut);
+    if let Some(s) = personal_opt {
+        shelves.push(s);
     }
-    for sh in futures_join_all_bounded(genre_futs).await {
+    if let Some(s) = live_opt {
+        shelves.push(s);
+    }
+    for sh in genre_shelves {
         if let Some(s) = sh {
             shelves.push(s);
         }
@@ -2705,11 +2704,18 @@ pub async fn fetch_official_radio_shelves(
 
 async fn futures_join_all_bounded<F, T>(futs: Vec<F>) -> Vec<T>
 where
-    F: std::future::Future<Output = T>,
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
 {
-    let mut out = Vec::with_capacity(futs.len());
+    let mut handles = Vec::with_capacity(futs.len());
     for f in futs {
-        out.push(f.await);
+        handles.push(tokio::spawn(f));
+    }
+    let mut out = Vec::with_capacity(handles.len());
+    for h in handles {
+        if let Ok(v) = h.await {
+            out.push(v);
+        }
     }
     out
 }
@@ -2800,10 +2806,16 @@ pub async fn fetch_track_motion_video_url(
         .map(str::trim)
         .filter(|s| !s.is_empty() && !s.starts_with("i."))
     {
-        for try_sf in &storefronts {
-            if let Some(url) = fetch_album_motion_video_url(try_sf, id, true).await {
+        if storefronts.len() == 2 {
+            let (r1, r2) = tokio::join!(
+                fetch_album_motion_video_url(storefronts[0], id, true),
+                fetch_album_motion_video_url(storefronts[1], id, true),
+            );
+            if let Some(url) = r1.or(r2) {
                 return Some(url);
             }
+        } else if let Some(url) = fetch_album_motion_video_url(storefronts[0], id, true).await {
+            return Some(url);
         }
     }
     let query_raw = if !album.trim().is_empty() && !artist.trim().is_empty() {
@@ -2815,38 +2827,47 @@ pub async fn fetch_track_motion_video_url(
     };
     let encoded: String = url::form_urlencoded::byte_serialize(query_raw.as_bytes()).collect();
     let alb_low = album.trim().to_ascii_lowercase();
-    for try_sf in &storefronts {
-        let search_path = format!(
-            "v1/catalog/{try_sf}/search?types=albums&term={encoded}&limit=5&extend=editorialVideo&l=zh-Hans-CN"
-        );
-        if let Ok(json) = fetch_am_api(search_path, None, None, Some((*try_sf).to_string())).await {
-            if let Some(albums) = json.pointer("/results/albums/data").and_then(Value::as_array) {
-                let mut fallback_vid: Option<String> = None;
-                for alb in albums {
-                    if let Some(attrs) = alb.get("attributes") {
-                        if let Some(v) = extract_editorial_motion_video_from_attrs(attrs) {
-                            let name_low = attrs
-                                .get("name")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_ascii_lowercase();
-                            if alb_low.is_empty()
-                                || name_low.contains(&alb_low)
-                                || alb_low.contains(&name_low)
-                            {
-                                return Some(v);
-                            }
-                            if fallback_vid.is_none() {
-                                fallback_vid = Some(v);
-                            }
+    let search_in_sf = |try_sf: String| {
+        let enc_s = encoded.clone();
+        let alb_l = alb_low.clone();
+        async move {
+            let search_path = format!(
+                "v1/catalog/{try_sf}/search?types=albums&term={enc_s}&limit=5&extend=editorialVideo&l=zh-Hans-CN"
+            );
+            let json = fetch_am_api(search_path, None, None, Some(try_sf))
+                .await
+                .ok()?;
+            let albums = json.pointer("/results/albums/data").and_then(Value::as_array)?;
+            let mut fallback_vid: Option<String> = None;
+            for alb in albums {
+                if let Some(attrs) = alb.get("attributes") {
+                    if let Some(v) = extract_editorial_motion_video_from_attrs(attrs) {
+                        let name_low = attrs
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_ascii_lowercase();
+                        if alb_l.is_empty()
+                            || name_low.contains(&alb_l)
+                            || alb_l.contains(&name_low)
+                        {
+                            return Some(v);
+                        }
+                        if fallback_vid.is_none() {
+                            fallback_vid = Some(v);
                         }
                     }
                 }
-                if let Some(v) = fallback_vid {
-                    return Some(v);
-                }
             }
+            fallback_vid
         }
+    };
+    if storefronts.len() == 2 {
+        let (r1, r2) = tokio::join!(
+            search_in_sf(storefronts[0].to_string()),
+            search_in_sf(storefronts[1].to_string()),
+        );
+        return r1.or(r2);
     }
-    None
+    search_in_sf(storefronts[0].to_string()).await
 }

@@ -1747,11 +1747,11 @@ mod tests {
         use am_light_lib::bplist::PlistValue;
         use am_light_lib::lyrics::{has_mismatched_edition_tag, is_cjk_char, parse_ttml_lyrics};
 
-        // 1. Liquid Glass Default OFF + English-by-Word Default ON (even on legacy settings_v2.json!)
+        // 1. Rebuilt iOS 26 Liquid Glass Default ON + English-by-Word Default ON (even on legacy settings_v2.json!)
         let def_s = AppSettings::default();
         assert!(
-            !def_s.liquid_glass_enabled,
-            "Liquid Glass must be disabled by default"
+            def_s.liquid_glass_enabled,
+            "Rebuilt iOS 26 Liquid Glass must be enabled by default"
         );
         assert!(
             def_s.lyrics_latin_by_word,
@@ -1761,8 +1761,8 @@ mod tests {
         let legacy_json = r#"{"storefront":"cn","reduce_transparency":false,"window_corner_radius":12.0}"#;
         let migrated: AppSettings = serde_json::from_str(legacy_json).expect("deserialize legacy");
         assert!(
-            !migrated.liquid_glass_enabled,
-            "existing settings_v2.json without liquid_glass_enabled must default to OFF"
+            migrated.liquid_glass_enabled,
+            "existing settings_v2.json without liquid_glass_enabled must default to ON"
         );
         assert!(
             migrated.lyrics_latin_by_word,
@@ -1770,11 +1770,11 @@ mod tests {
         );
 
         let mut ui = AppUi::new(0);
-        assert!(ui.glass_off(), "AppUi::glass_off() must be true by default");
-        ui.execute_action(UiAction::ToggleLiquidGlass);
-        assert!(ui.settings.liquid_glass_enabled && !ui.glass_off());
+        assert!(!ui.glass_off(), "AppUi::glass_off() must be false by default with Liquid Glass ON");
         ui.execute_action(UiAction::ToggleLiquidGlass);
         assert!(!ui.settings.liquid_glass_enabled && ui.glass_off());
+        ui.execute_action(UiAction::ToggleLiquidGlass);
+        assert!(ui.settings.liquid_glass_enabled && !ui.glass_off());
 
         // 2. CJK (Chinese Hanzi / Japanese Kana+Kanji / Korean Hangul) per-character (`字`) vs English per-word (`word`) + Switch
         assert!(is_cjk_char('温') && is_cjk_char('あ') && is_cjk_char('カ') && is_cjk_char('밤'));
@@ -5157,6 +5157,1053 @@ lo48.m3u8\n";
         set_active_language(AppLanguage::Auto);
         unsafe {
             let _ = DestroyWindow(hwnd);
+        }
+    }
+
+    #[test]
+    fn test_v0211_ios26_liquid_glass_inter_font_lyrics_ui_and_page_cache() {
+        use am_light_lib::am_agent::AgentTrackInput;
+        use am_light_lib::app_ui::{AppSettings, AppUi, ContextMenuTarget, PageRoute, UiAction};
+        use am_light_lib::d2d_renderer::D2DRenderer;
+        use am_light_lib::lyrics::parse_ttml_lyrics;
+        use am_light_lib::lyrics_view::{LyricsHitAction, LyricsViewState};
+        use am_light_lib::theme::RectF;
+        use windows::core::{w, PCWSTR};
+        use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, CS_HREDRAW, CS_VREDRAW,
+            WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP, WS_POPUP,
+        };
+
+        unsafe extern "system" fn unit_wnd_proc(
+            h: HWND,
+            m: u32,
+            w: WPARAM,
+            l: LPARAM,
+        ) -> LRESULT {
+            DefWindowProcW(h, m, w, l)
+        }
+
+        // 1. iOS 26 Liquid Glass default ON + one-time v2 migration flag + page_cache_enabled default ON & toggle
+        let def_s = AppSettings::default();
+        assert!(def_s.liquid_glass_enabled, "iOS 26 Liquid Glass must default ON");
+        assert!(def_s.page_cache_enabled, "page_cache_enabled must default ON");
+        assert!(def_s.lyrics_left_enlarged, "lyrics_left_enlarged must default ON");
+        assert!(!def_s.lyrics_center_axis, "lyrics_center_axis must default OFF");
+
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tmp_dir = std::env::temp_dir().join(format!("am_light_v0211_migrate_{uniq}"));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
+        let old_file = tmp_dir.join("legacy_off.json");
+        std::fs::write(
+            &old_file,
+            r#"{"storefront":"cn","liquid_glass_enabled":false}"#,
+        )
+        .expect("write legacy off json");
+        let upgraded = AppSettings::load_from_paths(&[old_file.clone()]).expect("load legacy");
+        assert!(
+            upgraded.liquid_glass_enabled && upgraded.liquid_glass_v2_migrated,
+            "unmigrated legacy settings with liquid_glass_enabled=false must auto-migrate ON once"
+        );
+
+        let user_opted_out = tmp_dir.join("user_opted_out.json");
+        std::fs::write(
+            &user_opted_out,
+            r#"{"storefront":"cn","liquid_glass_enabled":false,"liquid_glass_v2_migrated":true}"#,
+        )
+        .expect("write opted-out json");
+        let respected = AppSettings::load_from_paths(&[user_opted_out]).expect("load opted-out");
+        assert!(
+            !respected.liquid_glass_enabled && respected.liquid_glass_v2_migrated,
+            "once liquid_glass_v2_migrated=true, user toggling Liquid Glass OFF must be respected permanently"
+        );
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+
+        // SDF optical lens displacement map: flat neutral interior (128,128) + curved refractive bezel!
+        let disp = D2DRenderer::generate_liquid_glass_sdf_displacement_map(128, 48, 320.0, 64.0, 32.0);
+        assert_eq!(disp.len(), 128 * 48 * 4);
+        let center_idx = ((24 * 128) + 64) * 4;
+        assert_eq!(
+            (disp[center_idx + 2], disp[center_idx + 1]),
+            (128, 128),
+            "interior optical core must stay neutral (128,128) with zero distortion"
+        );
+        let edge_idx = ((24 * 128) + 2) * 4; // left bezel edge -> bends along horizontal normal
+        assert!(
+            (disp[edge_idx + 2] as i32 - 128).abs() >= 6,
+            "outer glass bezel must encode curved horizontal refraction normal: R={}",
+            disp[edge_idx + 2]
+        );
+
+        // 2. Bundled OFL Inter font loading & zero-slash tabular digits (NEVER Consolas!)
+        assert!(
+            D2DRenderer::verify_inter_font_bundle(),
+            "bundled InterVariable.ttf must have valid TTF magic header and payload"
+        );
+        let d2d_src = std::fs::read_to_string("src/d2d_renderer.rs").expect("read d2d_renderer.rs");
+        let has_consolas_code = d2d_src.lines().any(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.starts_with("//") && line.contains("\"Consolas\"")
+        });
+        assert!(
+            !has_consolas_code,
+            "Consolas must be completely eliminated in favor of Inter + tnum/zero=0"
+        );
+        assert!(
+            d2d_src.contains("DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES")
+                && d2d_src.contains("DWRITE_FONT_FEATURE_TAG_SLASHED_ZERO"),
+            "DirectWrite mono typography must explicitly configure tnum=1 and zero=0"
+        );
+
+        // Spin up a lightweight offscreen D2D renderer to verify live DirectWrite Inter loading AND top-bar hits!
+        let hwnd = unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let hinst: HINSTANCE = GetModuleHandleW(None).unwrap_or_default().into();
+            let cls = w!("AMLightV0211UnitHost");
+            let wc = WNDCLASSW {
+                style: CS_HREDRAW | CS_VREDRAW,
+                lpfnWndProc: Some(unit_wnd_proc),
+                hInstance: hinst,
+                lpszClassName: cls,
+                ..Default::default()
+            };
+            let _ = RegisterClassW(&wc);
+            CreateWindowExW(
+                WS_EX_NOREDIRECTIONBITMAP,
+                cls,
+                PCWSTR(w!("AM Light Unit").as_ptr()),
+                WS_POPUP,
+                0,
+                0,
+                1280,
+                760,
+                None,
+                None,
+                Some(hinst),
+                None,
+            )
+            .expect("CreateWindowExW")
+        };
+        let mut renderer = D2DRenderer::new(hwnd, 1280, 760, 1.0).expect("D2DRenderer::new");
+        assert!(
+            renderer.has_bundled_inter_font(),
+            "DirectWrite in-memory font loader must load bundled Inter Variable font"
+        );
+        assert!(
+            renderer.active_ui_font_family().contains("Inter"),
+            "active UI font must be Inter, got {}",
+            renderer.active_ui_font_family()
+        );
+        assert!(
+            renderer.mono_font_family().contains("Inter")
+                && !renderer.mono_font_family().contains("Consolas"),
+            "mono font must be Inter (never Consolas), got {}",
+            renderer.mono_font_family()
+        );
+        assert!(
+            renderer.verify_inter_formats_all_weights(),
+            "all UI weights (400/500/600/700) for regular & mono must resolve to bundled Inter"
+        );
+
+        // 3. Main window top-right Refresh button completely removed + Settings forces glass_off + page_cache toggle + F5 refresh
+        let mut ui = AppUi::new(0);
+        assert!(ui.settings.page_cache_enabled);
+        ui.execute_action(UiAction::TogglePageCache);
+        assert!(!ui.settings.page_cache_enabled);
+        ui.execute_action(UiAction::TogglePageCache);
+        assert!(ui.settings.page_cache_enabled);
+        ui.execute_action(UiAction::ClearPageCache);
+        assert!(ui.on_key_down(0x74 /* VK_F5 */));
+
+        // Settings page must disable Liquid Glass completely while Home & Lyrics overlay retain it
+        assert!(!ui.glass_off(), "Home page must have Liquid Glass ON by default");
+        ui.route = PageRoute::Settings;
+        ui.show_lyrics_overlay = false;
+        assert!(ui.glass_off(), "Settings page must force Liquid Glass OFF for pure iPadOS matte perf");
+        ui.show_lyrics_overlay = true;
+        assert!(!ui.glass_off(), "Lyrics overlay opened from Settings must keep Liquid Glass ON");
+        ui.show_lyrics_overlay = false;
+
+        let app_ui_src = std::fs::read_to_string("src/app_ui.rs").expect("read src/app_ui.rs");
+        let sp_start = app_ui_src
+            .find("fn draw_settings_page(")
+            .expect("draw_settings_page");
+        let sp_rest = &app_ui_src[sp_start + 20..];
+        let sp_end = sp_rest
+            .find("\n    fn ")
+            .map(|o| sp_start + 20 + o)
+            .unwrap_or(app_ui_src.len());
+        let settings_fn_src = &app_ui_src[sp_start..sp_end];
+        assert!(
+            !settings_fn_src.contains("draw_liquid_glass"),
+            "draw_settings_page must contain ZERO draw_liquid_glass calls"
+        );
+
+        ui.route = PageRoute::Home;
+        ui.show_lyrics_overlay = false;
+        ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, true);
+        // Glass hover/press springs must settle cleanly to 0% idle CPU
+        renderer.step_glass_animations(1.0);
+        assert!(
+            !renderer.has_active_glass_motion(),
+            "glass springs must settle to idle (has_active_glass_motion == false)"
+        );
+        let top_refresh_hits = ui
+            .hit_regions
+            .iter()
+            .filter(|h| h.rect.y < 70.0 && matches!(h.action, UiAction::RefreshCurrentView))
+            .count();
+        assert_eq!(
+            top_refresh_hits, 0,
+            "Main window top-right floating nav must NOT contain a Refresh button"
+        );
+
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+
+        // 4. Lyrics view new defaults, toggles, queue wheel scroll, and end-of-playlist scroll-back latch
+        let lv_def = LyricsViewState::default();
+        assert!(lv_def.left_enlarged, "left_enlarged must default to true");
+        assert!(!lv_def.center_axis, "center_axis must default to false");
+        assert!(lv_def.show_lyrics, "show_lyrics must default to true");
+        assert!(!lv_def.show_queue, "show_queue must default to false");
+
+        // Persisted toggles & keeping NowPlaying context menu open
+        ui.handle_lyrics_action(LyricsHitAction::OpenMoreMenu(RectF::new(400.0, 460.0, 32.0, 32.0)));
+        assert!(matches!(
+            ui.context_menu.as_ref().map(|c| &c.target),
+            Some(ContextMenuTarget::NowPlaying)
+        ));
+        ui.execute_action(UiAction::ToggleLyricsLeftEnlarged);
+        assert!(!ui.settings.lyrics_left_enlarged && !ui.lyrics_view.left_enlarged);
+        assert!(ui.context_menu.is_some(), "toggling left_enlarged should keep NowPlaying menu open");
+        ui.execute_action(UiAction::ToggleLyricsLeftEnlarged);
+        assert!(ui.settings.lyrics_left_enlarged && ui.lyrics_view.left_enlarged);
+
+        ui.execute_action(UiAction::ToggleLyricsCenterAxis);
+        assert!(ui.settings.lyrics_center_axis && ui.lyrics_view.center_axis);
+        ui.execute_action(UiAction::ToggleLyricsCenterAxis);
+        assert!(!ui.settings.lyrics_center_axis && !ui.lyrics_view.center_axis);
+
+        // ToggleLyricsVisible / ToggleLyricsQueue mutual interaction + queue wheel scroll
+        ui.show_lyrics_overlay = true;
+        ui.handle_lyrics_action(LyricsHitAction::ToggleLyricsQueue);
+        assert!(ui.lyrics_view.show_queue);
+        let mock_queue: Vec<AgentTrackInput> = (0..18)
+            .map(|i| AgentTrackInput {
+                id: format!("q_{i}"),
+                name: format!("Queue Track {i}"),
+                artist_name: "Test Artist".to_string(),
+                album_name: "Test Album".to_string(),
+                duration_sec: 210.0,
+                ..Default::default()
+            })
+            .collect();
+        ui.lyrics_view.queue_column_rect = RectF::new(720.0, 40.0, 620.0, 760.0);
+        ui.lyrics_view.set_queue_tracks(mock_queue);
+        assert!(ui.lyrics_view.queue_max_scroll_y > 100.0);
+        ui.mouse_pos = (920.0, 360.0);
+        ui.on_wheel(-1.0);
+        assert!(
+            ui.lyrics_view.queue_scroll_y > 20.0
+                && ui.lyrics_view.queue_scroll_y <= ui.lyrics_view.queue_max_scroll_y,
+            "mouse wheel over lyrics queue column must scroll queue_scroll_y: {}",
+            ui.lyrics_view.queue_scroll_y
+        );
+        ui.on_wheel(10.0);
+        assert_eq!(ui.lyrics_view.queue_scroll_y, 0.0);
+
+        // Turning lyrics visible back ON closes queue cleanly
+        ui.lyrics_view.show_lyrics = false;
+        ui.handle_lyrics_action(LyricsHitAction::ToggleLyricsVisible);
+        assert!(ui.lyrics_view.show_lyrics && !ui.lyrics_view.show_queue);
+
+        // End-of-playlist lyrics scroll-back latch: stopping at end of song MUST NOT reset lyrics to line 0!
+        let end_ttml = r#"<tt xmlns="http://www.w3.org/ns/ttml"><body><div>
+            <p begin="00:01.000" end="00:04.000"><span begin="00:01.000" end="00:04.000">Opening line</span></p>
+            <p begin="00:06.000" end="00:10.000"><span begin="00:06.000" end="00:10.000">Middle chorus</span></p>
+            <p begin="00:14.000" end="00:19.000"><span begin="00:14.000" end="00:19.000">Final farewell line</span></p>
+        </div></body></tt>"#;
+        let parsed_end = parse_ttml_lyrics(end_ttml, "TTML").expect("parse end ttml");
+        let mut lv = LyricsViewState::default();
+        // Play up to near the end of the final line (`t = 18.2s`, `is_playing = true`)
+        for f in 0..45 {
+            lv.step(
+                Some(&parsed_end),
+                false,
+                "id:end_latch_track",
+                17.5 + (f as f64) * 0.016,
+                true,
+                0.2,
+                None,
+                760.0,
+                1.0 / 60.0,
+                false,
+                true,
+            );
+        }
+        let end_line_y_before = lv.animator.line_states[2].y_spring.value;
+        assert_eq!(lv.animator.primary_active_idx, Some(2));
+        assert!(lv.end_latched_playhead.is_none());
+
+        // Playlist ends: backend stops (`is_playing = false`) and snaps `playhead_sec` back to `0.0` on SAME track!
+        for _ in 0..30 {
+            lv.step(
+                Some(&parsed_end),
+                false,
+                "id:end_latch_track",
+                0.0,
+                false,
+                0.0,
+                None,
+                760.0,
+                1.0 / 60.0,
+                false,
+                true,
+            );
+        }
+        assert!(
+            lv.end_latched_playhead.is_some(),
+            "stopping at song end with playhead reset to 0.0 must engage end_latched_playhead"
+        );
+        assert!(
+            lv.synced_playhead_sec > 15.0,
+            "latched synced_playhead_sec must stay at song end instead of 0.0 (got {})",
+            lv.synced_playhead_sec
+        );
+        assert_ne!(
+            lv.animator.primary_active_idx,
+            Some(0),
+            "lyrics must NOT jump back to line 0 when playlist ends!"
+        );
+        assert!(
+            (lv.animator.line_states[2].y_spring.value - end_line_y_before).abs() < 24.0,
+            "final lyric line Y position must remain serenely near the end: before={end_line_y_before}, now={}",
+            lv.animator.line_states[2].y_spring.value
+        );
+
+        // Resuming playback (`is_playing = true`) or calling `clear_end_latch()` clears the latch cleanly
+        lv.clear_end_latch();
+        assert!(lv.end_latched_playhead.is_none());
+        lv.step(
+            Some(&parsed_end),
+            false,
+            "id:end_latch_track",
+            1.5,
+            true,
+            0.2,
+            None,
+            760.0,
+            1.0 / 60.0,
+            false,
+            true,
+        );
+        assert_eq!(lv.animator.primary_active_idx, Some(0));
+    }
+
+    #[test]
+    #[ignore]
+    fn capture_v0211_qa_screenshots() {
+        use am_light_lib::am_agent::AgentTrackInput;
+        use am_light_lib::am_api;
+        use am_light_lib::app_ui::{AppUi, PageRoute, UiAction};
+        use am_light_lib::audio_viz::StreamAudioSpecs;
+        use am_light_lib::backends::PlaybackBackend;
+        use am_light_lib::d2d_renderer::D2DRenderer;
+        use am_light_lib::i18n::{set_active_language, AppLanguage};
+        use am_light_lib::lyrics::parse_ttml_lyrics;
+        use am_light_lib::lyrics_view::LyricsHitAction;
+        use am_light_lib::smtc::SmtcState;
+        use am_light_lib::theme::RectF;
+        use std::path::PathBuf;
+        use windows::core::{w, PCWSTR};
+        use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, CS_HREDRAW, CS_VREDRAW,
+            WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP, WS_POPUP,
+        };
+
+        unsafe extern "system" fn qa_wnd_proc(
+            h: HWND,
+            m: u32,
+            w: WPARAM,
+            l: LPARAM,
+        ) -> LRESULT {
+            DefWindowProcW(h, m, w, l)
+        }
+
+        let out_dir = std::env::var("AM_LIGHT_QA_OUT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir().join("am_light_v0211_qa"));
+        std::fs::create_dir_all(&out_dir).expect("create QA screenshot dir");
+
+        // Full window size 1400x880 @ 1.0x DPI, Dark theme, rebuilt iOS 26 Liquid Glass ON
+        let w_px: u32 = 1400;
+        let h_px: u32 = 880;
+        let dpi_scale: f32 = 1.0;
+
+        let hwnd = unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let hinst: HINSTANCE = GetModuleHandleW(None).unwrap_or_default().into();
+            let cls = w!("AMLightQaCaptureHost");
+            let wc = WNDCLASSW {
+                style: CS_HREDRAW | CS_VREDRAW,
+                lpfnWndProc: Some(qa_wnd_proc),
+                hInstance: hinst,
+                lpszClassName: cls,
+                ..Default::default()
+            };
+            let _ = RegisterClassW(&wc);
+            CreateWindowExW(
+                WS_EX_NOREDIRECTIONBITMAP,
+                cls,
+                PCWSTR(w!("AM Light QA").as_ptr()),
+                WS_POPUP,
+                0,
+                0,
+                w_px as i32,
+                h_px as i32,
+                None,
+                None,
+                Some(hinst),
+                None,
+            )
+            .expect("CreateWindowExW")
+        };
+
+        let mut renderer = D2DRenderer::new(hwnd, w_px, h_px, dpi_scale).expect("D2DRenderer::new");
+        println!(
+            "[QA FONT] has_bundled_inter_font={}, active_ui_font_family={:?}, mono_font_family={:?}",
+            renderer.has_bundled_inter_font(),
+            renderer.active_ui_font_family(),
+            renderer.mono_font_family()
+        );
+        assert!(
+            renderer.has_bundled_inter_font(),
+            "bundled Inter font must load for QA screenshots"
+        );
+        let rt = tokio::runtime::Runtime::new().expect("tokio rt");
+
+        set_active_language(AppLanguage::ZhCn);
+        let shelves = rt
+            .block_on(am_api::fetch_home_editorial_shelves("cn", None))
+            .unwrap_or_default();
+
+        let mut art_urls: Vec<(String, bool)> = Vec::new();
+        for (si, shelf) in shelves.iter().take(4).enumerate() {
+            for item in shelf.items.iter().take(10) {
+                if !item.artwork_url.is_empty() {
+                    art_urls.push((item.artwork_url.clone(), si == 0));
+                }
+            }
+        }
+        let fetched_arts: Vec<(String, bool, Vec<u8>)> = rt.block_on(async {
+            let mut futs = Vec::new();
+            for (u, hero) in art_urls {
+                futs.push(async move {
+                    let bytes = am_api::fetch_artwork_bytes(&u, hero).await.ok()?;
+                    Some((u, hero, bytes))
+                });
+            }
+            let mut out = Vec::new();
+            for f in futs {
+                if let Some(v) = f.await {
+                    out.push(v);
+                }
+            }
+            out
+        });
+        for (u, hero, bytes) in &fetched_arts {
+            let _ = renderer.insert_artwork_bytes(u.clone(), bytes, *hero);
+        }
+
+        let available_items: Vec<_> = shelves
+            .iter()
+            .flat_map(|s| s.items.iter())
+            .filter(|it| {
+                !it.artwork_url.is_empty()
+                    && (renderer.has_artwork(&it.artwork_url, false)
+                        || renderer.has_artwork(&it.artwork_url, true))
+            })
+            .cloned()
+            .collect();
+
+        let hero_item = available_items.first().cloned();
+        let lyrics_item = available_items.first().cloned();
+        let hero_art_url = hero_item.as_ref().map(|it| it.artwork_url.clone());
+        let lyrics_art_url = lyrics_item
+            .as_ref()
+            .map(|it| it.artwork_url.clone())
+            .or_else(|| hero_art_url.clone());
+        if let Some(ref u) = lyrics_art_url {
+            if let Some((_, _, bytes)) = fetched_arts.iter().find(|(k, _, _)| k == u) {
+                let _ = renderer.insert_artwork_bytes(u.clone(), bytes, true);
+            }
+        }
+
+        let mut ui = AppUi::new(0);
+        ui.settings.language = AppLanguage::ZhCn;
+        ui.settings.storefront = "cn".to_string();
+        ui.settings.user_token.clear();
+        ui.settings.playback_backend = PlaybackBackend::AppleMusicNative;
+        ui.settings.liquid_glass_enabled = true;
+        ui.settings.reduce_transparency = false;
+        ui.settings.window_corner_radius = 14.0;
+        ui.settings.lyrics_free_blur = true;
+        ui.settings.lyrics_immersive_mode = false;
+        ui.settings.lyrics_left_enlarged = true;
+        ui.settings.lyrics_center_axis = false;
+        ui.settings.lyrics_auto_emphasis = true;
+        ui.settings.lyrics_frontier_wave = true;
+        ui.settings.lyrics_end_hold_glow = true;
+        ui.lyrics_view.music_free_blur = true;
+        ui.lyrics_view.left_enlarged = true;
+        ui.lyrics_view.center_axis = false;
+        ui.lyrics_view.show_lyrics = true;
+        ui.lyrics_view.show_queue = false;
+        ui.lyrics_view.show_translation = true;
+        ui.official_account = Default::default();
+        ui.home_shelves = shelves;
+
+        let demo_specs = StreamAudioSpecs {
+            codec: "alac".to_string(),
+            codec_label: "ALAC".to_string(),
+            tier_label: "高解析度无损".to_string(),
+            sample_rate_hz: 96_000,
+            bit_depth: Some(24),
+            channels: "2ch".to_string(),
+            bitrate_kbps: 3210,
+            peak_bitrate_kbps: 3680,
+            uncompressed_pcm_kbps: Some(4608),
+            compression_ratio_pct: Some(69.7),
+            atmos_fallback_reason: None,
+            hires_catalog_trait: true,
+            available_variants: Vec::new(),
+        };
+
+        let base_smtc = SmtcState {
+            active: true,
+            app_id: "AMPLibraryAgent.exe".to_string(),
+            title: "Midnight Resonance".to_string(),
+            artist: "Aurora Synth Ensemble".to_string(),
+            album: "Liquid Glass Sessions (Hi-Res Master)".to_string(),
+            status: "Playing".to_string(),
+            position_sec: 60.4,
+            duration_sec: 240.0,
+            thumbnail_base64: None,
+            artwork_url: hero_art_url.clone(),
+            backend_mode: "agent".to_string(),
+            audio_quality: Some("高解析度无损 · 24-bit / 96kHz".to_string()),
+            volume: Some(0.75),
+            agent_pid: None,
+            adam_id: Some("1000001".to_string()),
+            stream_specs: Some(demo_specs),
+            sampled_at: Some(std::time::Instant::now()),
+            timeline_updated_univ: 0,
+            position_is_calibrated: true,
+        };
+        ui.on_playback_state_changed(base_smtc.clone());
+
+        // ====================================================================
+        // QA SHOT 1: Home Page with Rebuilt iOS 26 Liquid Glass ON (1400x880)
+        // Scroll slightly so rich colorful covers sit behind the floating MiniPlayer!
+        // ====================================================================
+        ui.execute_action(UiAction::Navigate(PageRoute::Home));
+        ui.show_lyrics_overlay = false;
+        ui.scroll_y = 140.0;
+        ui.scroll_target_y = 140.0;
+        for _ in 0..24 {
+            ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, true);
+        }
+        let s1 = out_dir.join("qa_1_home_liquid_glass.png");
+        renderer.pending_capture_path = Some(s1.clone());
+        ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, true);
+        assert!(s1.exists(), "qa_1_home_liquid_glass.png must be written");
+
+        // Prepare rich bilingual syllable-synced TTML lyrics around t = 60.4s (displays `1:00` and `-3:00` -> tests unslashed `0`!)
+        let sample_ttml = concat!(
+            r#"<tt xmlns="http://www.w3.org/ns/ttml" xmlns:itunes="http://music.apple.com/lyric-ttml-internal" xmlns:ttm="http://www.w3.org/ns/ttml#metadata">"#,
+            r#"<head><metadata><iTunesMetadata><translations><translation xml:lang="zh-Hans-CN">"#,
+            r#"<text for="L1">霓虹折射在午夜微凉的雨幕里</text>"#,
+            r#"<text for="L2">每一道声波都在液态玻璃上缓缓绽放</text>"#,
+            r#"<text for="L3">听见星海在无损高频间轻声回响</text>"#,
+            r#"<text for="L4">让光影与旋律在此刻停留成永恒</text>"#,
+            r#"<text for="L5">穿越云端与城市沉默的霓虹灯火</text>"#,
+            r#"<text for="L6">闭上双眼感受律动在指尖轻轻起伏</text>"#,
+            r#"</translation></translations></iTunesMetadata></metadata></head><body><div>"#,
+            r#"<p begin="00:46.000" end="00:52.200" itunes:key="L1"><span begin="00:46.000" end="00:47.100">Neon</span> <span begin="00:47.100" end="00:48.200">lights</span> <span begin="00:48.200" end="00:49.400">dissolve</span> <span begin="00:49.400" end="00:50.600">across</span> <span begin="00:50.600" end="00:52.200">midnight rain</span></p>"#,
+            r#"<p begin="00:52.600" end="00:58.400" itunes:key="L2"><span begin="00:52.600" end="00:53.500">Every</span> <span begin="00:53.500" end="00:54.500">wave</span> <span begin="00:54.500" end="00:55.700">unfolds</span> <span begin="00:55.700" end="00:56.800">in</span> <span begin="00:56.800" end="00:58.400" itunes:emphasis="true">liquid glass</span></p>"#,
+            r#"<p begin="00:58.800" end="01:05.600" itunes:key="L3"><span begin="00:58.800" end="00:59.600">Hear</span> <span begin="00:59.600" end="01:00.200">the</span> <span begin="01:00.200" end="01:01.600" itunes:emphasis="true">starlight</span> <span begin="01:01.600" end="01:03.200" itunes:emphasis="true">shimmering</span> <span begin="01:03.200" end="01:04.400">through</span> <span begin="01:04.400" end="01:05.600">the air</span></p>"#,
+            r#"<p begin="01:06.000" end="01:12.400" itunes:key="L4"><span begin="01:06.000" end="01:07.100">Hold</span> <span begin="01:07.100" end="01:08.100">this</span> <span begin="01:08.100" end="01:09.600" itunes:emphasis="true">melody</span> <span begin="01:09.600" end="01:11.000">inside</span> <span begin="01:11.000" end="01:12.400">the glow</span></p>"#,
+            r#"<p begin="01:12.800" end="01:18.500" itunes:key="L5"><span begin="01:12.800" end="01:14.100">Drifting</span> <span begin="01:14.100" end="01:15.500">softly</span> <span begin="01:15.500" end="01:16.900">past</span> <span begin="01:16.900" end="01:18.500">the quiet sky</span></p>"#,
+            r#"<p begin="01:18.900" end="01:24.500" itunes:key="L6"><span begin="01:18.900" end="01:20.200">Close</span> <span begin="01:20.200" end="01:21.500">your</span> <span begin="01:21.500" end="01:23.000">eyes</span> <span begin="01:23.000" end="01:24.500">and float</span></p>"#,
+            r#"</div></body></tt>"#,
+        );
+        let parsed_lyr = parse_ttml_lyrics(sample_ttml, "Apple Music TTML").expect("sample ttml");
+        let mut lyr_smtc = base_smtc.clone();
+        lyr_smtc.artwork_url = lyrics_art_url.clone();
+        lyr_smtc.position_sec = 60.4;
+        lyr_smtc.duration_sec = 240.0;
+        ui.on_playback_state_changed(lyr_smtc);
+        ui.current_lyrics_key = "qa:v0211-lyrics".to_string();
+        ui.current_lyrics = Some(parsed_lyr);
+        ui.lyrics_loading = false;
+        ui.show_lyrics_overlay = true;
+
+        // ====================================================================
+        // QA SHOT 2: Full-Screen Lyrics in 流光 Mode with left_enlarged = true
+        // ====================================================================
+        ui.settings.lyrics_free_blur = true;
+        ui.lyrics_view.music_free_blur = true;
+        ui.settings.lyrics_left_enlarged = true;
+        ui.settings.lyrics_center_axis = false;
+        ui.lyrics_view.show_lyrics = true;
+        ui.lyrics_view.show_queue = false;
+        ui.lyrics_view.show_translation = true;
+        ui.context_menu = None;
+        for f in 0..48 {
+            ui.smtc.position_sec = 59.35 + (f as f64) * 0.015;
+            ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, true);
+        }
+        ui.smtc.position_sec = 60.05;
+        let s2 = out_dir.join("qa_2_lyrics_aurora_enlarged.png");
+        renderer.pending_capture_path = Some(s2.clone());
+        ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, true);
+        assert!(s2.exists(), "qa_2_lyrics_aurora_enlarged.png must be written");
+
+        // ====================================================================
+        // QA SHOT 3: Full-Screen Lyrics with Left `•••` Context Menu OPEN
+        // ====================================================================
+        let dots_anchor = ui
+            .lyrics_view
+            .hit_zones
+            .iter()
+            .find(|z| matches!(z.action, LyricsHitAction::OpenMoreMenu(_)))
+            .map(|z| z.rect)
+            .unwrap_or_else(|| RectF::new(500.0, 560.0, 32.0, 32.0));
+        ui.handle_lyrics_action(LyricsHitAction::OpenMoreMenu(dots_anchor));
+        for _ in 0..8 {
+            ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, true);
+        }
+        let s3 = out_dir.join("qa_3_lyrics_more_menu.png");
+        renderer.pending_capture_path = Some(s3.clone());
+        ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, true);
+        assert!(s3.exists(), "qa_3_lyrics_more_menu.png must be written");
+
+        // ====================================================================
+        // QA SHOT 4: Full-Screen Lyrics with `center_axis = true`
+        // ====================================================================
+        ui.context_menu = None;
+        ui.settings.lyrics_center_axis = true;
+        ui.lyrics_view.center_axis = true;
+        for _ in 0..24 {
+            ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, true);
+        }
+        let s4 = out_dir.join("qa_4_lyrics_center_axis.png");
+        renderer.pending_capture_path = Some(s4.clone());
+        ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, true);
+        assert!(s4.exists(), "qa_4_lyrics_center_axis.png must be written");
+
+        // ====================================================================
+        // QA SHOT 5: Full-Screen Lyrics with Right-Column `播放列表` Queue Open
+        // ====================================================================
+        ui.settings.lyrics_center_axis = false;
+        ui.lyrics_view.center_axis = false;
+        ui.play_next_queue.clear();
+        let queue_titles = [
+            ("Midnight Resonance", "Aurora Synth Ensemble", 240.0),
+            ("Velvet Horizon", "Nocturne Collective", 210.0),
+            ("Glass Reflections", "Kyoto Drift", 195.0),
+            ("Solstice Rain", "Sora Takahashi", 268.0),
+            ("Starlight Boulevard", "Chromatic Echo", 224.0),
+            ("Amber Tide", "Pacific Waves", 180.0),
+            ("Silent Frequency", "Lumina Studio", 252.0),
+            ("Electric Dawn", "Synth Archive", 206.0),
+            ("Cloudburst Suite", "Aether Quartet", 300.0),
+            ("Neon Harbour", "Midnight Mono", 230.0),
+            ("Crystal Reverie", "Opal Lines", 214.0),
+            ("Afterglow 09", "Deep Horizon", 245.0),
+        ];
+        for (idx, &(title, artist, dur)) in queue_titles.iter().enumerate() {
+            let art = available_items
+                .get(idx % available_items.len().max(1))
+                .map(|it| it.artwork_url.clone())
+                .or_else(|| lyrics_art_url.clone());
+            ui.play_next_queue.push_back(AgentTrackInput {
+                id: if idx == 0 {
+                    "1000001".to_string()
+                } else {
+                    format!("qa_q_{idx}")
+                },
+                catalog_id: None,
+                kind: Some("song".to_string()),
+                name: title.to_string(),
+                artist_name: artist.to_string(),
+                album_name: "Liquid Glass Sessions".to_string(),
+                duration_sec: dur,
+                artwork_url: art,
+                audio_traits: vec!["hi-res-lossless".to_string()],
+            });
+        }
+        ui.handle_lyrics_action(LyricsHitAction::ToggleLyricsQueue);
+        for _ in 0..20 {
+            ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, true);
+        }
+        let s5 = out_dir.join("qa_5_lyrics_queue_open.png");
+        renderer.pending_capture_path = Some(s5.clone());
+        ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, true);
+        assert!(s5.exists(), "qa_5_lyrics_queue_open.png must be written");
+
+        set_active_language(AppLanguage::Auto);
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn capture_v0211_round2_hidpi_perf_qa() {
+        use am_light_lib::am_api;
+        use am_light_lib::app_ui::{AppUi, PageRoute, UiAction};
+        use am_light_lib::audio_viz::{AudioOutputDevice, StreamAudioSpecs};
+        use am_light_lib::backends::PlaybackBackend;
+        use am_light_lib::d2d_renderer::D2DRenderer;
+        use am_light_lib::drm_fix::DrmDiagReport;
+        use am_light_lib::i18n::{set_active_language, AppLanguage};
+        use am_light_lib::lyrics::parse_ttml_lyrics;
+        use am_light_lib::lyrics_view::LyricsHitAction;
+        use am_light_lib::smtc::SmtcState;
+        use am_light_lib::theme::RectF;
+        use std::path::PathBuf;
+        use std::time::Instant;
+        use windows::core::{w, PCWSTR};
+        use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, CS_HREDRAW, CS_VREDRAW,
+            WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP, WS_POPUP,
+        };
+
+        unsafe extern "system" fn qa2_wnd_proc(
+            h: HWND,
+            m: u32,
+            w: WPARAM,
+            l: LPARAM,
+        ) -> LRESULT {
+            DefWindowProcW(h, m, w, l)
+        }
+
+        let make_host = |cls_name: windows::core::PCWSTR, w_px: u32, h_px: u32| -> HWND {
+            unsafe {
+                let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+                let hinst: HINSTANCE = GetModuleHandleW(None).unwrap_or_default().into();
+                let wc = WNDCLASSW {
+                    style: CS_HREDRAW | CS_VREDRAW,
+                    lpfnWndProc: Some(qa2_wnd_proc),
+                    hInstance: hinst,
+                    lpszClassName: cls_name,
+                    ..Default::default()
+                };
+                let _ = RegisterClassW(&wc);
+                CreateWindowExW(
+                    WS_EX_NOREDIRECTIONBITMAP,
+                    cls_name,
+                    PCWSTR(w!("AM Light QA2").as_ptr()),
+                    WS_POPUP,
+                    0,
+                    0,
+                    w_px as i32,
+                    h_px as i32,
+                    None,
+                    None,
+                    Some(hinst),
+                    None,
+                )
+                .expect("CreateWindowExW")
+            }
+        };
+
+        let out_dir = std::env::var("AM_LIGHT_QA_OUT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir().join("am_light_v0211_qa2"));
+        std::fs::create_dir_all(&out_dir).expect("create QA2 dir");
+
+        let hwnd_100 = make_host(w!("AMLightQa2Host100"), 1400, 880);
+        let hwnd_200 = make_host(w!("AMLightQa2Host200"), 2800, 1760);
+
+        let mut r100 = D2DRenderer::new(hwnd_100, 1400, 880, 1.0).expect("D2DRenderer 100%");
+        let mut r200 = D2DRenderer::new(hwnd_200, 2800, 1760, 2.0).expect("D2DRenderer 200%");
+        assert!(r100.has_bundled_inter_font() && r100.verify_inter_formats_all_weights());
+        assert!(r200.has_bundled_inter_font() && r200.verify_inter_formats_all_weights());
+
+        let rt = tokio::runtime::Runtime::new().expect("tokio rt");
+        set_active_language(AppLanguage::ZhCn);
+        let shelves = rt
+            .block_on(am_api::fetch_home_editorial_shelves("cn", None))
+            .unwrap_or_default();
+
+        let mut art_urls: Vec<(String, bool)> = Vec::new();
+        for (si, shelf) in shelves.iter().take(4).enumerate() {
+            for item in shelf.items.iter().take(10) {
+                if !item.artwork_url.is_empty() {
+                    art_urls.push((item.artwork_url.clone(), si == 0));
+                }
+            }
+        }
+        let fetched_arts: Vec<(String, bool, Vec<u8>)> = rt.block_on(async {
+            let mut futs = Vec::new();
+            for (u, hero) in art_urls {
+                futs.push(async move {
+                    let bytes = am_api::fetch_artwork_bytes(&u, hero).await.ok()?;
+                    Some((u, hero, bytes))
+                });
+            }
+            let mut out = Vec::new();
+            for f in futs {
+                if let Some(v) = f.await {
+                    out.push(v);
+                }
+            }
+            out
+        });
+        for (u, hero, bytes) in &fetched_arts {
+            let _ = r100.insert_artwork_bytes(u.clone(), bytes, *hero);
+            let _ = r200.insert_artwork_bytes(u.clone(), bytes, *hero);
+        }
+
+        let hero_art_url = shelves
+            .iter()
+            .flat_map(|s| s.items.iter())
+            .find(|it| {
+                !it.artwork_url.is_empty()
+                    && (r100.has_artwork(&it.artwork_url, false)
+                        || r100.has_artwork(&it.artwork_url, true))
+            })
+            .map(|it| it.artwork_url.clone());
+        if let Some(ref u) = hero_art_url {
+            if let Some((_, _, bytes)) = fetched_arts.iter().find(|(k, _, _)| k == u) {
+                let _ = r100.insert_artwork_bytes(u.clone(), bytes, true);
+                let _ = r200.insert_artwork_bytes(u.clone(), bytes, true);
+            }
+        }
+
+        let mut ui = AppUi::new(0);
+        ui.settings.language = AppLanguage::ZhCn;
+        ui.settings.storefront = "cn".to_string();
+        ui.settings.user_token.clear();
+        ui.settings.playback_backend = PlaybackBackend::AppleMusicNative;
+        ui.settings.liquid_glass_enabled = true;
+        ui.settings.reduce_transparency = false;
+        ui.settings.window_corner_radius = 14.0;
+        ui.settings.lyrics_free_blur = true;
+        ui.settings.lyrics_immersive_mode = false;
+        ui.settings.lyrics_left_enlarged = true;
+        ui.settings.lyrics_center_axis = false;
+        ui.lyrics_view.music_free_blur = true;
+        ui.lyrics_view.left_enlarged = true;
+        ui.lyrics_view.center_axis = false;
+        ui.lyrics_view.show_lyrics = true;
+        ui.lyrics_view.show_queue = false;
+        ui.lyrics_view.show_translation = true;
+        ui.official_account = Default::default();
+        ui.drm_diag = DrmDiagReport {
+            checked: true,
+            healthy: true,
+            adi_dir_exists: true,
+            adi_file_count: 1,
+            unwritable_files: Vec::new(),
+            sc_info_unwritable: false,
+            hklm_redirections: Vec::new(),
+            summary: "DRM 授权状态正常（1 个 ADI 身份文件均可正常读写）".to_string(),
+            detail: "设备授权正常，支持无损与高解析度流媒体播放".to_string(),
+        };
+        ui.devices = vec![AudioOutputDevice {
+            id: "studio-dac".to_string(),
+            name: "Studio DAC USB Audio".to_string(),
+            is_default: true,
+            sample_rate: 96_000,
+            bit_depth: 24,
+            channels: 2,
+            format_tag: "PCM".to_string(),
+            spatial_audio_active: false,
+        }];
+        ui.current_monitor_hz = 144;
+        ui.home_shelves = shelves;
+
+        let demo_specs = StreamAudioSpecs {
+            codec: "alac".to_string(),
+            codec_label: "ALAC".to_string(),
+            tier_label: "高解析度无损".to_string(),
+            sample_rate_hz: 96_000,
+            bit_depth: Some(24),
+            channels: "2ch".to_string(),
+            bitrate_kbps: 3210,
+            peak_bitrate_kbps: 3680,
+            uncompressed_pcm_kbps: Some(4608),
+            compression_ratio_pct: Some(69.7),
+            atmos_fallback_reason: None,
+            hires_catalog_trait: true,
+            available_variants: Vec::new(),
+        };
+        let base_smtc = SmtcState {
+            active: true,
+            app_id: "AMPLibraryAgent.exe".to_string(),
+            title: "Midnight Resonance".to_string(),
+            artist: "Aurora Synth Ensemble".to_string(),
+            album: "Liquid Glass Sessions (Hi-Res Master)".to_string(),
+            status: "Playing".to_string(),
+            position_sec: 60.05,
+            duration_sec: 240.0,
+            thumbnail_base64: None,
+            artwork_url: hero_art_url.clone(),
+            backend_mode: "agent".to_string(),
+            audio_quality: Some("高解析度无损 · 24-bit / 96kHz".to_string()),
+            volume: Some(0.75),
+            agent_pid: None,
+            adam_id: Some("1000001".to_string()),
+            stream_specs: Some(demo_specs),
+            sampled_at: Some(Instant::now()),
+            timeline_updated_univ: 0,
+            position_is_calibrated: true,
+        };
+        ui.on_playback_state_changed(base_smtc.clone());
+
+        let bench_30 = |label: &str, ui: &mut AppUi, r: &mut D2DRenderer| {
+            // Warmup 6 frames so caches & GPU pipelines stabilize
+            for _ in 0..6 {
+                ui.step_and_render_ex(r, 1.0 / 60.0, true);
+            }
+            let mut min_ms = f64::MAX;
+            let mut max_ms = 0.0f64;
+            let mut sum_ms = 0.0f64;
+            for _ in 0..30 {
+                let t0 = Instant::now();
+                ui.step_and_render_ex(r, 1.0 / 60.0, true);
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                min_ms = min_ms.min(ms);
+                max_ms = max_ms.max(ms);
+                sum_ms += ms;
+            }
+            let avg_ms = sum_ms / 30.0;
+            println!(
+                "[PERF] {label}: avg={avg_ms:.2} ms/frame (min={min_ms:.2} ms, max={max_ms:.2} ms, ~{:.0} FPS)",
+                1000.0 / avg_ms.max(0.01)
+            );
+        };
+
+        // ====================================================================
+        // SHOT 1: Home @ 100% DPI (1400x880) with Ultra-Clear Vertical-Rim Liquid Glass
+        // ====================================================================
+        ui.execute_action(UiAction::Navigate(PageRoute::Home));
+        ui.show_lyrics_overlay = false;
+        ui.scroll_y = 140.0;
+        ui.scroll_target_y = 140.0;
+        bench_30("Home (Liquid Glass ON, 100% DPI 1400x880)", &mut ui, &mut r100);
+        let p1 = out_dir.join("qa2_1_home_100dpi.png");
+        r100.pending_capture_path = Some(p1.clone());
+        ui.step_and_render_ex(&mut r100, 1.0 / 60.0, true);
+        assert!(p1.exists(), "qa2_1_home_100dpi.png must be written");
+
+        // ====================================================================
+        // SHOT 2: Home @ 200% HiDPI (2800x1760 physical px) — verify ZERO seam/banding!
+        // ====================================================================
+        bench_30("Home (Liquid Glass ON, 200% HiDPI 2800x1760)", &mut ui, &mut r200);
+        let p2 = out_dir.join("qa2_2_home_200hidpi.png");
+        r200.pending_capture_path = Some(p2.clone());
+        ui.step_and_render_ex(&mut r200, 1.0 / 60.0, true);
+        assert!(p2.exists(), "qa2_2_home_200hidpi.png must be written");
+
+        // ====================================================================
+        // SHOT 3: New iPadOS Grouped Settings Page (ZERO Liquid Glass!)
+        // ====================================================================
+        ui.execute_action(UiAction::Navigate(PageRoute::Settings));
+        ui.show_lyrics_overlay = false;
+        ui.scroll_y = 0.0;
+        ui.scroll_target_y = 0.0;
+        ui.banner_text = None;
+        assert!(ui.glass_off(), "Settings must run with glass_off == true");
+        bench_30("Settings (iPadOS matte, 100% DPI 1400x880)", &mut ui, &mut r100);
+        bench_30("Settings (iPadOS matte, 200% HiDPI 2800x1760)", &mut ui, &mut r200);
+        let p3 = out_dir.join("qa2_3_settings_ipados.png");
+        r100.pending_capture_path = Some(p3.clone());
+        ui.step_and_render_ex(&mut r100, 1.0 / 60.0, true);
+        assert!(p3.exists(), "qa2_3_settings_ipados.png must be written");
+
+        // Also capture scrolled middle/lower Settings sections for visual audit
+        ui.scroll_y = 560.0;
+        ui.scroll_target_y = 560.0;
+        for _ in 0..8 {
+            ui.step_and_render_ex(&mut r100, 1.0 / 60.0, true);
+        }
+        let p3b = out_dir.join("qa2_3b_settings_ipados_mid.png");
+        r100.pending_capture_path = Some(p3b.clone());
+        ui.step_and_render_ex(&mut r100, 1.0 / 60.0, true);
+        assert!(p3b.exists());
+
+        // ====================================================================
+        // SHOT 4: Lyrics Page in 流光 Mode + Clear Vertical-Rim Liquid Glass `•••` Menu
+        // ====================================================================
+        let sample_ttml = concat!(
+            r#"<tt xmlns="http://www.w3.org/ns/ttml" xmlns:itunes="http://music.apple.com/lyric-ttml-internal" xmlns:ttm="http://www.w3.org/ns/ttml#metadata">"#,
+            r#"<head><metadata><iTunesMetadata><translations><translation xml:lang="zh-Hans-CN">"#,
+            r#"<text for="L1">霓虹折射在午夜微凉的雨幕里</text>"#,
+            r#"<text for="L2">每一道声波都在液态玻璃上缓缓绽放</text>"#,
+            r#"<text for="L3">听见星海在无损高频间轻声回响</text>"#,
+            r#"<text for="L4">让光影与旋律在此刻停留成永恒</text>"#,
+            r#"<text for="L5">穿越云端与城市沉默的霓虹灯火</text>"#,
+            r#"<text for="L6">闭上双眼感受律动在指尖轻轻起伏</text>"#,
+            r#"</translation></translations></iTunesMetadata></metadata></head><body><div>"#,
+            r#"<p begin="00:46.000" end="00:52.200" itunes:key="L1"><span begin="00:46.000" end="00:47.100">Neon</span> <span begin="00:47.100" end="00:48.200">lights</span> <span begin="00:48.200" end="00:49.400">dissolve</span> <span begin="00:49.400" end="00:50.600">across</span> <span begin="00:50.600" end="00:52.200">midnight rain</span></p>"#,
+            r#"<p begin="00:52.600" end="00:58.400" itunes:key="L2"><span begin="00:52.600" end="00:53.500">Every</span> <span begin="00:53.500" end="00:54.500">wave</span> <span begin="00:54.500" end="00:55.700">unfolds</span> <span begin="00:55.700" end="00:56.800">in</span> <span begin="00:56.800" end="00:58.400" itunes:emphasis="true">liquid glass</span></p>"#,
+            r#"<p begin="00:58.800" end="01:05.600" itunes:key="L3"><span begin="00:58.800" end="00:59.600">Hear</span> <span begin="00:59.600" end="01:00.200">the</span> <span begin="01:00.200" end="01:01.600" itunes:emphasis="true">starlight</span> <span begin="01:01.600" end="01:03.200" itunes:emphasis="true">shimmering</span> <span begin="01:03.200" end="01:04.400">through</span> <span begin="01:04.400" end="01:05.600">the air</span></p>"#,
+            r#"<p begin="01:06.000" end="01:12.400" itunes:key="L4"><span begin="01:06.000" end="01:07.100">Hold</span> <span begin="01:07.100" end="01:08.100">this</span> <span begin="01:08.100" end="01:09.600" itunes:emphasis="true">melody</span> <span begin="01:09.600" end="01:11.000">inside</span> <span begin="01:11.000" end="01:12.400">the glow</span></p>"#,
+            r#"<p begin="01:12.800" end="01:18.500" itunes:key="L5"><span begin="01:12.800" end="01:14.100">Drifting</span> <span begin="01:14.100" end="01:15.500">softly</span> <span begin="01:15.500" end="01:16.900">past</span> <span begin="01:16.900" end="01:18.500">the quiet sky</span></p>"#,
+            r#"<p begin="01:18.900" end="01:24.500" itunes:key="L6"><span begin="01:18.900" end="01:20.200">Close</span> <span begin="01:20.200" end="01:21.500">your</span> <span begin="01:21.500" end="01:23.000">eyes</span> <span begin="01:23.000" end="01:24.500">and float</span></p>"#,
+            r#"</div></body></tt>"#,
+        );
+        let parsed_lyr = parse_ttml_lyrics(sample_ttml, "Apple Music TTML").expect("sample ttml");
+        ui.current_lyrics_key = "qa2:lyrics".to_string();
+        ui.current_lyrics = Some(parsed_lyr);
+        ui.lyrics_loading = false;
+        ui.show_lyrics_overlay = true;
+        ui.context_menu = None;
+        for f in 0..30 {
+            ui.smtc.position_sec = 59.60 + (f as f64) * 0.015;
+            ui.step_and_render_ex(&mut r100, 1.0 / 60.0, true);
+        }
+        bench_30("Lyrics (流光 Aurora, 100% DPI 1400x880)", &mut ui, &mut r100);
+
+        let dots_anchor = ui
+            .lyrics_view
+            .hit_zones
+            .iter()
+            .find(|z| matches!(z.action, LyricsHitAction::OpenMoreMenu(_)))
+            .map(|z| z.rect)
+            .unwrap_or_else(|| RectF::new(500.0, 560.0, 32.0, 32.0));
+        ui.handle_lyrics_action(LyricsHitAction::OpenMoreMenu(dots_anchor));
+        // Let popover morph spring settle fully open
+        for _ in 0..24 {
+            ui.step_and_render_ex(&mut r100, 1.0 / 60.0, true);
+        }
+        let p4 = out_dir.join("qa2_4_lyrics_menu_glass.png");
+        r100.pending_capture_path = Some(p4.clone());
+        ui.step_and_render_ex(&mut r100, 1.0 / 60.0, true);
+        assert!(p4.exists(), "qa2_4_lyrics_menu_glass.png must be written");
+
+        set_active_language(AppLanguage::Auto);
+        unsafe {
+            let _ = DestroyWindow(hwnd_100);
+            let _ = DestroyWindow(hwnd_200);
         }
     }
 }

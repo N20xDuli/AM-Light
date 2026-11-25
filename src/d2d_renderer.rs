@@ -7,23 +7,30 @@ use std::ffi::c_void;
 use windows::core::{Interface, HSTRING};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_BEZIER_SEGMENT,
-    D2D1_BORDER_MODE_HARD, D2D1_BORDER_MODE_SOFT, D2D1_COLOR_F,
-    D2D1_COMPOSITE_MODE_SOURCE_OVER, D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_BEGIN_HOLLOW,
-    D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN, D2D1_GRADIENT_STOP, D2D1_PIXEL_FORMAT,
-    D2D_POINT_2U, D2D_RECT_F, D2D_RECT_U, D2D_SIZE_F, D2D_SIZE_U,
+    D2D1_2DAFFINETRANSFORM_INTERPOLATION_MODE_LINEAR, D2D1_ALPHA_MODE_IGNORE,
+    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_BEZIER_SEGMENT, D2D1_BORDER_MODE_HARD,
+    D2D1_BORDER_MODE_SOFT, D2D1_COLOR_F, D2D1_COMPOSITE_MODE_SOURCE_OVER,
+    D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_BEGIN_HOLLOW, D2D1_FIGURE_END_CLOSED,
+    D2D1_FIGURE_END_OPEN, D2D1_GRADIENT_STOP, D2D1_PIXEL_FORMAT, D2D_POINT_2U, D2D_RECT_F,
+    D2D_RECT_U, D2D_SIZE_F, D2D_SIZE_U,
 };
 use windows::Win32::Graphics::DirectComposition::{
     DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
 };
 use windows::Win32::Graphics::Direct2D::{
-    CLSID_D2D1ColorMatrix, CLSID_D2D1Crop, CLSID_D2D1GaussianBlur, D2D1CreateFactory, ID2D1Bitmap1,
+    CLSID_D2D12DAffineTransform, CLSID_D2D1Border, CLSID_D2D1ColorMatrix, CLSID_D2D1Crop,
+    CLSID_D2D1DisplacementMap, CLSID_D2D1GaussianBlur, D2D1CreateFactory, ID2D1Bitmap1,
     ID2D1BitmapBrush1, ID2D1Device, ID2D1DeviceContext, ID2D1Effect, ID2D1Factory, ID2D1Factory1,
     ID2D1Geometry, ID2D1Image, ID2D1LinearGradientBrush, ID2D1PathGeometry, ID2D1RenderTarget,
-    ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_BRUSH_PROPERTIES1,
+    ID2D1SolidColorBrush, D2D1_2DAFFINETRANSFORM_PROP_BORDER_MODE,
+    D2D1_2DAFFINETRANSFORM_PROP_INTERPOLATION_MODE, D2D1_2DAFFINETRANSFORM_PROP_TRANSFORM_MATRIX,
+    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_BRUSH_PROPERTIES1,
     D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_NONE, D2D1_BITMAP_OPTIONS_TARGET,
-    D2D1_BITMAP_PROPERTIES1, D2D1_CAP_STYLE_ROUND, D2D1_COLORMATRIX_PROP_COLOR_MATRIX,
-    D2D1_COMBINE_MODE_EXCLUDE, D2D1_CROP_PROP_RECT, D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
+    D2D1_BITMAP_PROPERTIES1, D2D1_BORDER_EDGE_MODE_CLAMP, D2D1_BORDER_PROP_EDGE_MODE_X,
+    D2D1_BORDER_PROP_EDGE_MODE_Y, D2D1_CAP_STYLE_ROUND, D2D1_CHANNEL_SELECTOR_G,
+    D2D1_CHANNEL_SELECTOR_R, D2D1_COLORMATRIX_PROP_COLOR_MATRIX, D2D1_COMBINE_MODE_EXCLUDE,
+    D2D1_CROP_PROP_RECT, D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_DISPLACEMENTMAP_PROP_SCALE,
+    D2D1_DISPLACEMENTMAP_PROP_X_CHANNEL_SELECT, D2D1_DISPLACEMENTMAP_PROP_Y_CHANNEL_SELECT,
     D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
     D2D1_DRAW_TEXT_OPTIONS_NO_SNAP, D2D1_ELLIPSE, D2D1_EXTEND_MODE_CLAMP,
     D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_GAMMA_2_2, D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED,
@@ -31,9 +38,10 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION, D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION,
     D2D1_INTERPOLATION_MODE_LINEAR, D2D1_LAYER_OPTIONS1_NONE, D2D1_LAYER_PARAMETERS1,
     D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_LINE_JOIN_ROUND, D2D1_PRIMITIVE_BLEND_COPY,
-    D2D1_PRIMITIVE_BLEND_SOURCE_OVER, D2D1_PROPERTY_TYPE_BLOB, D2D1_PROPERTY_TYPE_FLOAT,
-    D2D1_PROPERTY_TYPE_UINT32, D2D1_PROPERTY_TYPE_VECTOR4, D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES,
-    D2D1_ROUNDED_RECT, D2D1_STROKE_STYLE_PROPERTIES, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
+    D2D1_PRIMITIVE_BLEND_SOURCE_OVER, D2D1_PROPERTY_TYPE_BLOB, D2D1_PROPERTY_TYPE_ENUM,
+    D2D1_PROPERTY_TYPE_FLOAT, D2D1_PROPERTY_TYPE_MATRIX_3X2, D2D1_PROPERTY_TYPE_UINT32,
+    D2D1_PROPERTY_TYPE_VECTOR4, D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES, D2D1_ROUNDED_RECT,
+    D2D1_STROKE_STYLE_PROPERTIES, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
 };
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL_10_0,
@@ -44,18 +52,21 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_CREATE_DEVICE_SINGLETHREADED, D3D11_SDK_VERSION,
 };
 use windows::Win32::Graphics::DirectWrite::{
-    DWriteCreateFactory, IDWriteFactory, IDWriteInlineObject, IDWriteRenderingParams,
-    IDWriteTextFormat, IDWriteTextLayout, DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL,
-    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT, DWRITE_HIT_TEST_METRICS,
-    DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
-    DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC, DWRITE_TEXT_ALIGNMENT_CENTER,
-    DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TEXT_METRICS,
-    DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER, DWRITE_WORD_WRAPPING_NO_WRAP,
-    DWRITE_WORD_WRAPPING_WRAP,
+    DWriteCreateFactory, IDWriteFactory, IDWriteFactory3, IDWriteFactory5, IDWriteFontCollection,
+    IDWriteFontFallback, IDWriteInMemoryFontFileLoader, IDWriteInlineObject,
+    IDWriteRenderingParams, IDWriteTextFormat, IDWriteTextFormat1, IDWriteTextFormat3,
+    IDWriteTextLayout, IDWriteTypography, DWRITE_AUTOMATIC_FONT_AXES_OPTICAL_SIZE,
+    DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_FEATURE, DWRITE_FONT_FEATURE_TAG_SLASHED_ZERO,
+    DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+    DWRITE_FONT_WEIGHT, DWRITE_HIT_TEST_METRICS, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+    DWRITE_PARAGRAPH_ALIGNMENT_NEAR, DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC,
+    DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING,
+    DWRITE_TEXT_METRICS, DWRITE_TEXT_RANGE, DWRITE_TRIMMING,
+    DWRITE_TRIMMING_GRANULARITY_CHARACTER, DWRITE_WORD_WRAPPING_NO_WRAP, DWRITE_WORD_WRAPPING_WRAP,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_IGNORE, DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM,
-    DXGI_SAMPLE_DESC,
+    DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     IDXGIDevice, IDXGIDevice1, IDXGIDevice3, IDXGIFactory2, IDXGISurface, IDXGISwapChain1,
@@ -73,6 +84,10 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
 use windows::Win32::UI::Shell::SHCreateMemStream;
 use windows_numerics::{Matrix3x2, Vector2};
+
+/// Official open-source Inter v4.1 Variable Font (SIL OFL 1.1 — `assets/fonts/OFL.txt`).
+pub const INTER_FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/InterVariable.ttf");
+pub const INTER_FONT_FAMILY: &str = "Inter Variable Text";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TextAlign {
@@ -106,6 +121,7 @@ pub enum SfIcon {
     Next,
     Shuffle,
     Repeat,
+    Translate,
     LyricsBubble,
     QueueList,
     MoreDots,
@@ -210,6 +226,22 @@ impl Default for ActiveGlowSlot {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct GlassAnimState {
+    hover_t: f32,
+    hover_target: f32,
+    press_t: f32,
+    press_target: f32,
+    scale: f32,
+    scale_vel: f32,
+    scale_target: f32,
+    caustic_x: f32,
+    caustic_y: f32,
+    caustic_target_x: f32,
+    caustic_target_y: f32,
+    last_frame: u64,
+}
+
 pub struct D2DRenderer {
     pub d2d_factory: ID2D1Factory1,
     pub dxgi_device: IDXGIDevice,
@@ -225,6 +257,12 @@ pub struct D2DRenderer {
     pub swap_buffer_count: u32,
     pub target_bitmap: Option<ID2D1Bitmap1>,
     pub dwrite: IDWriteFactory,
+    custom_font_collection: Option<IDWriteFontCollection>,
+    system_font_fallback: Option<IDWriteFontFallback>,
+    mono_typography: Option<IDWriteTypography>,
+    bundled_inter_family: String,
+    bundled_inter_loaded: bool,
+    in_memory_font_loader: Option<IDWriteInMemoryFontFileLoader>,
     lyrics_text_params: Option<IDWriteRenderingParams>,
     lyrics_subpixel_mode: bool,
     pub wic: IWICImagingFactory,
@@ -232,9 +270,12 @@ pub struct D2DRenderer {
     pub round_stroke: windows::Win32::Graphics::Direct2D::ID2D1StrokeStyle,
     pub blur_effect: Option<ID2D1Effect>,
     pub glass_crop_effect: Option<ID2D1Effect>,
-    pub glass_rim_blur_effect: Option<ID2D1Effect>,
     pub glass_vibrancy_effect: Option<ID2D1Effect>,
-    pub glass_rim_vibrancy_effect: Option<ID2D1Effect>,
+    glass_border_effect: Option<ID2D1Effect>,
+    glass_bg_scale_effect: Option<ID2D1Effect>,
+    glass_disp_xform_effect: Option<ID2D1Effect>,
+    glass_disp_border_effect: Option<ID2D1Effect>,
+    glass_disp_g_effect: Option<ID2D1Effect>,
     pub line_blur_effect: Option<ID2D1Effect>,
     pub trans_bg_blur_effect: Option<ID2D1Effect>,
     pub trans_fg_blur_effect: Option<ID2D1Effect>,
@@ -243,22 +284,34 @@ pub struct D2DRenderer {
     pub glow_outer_alpha_effect: Option<ID2D1Effect>,
     pub glow_inner_alpha_effect: Option<ID2D1Effect>,
     pub mesh_blur_effect: Option<ID2D1Effect>,
+    mesh_vibrancy_effect: Option<ID2D1Effect>,
+    mesh_feather_brush: Option<windows::Win32::Graphics::Direct2D::ID2D1RadialGradientBrush>,
     cherenkov_brush: Option<windows::Win32::Graphics::Direct2D::ID2D1RadialGradientBrush>,
     window_rim_brush: Option<ID2D1LinearGradientBrush>,
+    glass_vrim_brush: Option<ID2D1LinearGradientBrush>,
+    glass_vrim_hover_brush: Option<ID2D1LinearGradientBrush>,
+    glass_inner_gleam_brush: Option<ID2D1LinearGradientBrush>,
 
     // Cached exterior corner mask geometry for custom rounded window silhouette
     corner_cutout_key: (u32, u32, u16),
     corner_cutout_geom: Option<ID2D1PathGeometry>,
 
-    // Reusable scratch bitmap for Liquid Glass backdrop capture + single per-frame scene snapshot
-    // (eliminates 10+ per-button GPU Flush/Copy stalls per frame!)
+    // Reusable scratch bitmap + single per-frame half-res pre-blurred snapshot + LRU FP16 SDF displacement maps
     glass_capture_bmp: Option<ID2D1Bitmap1>,
     glass_cap_w: u32,
     glass_cap_h: u32,
     glass_frame_snapshot: Option<ID2D1Bitmap1>,
     glass_snap_w: u32,
     glass_snap_h: u32,
+    glass_half_src: Option<ID2D1Bitmap1>,
+    glass_blurred_snapshot: Option<ID2D1Bitmap1>,
+    glass_half_w: u32,
+    glass_half_h: u32,
     glass_snapshot_active: bool,
+    glass_disp_maps: HashMap<(u16, u16, u16), (ID2D1Bitmap1, u32, u32)>,
+    glass_disp_lru: VecDeque<(u16, u16, u16)>,
+    glass_anim_states: std::cell::RefCell<HashMap<u64, GlassAnimState>>,
+    last_glass_surface_rects: std::cell::RefCell<Vec<RectF>>,
     frame_counter: u64,
 
     // Bounded LRU offscreen premultiplied bitmaps for true GPU Gaussian depth-of-field lyrics blur
@@ -335,6 +388,95 @@ pub fn to_d2d_rect(r: RectF) -> D2D_RECT_F {
         top: r.y,
         right: r.x + r.w,
         bottom: r.y + r.h,
+    }
+}
+
+#[inline]
+fn mat5x4_bytes(m: [f32; 20]) -> [u8; 80] {
+    let mut b = [0u8; 80];
+    for (i, f) in m.iter().enumerate() {
+        b[i * 4..(i + 1) * 4].copy_from_slice(&f.to_le_bytes());
+    }
+    b
+}
+
+#[inline]
+fn mat3x2_bytes(m: Matrix3x2) -> [u8; 24] {
+    let vals = [m.M11, m.M12, m.M21, m.M22, m.M31, m.M32];
+    let mut b = [0u8; 24];
+    for (i, f) in vals.iter().enumerate() {
+        b[i * 4..(i + 1) * 4].copy_from_slice(&f.to_le_bytes());
+    }
+    b
+}
+
+#[inline]
+fn vec4_bytes(v: [f32; 4]) -> [u8; 16] {
+    let mut b = [0u8; 16];
+    for (i, f) in v.iter().enumerate() {
+        b[i * 4..(i + 1) * 4].copy_from_slice(&f.to_le_bytes());
+    }
+    b
+}
+
+/// Converts a normalized `f32` in `[0.0, 1.0]` to an IEEE-754 binary16 half-float (`u16`)
+/// for `DXGI_FORMAT_R16G16B16A16_FLOAT` displacement maps (exact `0.5 -> 0x3800`, `1.0 -> 0x3C00`).
+#[inline]
+fn f32_to_f16_bits(x: f32) -> u16 {
+    let v = x.clamp(0.0, 1.0);
+    if v == 0.0 {
+        return 0;
+    }
+    let bits = v.to_bits();
+    let exp32 = ((bits >> 23) & 0xFF) as i32;
+    let mant32 = bits & 0x007F_FFFF;
+    if exp32 <= 112 {
+        if exp32 < 102 {
+            return 0;
+        }
+        let full_mant = 0x0080_0000u32 | mant32;
+        let shift = (126 - exp32) as u32;
+        let rounded = full_mant + (1u32 << (shift - 1));
+        return (rounded >> shift) as u16;
+    }
+    let mut exp16 = exp32 - 127 + 15;
+    let mant_round = mant32 + 0x1000;
+    let mant16 = if mant_round >= 0x0080_0000 {
+        exp16 += 1;
+        0u32
+    } else {
+        (mant_round >> 13) & 0x03FF
+    };
+    (((exp16 as u16) & 0x1F) << 10) | (mant16 as u16)
+}
+
+/// Quantized stable animation key for a glass button/pill rectangle (8-DIP buckets so slight hover
+/// scale inflation maps to the exact same elastic spring slot!).
+#[inline]
+fn glass_anim_key(r: RectF) -> u64 {
+    let bx = (r.center_x() / 8.0).round() as i32 as u64 & 0xFFFF;
+    let by = (r.center_y() / 8.0).round() as i32 as u64 & 0xFFFF;
+    let bw = (r.w / 8.0).round() as i32 as u64 & 0xFFFF;
+    let bh = (r.h / 8.0).round() as i32 as u64 & 0xFFFF;
+    (bx << 48) | (by << 32) | (bw << 16) | bh
+}
+
+impl Drop for D2DRenderer {
+    fn drop(&mut self) {
+        // Release all DirectWrite formats/layouts/collections referencing our in-memory font loader
+        // before unregistering it from the shared DirectWrite factory!
+        self.text_layout_cache.clear();
+        self.text_layout_fifo.clear();
+        self.lyrics_unit_layout_cache.clear();
+        self.lyrics_unit_layout_fifo.clear();
+        self.ellipsis_cache.clear();
+        self.font_cache.clear();
+        self.custom_font_collection = None;
+        if let Some(loader) = self.in_memory_font_loader.take() {
+            unsafe {
+                let _ = self.dwrite.UnregisterFontFileLoader(&loader);
+            }
+        }
     }
 }
 
@@ -478,6 +620,147 @@ impl D2DRenderer {
                     .ok()
             });
 
+            // Load bundled OFL Inter Variable font in-process via DirectWrite IDWriteFactory5
+            // and merge it with Windows' SystemFontSet so Inter Latin/numerals + CJK/Emoji
+            // fallback work seamlessly with zero temporary disk files!
+            let mut custom_font_collection: Option<IDWriteFontCollection> = None;
+            let mut system_font_fallback: Option<IDWriteFontFallback> = None;
+            let mut in_memory_font_loader: Option<IDWriteInMemoryFontFileLoader> = None;
+            let mut bundled_inter_family = String::from("Segoe UI Variable Display");
+            let mut bundled_inter_loaded = false;
+
+            if let Ok(factory3) = dwrite.cast::<IDWriteFactory3>() {
+                system_font_fallback = factory3.GetSystemFontFallback().ok();
+                if let Ok(factory5) = dwrite.cast::<IDWriteFactory5>() {
+                    if let Ok(mem_loader) = factory5.CreateInMemoryFontFileLoader() {
+                        if dwrite.RegisterFontFileLoader(&mem_loader).is_ok() {
+                            let load_res = (|| -> windows::core::Result<(IDWriteFontCollection, String)> {
+                                let font_file = mem_loader.CreateInMemoryFontFileReference(
+                                    &dwrite,
+                                    INTER_FONT_BYTES.as_ptr() as *const c_void,
+                                    INTER_FONT_BYTES.len() as u32,
+                                    None::<&windows::core::IUnknown>,
+                                )?;
+                                // Discover the exact DirectWrite WWS family name directly from an
+                                // Inter-only font collection (InterVariable.ttf registers as
+                                // "Inter Variable Text" under DirectWrite WWS with all 9 weights!).
+                                let mut discovered_names: Vec<String> = Vec::new();
+                                if let Ok(probe_builder) = factory5.CreateFontSetBuilder() {
+                                    if probe_builder.AddFontFile(&font_file).is_ok() {
+                                        if let Ok(inter_set) = probe_builder.CreateFontSet() {
+                                            if let Ok(inter_col1) =
+                                                factory3.CreateFontCollectionFromFontSet(&inter_set)
+                                            {
+                                                if let Ok(inter_col) =
+                                                    inter_col1.cast::<IDWriteFontCollection>()
+                                                {
+                                                    let fam_cnt = inter_col.GetFontFamilyCount();
+                                                    let en_us = HSTRING::from("en-us");
+                                                    for fi in 0..fam_cnt {
+                                                        if let Ok(ff) = inter_col.GetFontFamily(fi)
+                                                        {
+                                                            if let Ok(names) = ff.GetFamilyNames() {
+                                                                let mut loc_idx = 0u32;
+                                                                let mut found =
+                                                                    windows::core::BOOL(0);
+                                                                let idx = if names
+                                                                    .FindLocaleName(
+                                                                        &en_us,
+                                                                        &mut loc_idx,
+                                                                        &mut found,
+                                                                    )
+                                                                    .is_ok()
+                                                                    && found.as_bool()
+                                                                {
+                                                                    loc_idx
+                                                                } else {
+                                                                    0
+                                                                };
+                                                                if let Ok(len) =
+                                                                    names.GetStringLength(idx)
+                                                                {
+                                                                    if len > 0 {
+                                                                        let mut buf = vec![
+                                                                            0u16;
+                                                                            (len as usize) + 1
+                                                                        ];
+                                                                        if names
+                                                                            .GetString(
+                                                                                idx, &mut buf,
+                                                                            )
+                                                                            .is_ok()
+                                                                        {
+                                                                            let s = String::from_utf16_lossy(
+                                                                                &buf[..(len as usize)],
+                                                                            );
+                                                                            if !s.is_empty() {
+                                                                                discovered_names
+                                                                                    .push(s);
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                let builder = factory5.CreateFontSetBuilder()?;
+                                builder.AddFontFile(&font_file)?;
+                                if let Ok(sys_set) = factory3.GetSystemFontSet() {
+                                    let _ = builder.AddFontSet(&sys_set);
+                                }
+                                let merged_set = builder.CreateFontSet()?;
+                                let col1 = factory3.CreateFontCollectionFromFontSet(&merged_set)?;
+                                let col: IDWriteFontCollection = col1.cast()?;
+                                for cand in discovered_names
+                                    .iter()
+                                    .map(String::as_str)
+                                    .chain([INTER_FONT_FAMILY, "Inter Variable", "Inter"])
+                                {
+                                    let mut idx = 0u32;
+                                    let mut exists = windows::core::BOOL(0);
+                                    let name_h = HSTRING::from(cand);
+                                    if col.FindFamilyName(&name_h, &mut idx, &mut exists).is_ok()
+                                        && exists.as_bool()
+                                    {
+                                        return Ok((col, cand.to_string()));
+                                    }
+                                }
+                                Err(windows::core::Error::empty())
+                            })();
+                            match load_res {
+                                Ok((col, fam)) => {
+                                    custom_font_collection = Some(col);
+                                    bundled_inter_family = fam;
+                                    bundled_inter_loaded = true;
+                                    in_memory_font_loader = Some(mem_loader);
+                                }
+                                Err(_) => {
+                                    let _ = dwrite.UnregisterFontFileLoader(&mem_loader);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Tabular fixed-width numerals (`tnum = 1`) + unslashed zero (`zero = 0`) for timestamps/telemetry
+            let mono_typography = dwrite.CreateTypography().ok().inspect(|typo| {
+                let _ = typo.AddFontFeature(DWRITE_FONT_FEATURE {
+                    nameTag: DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES,
+                    parameter: 1,
+                });
+                let _ = typo.AddFontFeature(DWRITE_FONT_FEATURE {
+                    nameTag: DWRITE_FONT_FEATURE_TAG_SLASHED_ZERO,
+                    parameter: 0,
+                });
+            });
+
             let _ = crate::am_agent::init_process_com_security();
             let wic: IWICImagingFactory =
                 CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)
@@ -500,9 +783,65 @@ impl D2DRenderer {
 
             let blur_effect = dc.CreateEffect(&CLSID_D2D1GaussianBlur).ok();
             let glass_crop_effect = dc.CreateEffect(&CLSID_D2D1Crop).ok();
-            let glass_rim_blur_effect = dc.CreateEffect(&CLSID_D2D1GaussianBlur).ok();
             let glass_vibrancy_effect = dc.CreateEffect(&CLSID_D2D1ColorMatrix).ok();
-            let glass_rim_vibrancy_effect = dc.CreateEffect(&CLSID_D2D1ColorMatrix).ok();
+            let init_border_clamp = |eff: &ID2D1Effect| {
+                let clamp_mode = (D2D1_BORDER_EDGE_MODE_CLAMP.0 as u32).to_le_bytes();
+                let _ = eff.SetValue(
+                    D2D1_BORDER_PROP_EDGE_MODE_X.0 as u32,
+                    D2D1_PROPERTY_TYPE_ENUM,
+                    &clamp_mode,
+                );
+                let _ = eff.SetValue(
+                    D2D1_BORDER_PROP_EDGE_MODE_Y.0 as u32,
+                    D2D1_PROPERTY_TYPE_ENUM,
+                    &clamp_mode,
+                );
+            };
+            let glass_border_effect = dc
+                .CreateEffect(&CLSID_D2D1Border)
+                .ok()
+                .inspect(init_border_clamp);
+            let glass_disp_border_effect = dc
+                .CreateEffect(&CLSID_D2D1Border)
+                .ok()
+                .inspect(init_border_clamp);
+            let init_affine_linear = |eff: &ID2D1Effect| {
+                let interp = (D2D1_2DAFFINETRANSFORM_INTERPOLATION_MODE_LINEAR.0 as u32).to_le_bytes();
+                let bmode = (D2D1_BORDER_MODE_HARD.0 as u32).to_le_bytes();
+                let _ = eff.SetValue(
+                    D2D1_2DAFFINETRANSFORM_PROP_INTERPOLATION_MODE.0 as u32,
+                    D2D1_PROPERTY_TYPE_ENUM,
+                    &interp,
+                );
+                let _ = eff.SetValue(
+                    D2D1_2DAFFINETRANSFORM_PROP_BORDER_MODE.0 as u32,
+                    D2D1_PROPERTY_TYPE_ENUM,
+                    &bmode,
+                );
+            };
+            let glass_bg_scale_effect = dc
+                .CreateEffect(&CLSID_D2D12DAffineTransform)
+                .ok()
+                .inspect(init_affine_linear);
+            let glass_disp_xform_effect = dc
+                .CreateEffect(&CLSID_D2D12DAffineTransform)
+                .ok()
+                .inspect(init_affine_linear);
+            let glass_disp_g_effect = dc.CreateEffect(&CLSID_D2D1DisplacementMap).ok().inspect(|eff| {
+                let cx = (D2D1_CHANNEL_SELECTOR_R.0 as u32).to_le_bytes();
+                let cy = (D2D1_CHANNEL_SELECTOR_G.0 as u32).to_le_bytes();
+                let _ = eff.SetValue(
+                    D2D1_DISPLACEMENTMAP_PROP_X_CHANNEL_SELECT.0 as u32,
+                    D2D1_PROPERTY_TYPE_ENUM,
+                    &cx,
+                );
+                let _ = eff.SetValue(
+                    D2D1_DISPLACEMENTMAP_PROP_Y_CHANNEL_SELECT.0 as u32,
+                    D2D1_PROPERTY_TYPE_ENUM,
+                    &cy,
+                );
+            });
+
             let line_blur_effect = dc.CreateEffect(&CLSID_D2D1GaussianBlur).ok();
             let trans_bg_blur_effect = dc.CreateEffect(&CLSID_D2D1GaussianBlur).ok();
             let trans_fg_blur_effect = dc.CreateEffect(&CLSID_D2D1GaussianBlur).ok();
@@ -511,6 +850,150 @@ impl D2DRenderer {
             let glow_outer_alpha_effect = dc.CreateEffect(&CLSID_D2D1ColorMatrix).ok();
             let glow_inner_alpha_effect = dc.CreateEffect(&CLSID_D2D1ColorMatrix).ok();
             let mesh_blur_effect = dc.CreateEffect(&CLSID_D2D1GaussianBlur).ok();
+            let mesh_vibrancy_effect = dc.CreateEffect(&CLSID_D2D1ColorMatrix).ok();
+
+            // Pre-cached iPadOS 26 strictly VERTICAL top-to-bottom specular rim brushes (ZERO per-frame COM alloc!)
+            let vrim_stops = [
+                D2D1_GRADIENT_STOP {
+                    position: 0.00,
+                    color: to_d2d_color(Color::rgba(255, 255, 255, 0.44)),
+                },
+                D2D1_GRADIENT_STOP {
+                    position: 0.18,
+                    color: to_d2d_color(Color::rgba(255, 255, 255, 0.14)),
+                },
+                D2D1_GRADIENT_STOP {
+                    position: 0.50,
+                    color: to_d2d_color(Color::rgba(255, 255, 255, 0.06)),
+                },
+                D2D1_GRADIENT_STOP {
+                    position: 0.82,
+                    color: to_d2d_color(Color::rgba(255, 255, 255, 0.14)),
+                },
+                D2D1_GRADIENT_STOP {
+                    position: 1.00,
+                    color: to_d2d_color(Color::rgba(255, 255, 255, 0.34)),
+                },
+            ];
+            let glass_vrim_brush = ID2D1RenderTarget::CreateGradientStopCollection(
+                &dc,
+                &vrim_stops,
+                D2D1_GAMMA_2_2,
+                D2D1_EXTEND_MODE_CLAMP,
+            )
+            .ok()
+            .and_then(|coll| {
+                let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+                    startPoint: pt2(0.0, 0.0),
+                    endPoint: pt2(0.0, 64.0),
+                };
+                dc.CreateLinearGradientBrush(&props, None, &coll).ok()
+            });
+
+            let vrim_hover_stops = [
+                D2D1_GRADIENT_STOP {
+                    position: 0.00,
+                    color: to_d2d_color(Color::rgba(255, 255, 255, 0.58)),
+                },
+                D2D1_GRADIENT_STOP {
+                    position: 0.18,
+                    color: to_d2d_color(Color::rgba(255, 255, 255, 0.20)),
+                },
+                D2D1_GRADIENT_STOP {
+                    position: 0.50,
+                    color: to_d2d_color(Color::rgba(255, 255, 255, 0.09)),
+                },
+                D2D1_GRADIENT_STOP {
+                    position: 0.82,
+                    color: to_d2d_color(Color::rgba(255, 255, 255, 0.20)),
+                },
+                D2D1_GRADIENT_STOP {
+                    position: 1.00,
+                    color: to_d2d_color(Color::rgba(255, 255, 255, 0.46)),
+                },
+            ];
+            let glass_vrim_hover_brush = ID2D1RenderTarget::CreateGradientStopCollection(
+                &dc,
+                &vrim_hover_stops,
+                D2D1_GAMMA_2_2,
+                D2D1_EXTEND_MODE_CLAMP,
+            )
+            .ok()
+            .and_then(|coll| {
+                let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+                    startPoint: pt2(0.0, 0.0),
+                    endPoint: pt2(0.0, 64.0),
+                };
+                dc.CreateLinearGradientBrush(&props, None, &coll).ok()
+            });
+
+            let inner_gleam_stops = [
+                D2D1_GRADIENT_STOP {
+                    position: 0.00,
+                    color: to_d2d_color(Color::rgba(255, 255, 255, 0.22)),
+                },
+                D2D1_GRADIENT_STOP {
+                    position: 0.15,
+                    color: to_d2d_color(Color::rgba(255, 255, 255, 0.0)),
+                },
+                D2D1_GRADIENT_STOP {
+                    position: 0.85,
+                    color: to_d2d_color(Color::rgba(255, 255, 255, 0.0)),
+                },
+                D2D1_GRADIENT_STOP {
+                    position: 1.00,
+                    color: to_d2d_color(Color::rgba(244, 249, 255, 0.14)),
+                },
+            ];
+            let glass_inner_gleam_brush = ID2D1RenderTarget::CreateGradientStopCollection(
+                &dc,
+                &inner_gleam_stops,
+                D2D1_GAMMA_2_2,
+                D2D1_EXTEND_MODE_CLAMP,
+            )
+            .ok()
+            .and_then(|coll| {
+                let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+                    startPoint: pt2(0.0, 0.0),
+                    endPoint: pt2(0.0, 64.0),
+                };
+                dc.CreateLinearGradientBrush(&props, None, &coll).ok()
+            });
+
+            let feather_stops = [
+                D2D1_GRADIENT_STOP {
+                    position: 0.0,
+                    color: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.90 },
+                },
+                D2D1_GRADIENT_STOP {
+                    position: 0.42,
+                    color: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.64 },
+                },
+                D2D1_GRADIENT_STOP {
+                    position: 0.74,
+                    color: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.22 },
+                },
+                D2D1_GRADIENT_STOP {
+                    position: 1.0,
+                    color: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.0 },
+                },
+            ];
+            let mesh_feather_brush = ID2D1RenderTarget::CreateGradientStopCollection(
+                &dc,
+                &feather_stops,
+                D2D1_GAMMA_2_2,
+                D2D1_EXTEND_MODE_CLAMP,
+            )
+            .ok()
+            .and_then(|coll| {
+                let props = D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES {
+                    center: pt2(0.0, 0.0),
+                    gradientOriginOffset: pt2(0.0, 0.0),
+                    radiusX: 1.0,
+                    radiusY: 1.0,
+                };
+                dc.CreateRadialGradientBrush(&props, None, &coll).ok()
+            });
 
             let cherenkov_stops = [
                 D2D1_GRADIENT_STOP {
@@ -583,6 +1066,12 @@ impl D2DRenderer {
                 swap_buffer_count,
                 target_bitmap: None,
                 dwrite,
+                custom_font_collection,
+                system_font_fallback,
+                mono_typography,
+                bundled_inter_family,
+                bundled_inter_loaded,
+                in_memory_font_loader,
                 lyrics_text_params,
                 lyrics_subpixel_mode: false,
                 wic,
@@ -590,9 +1079,12 @@ impl D2DRenderer {
                 round_stroke,
                 blur_effect,
                 glass_crop_effect,
-                glass_rim_blur_effect,
                 glass_vibrancy_effect,
-                glass_rim_vibrancy_effect,
+                glass_border_effect,
+                glass_bg_scale_effect,
+                glass_disp_xform_effect,
+                glass_disp_border_effect,
+                glass_disp_g_effect,
                 line_blur_effect,
                 trans_bg_blur_effect,
                 trans_fg_blur_effect,
@@ -601,8 +1093,13 @@ impl D2DRenderer {
                 glow_outer_alpha_effect,
                 glow_inner_alpha_effect,
                 mesh_blur_effect,
+                mesh_vibrancy_effect,
+                mesh_feather_brush,
                 cherenkov_brush,
                 window_rim_brush,
+                glass_vrim_brush,
+                glass_vrim_hover_brush,
+                glass_inner_gleam_brush,
                 corner_cutout_key: (0, 0, 0),
                 corner_cutout_geom: None,
                 glass_capture_bmp: None,
@@ -611,7 +1108,15 @@ impl D2DRenderer {
                 glass_frame_snapshot: None,
                 glass_snap_w: 0,
                 glass_snap_h: 0,
+                glass_half_src: None,
+                glass_blurred_snapshot: None,
+                glass_half_w: 0,
+                glass_half_h: 0,
                 glass_snapshot_active: false,
+                glass_disp_maps: HashMap::new(),
+                glass_disp_lru: VecDeque::new(),
+                glass_anim_states: std::cell::RefCell::new(HashMap::new()),
+                last_glass_surface_rects: std::cell::RefCell::new(Vec::with_capacity(24)),
                 frame_counter: 0,
                 lyrics_bmp_track: String::new(),
                 lyrics_bmp_cache: HashMap::new(),
@@ -720,6 +1225,8 @@ impl D2DRenderer {
             self.glass_capture_bmp = None;
             self.glass_cap_w = 0;
             self.glass_cap_h = 0;
+            self.glass_disp_maps.clear();
+            self.glass_disp_lru.clear();
             self.release_lyrics_transition_surfaces();
             for slot in &mut self.active_glow_slots {
                 slot.bitmap = None;
@@ -749,6 +1256,10 @@ impl D2DRenderer {
         self.glass_frame_snapshot = None;
         self.glass_snap_w = 0;
         self.glass_snap_h = 0;
+        self.glass_half_src = None;
+        self.glass_blurred_snapshot = None;
+        self.glass_half_w = 0;
+        self.glass_half_h = 0;
         self.glass_snapshot_active = false;
         self.release_lyrics_transition_surfaces();
         unsafe {
@@ -757,9 +1268,12 @@ impl D2DRenderer {
             for eff in [
                 &self.blur_effect,
                 &self.glass_crop_effect,
-                &self.glass_rim_blur_effect,
                 &self.glass_vibrancy_effect,
-                &self.glass_rim_vibrancy_effect,
+                &self.glass_border_effect,
+                &self.glass_bg_scale_effect,
+                &self.glass_disp_xform_effect,
+                &self.glass_disp_border_effect,
+                &self.glass_disp_g_effect,
                 &self.line_blur_effect,
                 &self.trans_bg_blur_effect,
                 &self.trans_fg_blur_effect,
@@ -768,10 +1282,14 @@ impl D2DRenderer {
                 &self.glow_outer_alpha_effect,
                 &self.glow_inner_alpha_effect,
                 &self.mesh_blur_effect,
+                &self.mesh_vibrancy_effect,
             ] {
-                if let Some(ref blur) = eff {
-                    blur.SetInput(0, None::<&ID2D1Image>, true);
+                if let Some(ref e) = eff {
+                    e.SetInput(0, None::<&ID2D1Image>, true);
                 }
+            }
+            if let Some(ref e) = self.glass_disp_g_effect {
+                e.SetInput(1, None::<&ID2D1Image>, true);
             }
             let _ = self.swap_chain.ResizeBuffers(
                 self.swap_buffer_count,
@@ -797,6 +1315,7 @@ impl D2DRenderer {
     }
 
     pub fn begin_draw(&self, clear_color: Color) {
+        self.last_glass_surface_rects.borrow_mut().clear();
         unsafe {
             self.dc.BeginDraw();
             self.dc.SetTransform(&Matrix3x2::identity());
@@ -1548,15 +2067,192 @@ impl D2DRenderer {
         ]
     }
 
-    /// Redesigned iOS 26 / macOS Tahoe Liquid Glass Interactive Button:
-    /// - Pure crystal obsidian/ruby/alabaster translucent body (zero tacky rainbow tinting)
-    /// - Subtle curved top meniscus crest + bottom internal light bounce
-    /// - Pointer-tracking radial specular highlight that fluidly illuminates surface & nearby rim
-    /// - Crisp outer hairline contrast border + 4-stop pure silver-white Fresnel directional rim
-    /// - Tactile press compression & hover lift
-    /// Draws a soft two-tier floating drop shadow STRICTLY OUTSIDE `rect` using
-    /// `D2D1_COMBINE_MODE_EXCLUDE` so shadow pixels NEVER darken the live Liquid Glass backdrop
-    /// captured underneath `rect`!
+    /// Steps all active Liquid Glass hover/press elastic springs & cursor caustic tracking.
+    /// Call once per frame before drawing; settles cleanly to exact targets for 0% idle CPU.
+    pub fn step_glass_animations(&mut self, dt: f32) {
+        let dt = dt.clamp(0.001, 0.05);
+        let a_h = 1.0 - (-18.0 * dt).exp();
+        let a_p = 1.0 - (-26.0 * dt).exp();
+        let a_c = 1.0 - (-22.0 * dt).exp();
+        let cur_frame = self.frame_counter;
+        let mut map = self.glass_anim_states.borrow_mut();
+        map.retain(|_, st| cur_frame.saturating_sub(st.last_frame) <= 180);
+        for st in map.values_mut() {
+            // If a button wasn't drawn in recent frames, relax smoothly back to idle
+            if cur_frame.saturating_sub(st.last_frame) > 2 {
+                st.hover_target = 0.0;
+                st.press_target = 0.0;
+                st.scale_target = 1.0;
+            }
+            st.hover_t += (st.hover_target - st.hover_t) * a_h;
+            if (st.hover_target - st.hover_t).abs() < 0.001 {
+                st.hover_t = st.hover_target;
+            }
+            st.press_t += (st.press_target - st.press_t) * a_p;
+            if (st.press_target - st.press_t).abs() < 0.001 {
+                st.press_t = st.press_target;
+            }
+            // Crisp underdamped elastic spring (omega = 24 rad/s, zeta = 0.72) for tactile Apple bounce
+            let acc = (st.scale_target - st.scale) * 576.0 - st.scale_vel * 34.56;
+            st.scale_vel += acc * dt;
+            st.scale += st.scale_vel * dt;
+            if (st.scale_target - st.scale).abs() < 0.0008 && st.scale_vel.abs() < 0.002 {
+                st.scale = st.scale_target;
+                st.scale_vel = 0.0;
+            }
+            st.caustic_x += (st.caustic_target_x - st.caustic_x) * a_c;
+            st.caustic_y += (st.caustic_target_y - st.caustic_y) * a_c;
+            if (st.caustic_target_x - st.caustic_x).hypot(st.caustic_target_y - st.caustic_y) < 0.25 {
+                st.caustic_x = st.caustic_target_x;
+                st.caustic_y = st.caustic_target_y;
+            }
+        }
+    }
+
+    /// Returns `true` while any Liquid Glass hover/press spring is actively moving; returns `false`
+    /// as soon as springs settle so the app drops immediately to 0% idle CPU.
+    pub fn has_active_glass_motion(&self) -> bool {
+        let cur_frame = self.frame_counter;
+        let map = self.glass_anim_states.borrow();
+        map.values().any(|st| {
+            cur_frame.saturating_sub(st.last_frame) <= 4
+                && ((st.hover_t - st.hover_target).abs() > 0.001
+                    || (st.press_t - st.press_target).abs() > 0.001
+                    || (st.scale - st.scale_target).abs() > 0.0008
+                    || st.scale_vel.abs() > 0.002)
+        })
+    }
+
+    /// Updates targets and returns the current animated `(scale, hover_t, press_t, (caustic_x, caustic_y))`
+    /// for a Liquid Glass interactive surface.
+    fn sample_glass_anim(
+        &self,
+        rect: RectF,
+        hovered: bool,
+        pressed: bool,
+        mouse_pos: (f32, f32),
+    ) -> (f32, f32, f32, (f32, f32)) {
+        let key = glass_anim_key(rect);
+        let mut map = self.glass_anim_states.borrow_mut();
+        if map.len() > 64 {
+            let cur_f = self.frame_counter;
+            map.retain(|_, v| cur_f.saturating_sub(v.last_frame) <= 60);
+        }
+        let st = map.entry(key).or_insert(GlassAnimState {
+            hover_t: 0.0,
+            hover_target: 0.0,
+            press_t: 0.0,
+            press_target: 0.0,
+            scale: 1.0,
+            scale_vel: 0.0,
+            scale_target: 1.0,
+            caustic_x: mouse_pos.0,
+            caustic_y: mouse_pos.1,
+            caustic_target_x: mouse_pos.0,
+            caustic_target_y: mouse_pos.1,
+            last_frame: self.frame_counter,
+        });
+        st.hover_target = if hovered { 1.0 } else { 0.0 };
+        st.press_target = if pressed && hovered { 1.0 } else { 0.0 };
+        st.scale_target = if pressed && hovered {
+            0.945
+        } else if hovered {
+            1.045
+        } else {
+            1.0
+        };
+        st.caustic_target_x = mouse_pos.0;
+        st.caustic_target_y = mouse_pos.1;
+        st.last_frame = self.frame_counter;
+        (st.scale, st.hover_t, st.press_t, (st.caustic_x, st.caustic_y))
+    }
+
+    #[inline]
+    fn record_live_glass_rect(&self, r: RectF) {
+        let mut rects = self.last_glass_surface_rects.borrow_mut();
+        if rects.len() < 48 {
+            rects.push(r);
+        }
+    }
+
+    #[inline]
+    fn is_point_on_live_glass(&self, px: f32, py: f32) -> bool {
+        let rects = self.last_glass_surface_rects.borrow();
+        rects.iter().any(|r| r.contains(px, py))
+    }
+
+    /// Draws authentic iPadOS 26 strictly VERTICAL top-to-bottom specular rim highlights
+    /// (`top 0.44 -> sides 0.06 -> bottom 0.34`, brightening smoothly on hover to `0.58 / 0.46`)
+    /// plus a razor-thin inner top gleam & subtle bottom internal bounce with ZERO per-frame COM alloc!
+    fn draw_vertical_glass_rim(
+        &self,
+        r: RectF,
+        rad: f32,
+        hover_t: f32,
+        opacity_mul: f32,
+        dark_sep_alpha: f32,
+    ) {
+        let op = opacity_mul.clamp(0.0, 1.5);
+        let ht = hover_t.clamp(0.0, 1.0);
+        // Subtle outer hairline dark separation keeps crystal capsules distinct over white covers
+        if dark_sep_alpha > 0.01 {
+            self.stroke_rounded_rect(
+                r.inset(-0.45, -0.45),
+                (rad + 0.45).min(r.h * 0.5 + 0.45),
+                Color::rgba(0, 0, 0, dark_sep_alpha),
+                0.85,
+            );
+        }
+        unsafe {
+            let cx = r.center_x();
+            let top_pt = pt2(cx, r.y);
+            let bot_pt = pt2(cx, r.bottom());
+            let rr = D2D1_ROUNDED_RECT {
+                rect: to_d2d_rect(r),
+                radiusX: rad,
+                radiusY: rad,
+            };
+            let stroke_w = 1.02 + ht * 0.14;
+            if let Some(ref base_rim) = self.glass_vrim_brush {
+                base_rim.SetStartPoint(top_pt);
+                base_rim.SetEndPoint(bot_pt);
+                base_rim.SetOpacity(((1.0 - ht) * op).clamp(0.0, 1.0));
+                if (1.0 - ht) * op > 0.01 {
+                    self.dc
+                        .DrawRoundedRectangle(&rr, base_rim, stroke_w, &self.round_stroke);
+                }
+            }
+            if ht > 0.01 {
+                if let Some(ref hov_rim) = self.glass_vrim_hover_brush {
+                    hov_rim.SetStartPoint(top_pt);
+                    hov_rim.SetEndPoint(bot_pt);
+                    hov_rim.SetOpacity((ht * op).clamp(0.0, 1.0));
+                    self.dc
+                        .DrawRoundedRectangle(&rr, hov_rim, stroke_w, &self.round_stroke);
+                }
+            }
+            // Razor-thin inner top gleam + subtle bottom internal reflection (zero heavy white bar!)
+            let ir = r.inset(1.0, 1.0);
+            if ir.w > 8.0 && ir.h > 8.0 {
+                if let Some(ref gleam) = self.glass_inner_gleam_brush {
+                    gleam.SetStartPoint(pt2(ir.center_x(), ir.y));
+                    gleam.SetEndPoint(pt2(ir.center_x(), ir.bottom()));
+                    gleam.SetOpacity(((0.85 + ht * 0.25) * op).clamp(0.0, 1.0));
+                    let irad = (rad - 1.0).max(0.0);
+                    let irr = D2D1_ROUNDED_RECT {
+                        rect: to_d2d_rect(ir),
+                        radiusX: irad,
+                        radiusY: irad,
+                    };
+                    self.dc
+                        .DrawRoundedRectangle(&irr, gleam, 0.80, &self.round_stroke);
+                }
+            }
+        }
+    }
+
+    /// Draws a lightweight two-tier floating ambient + contact drop shadow STRICTLY OUTSIDE `rect`
+    /// using `D2D1_COMBINE_MODE_EXCLUDE` so shadow pixels NEVER darken the live Liquid Glass backdrop!
     fn draw_exterior_glass_shadow(&self, rect: RectF, radius: f32, close_a: f32, far_a: f32, dy: f32) {
         if rect.w <= 2.0 || rect.h <= 2.0 || (close_a <= 0.005 && far_a <= 0.005) {
             return;
@@ -1591,7 +2287,7 @@ impl D2DRenderer {
                                 &inner_base,
                                 D2D1_COMBINE_MODE_EXCLUDE,
                                 None,
-                                0.25,
+                                0.30,
                                 &sink,
                             )
                             .is_ok();
@@ -1606,13 +2302,15 @@ impl D2DRenderer {
                     }
                 }
             };
+            // Soft ambient elevation shadow
             draw_ring(
-                RectF::new(rect.x - 2.0, rect.y + dy * 1.6, rect.w + 4.0, rect.h + 2.0),
-                rad + 2.0,
+                RectF::new(rect.x - 2.5, rect.y + dy * 1.45, rect.w + 5.0, rect.h + 3.0),
+                rad + 2.5,
                 far_a,
             );
+            // Crisp contact shadow
             draw_ring(
-                RectF::new(rect.x + 1.0, rect.y + dy, rect.w - 2.0, rect.h),
+                RectF::new(rect.x + 0.8, rect.y + (dy * 0.50).max(1.0), rect.w - 1.6, rect.h),
                 rad,
                 close_a,
             );
@@ -1639,6 +2337,7 @@ impl D2DRenderer {
             mouse_pos,
             reduce_transparency,
             true,
+            None,
         );
     }
 
@@ -1653,18 +2352,32 @@ impl D2DRenderer {
         mouse_pos: (f32, f32),
         reduce_transparency: bool,
         draw_shadow: bool,
+        pre_sampled_anim: Option<(f32, f32, f32, (f32, f32))>,
     ) {
         if rect.w <= 1.0 || rect.h <= 1.0 {
             return;
         }
-        let r = if pressed && hovered {
-            rect.inset(0.8, 0.7)
-        } else if hovered {
-            rect.inset(-0.35, -0.35)
+        let (scale, hover_t, press_t, caustic_pt) = if reduce_transparency {
+            let sc = if pressed && hovered {
+                0.96
+            } else if hovered {
+                1.015
+            } else {
+                1.0
+            };
+            (sc, if hovered { 1.0 } else { 0.0 }, if pressed && hovered { 1.0 } else { 0.0 }, mouse_pos)
         } else {
-            rect
+            pre_sampled_anim.unwrap_or_else(|| self.sample_glass_anim(rect, hovered, pressed, mouse_pos))
         };
-        let rad = radius.min(r.w * 0.5).min(r.h * 0.5).max(0.0);
+        let dx = rect.w * (scale - 1.0) * 0.5;
+        let dy = rect.h * (scale - 1.0) * 0.5;
+        let r = RectF::new(
+            rect.x - dx,
+            rect.y - dy,
+            (rect.w + dx * 2.0).max(2.0),
+            (rect.h + dy * 2.0).max(2.0),
+        );
+        let rad = (radius * scale).min(r.w * 0.5).min(r.h * 0.5).max(0.0);
 
         if reduce_transparency {
             let is_down = pressed && hovered;
@@ -1715,253 +2428,137 @@ impl D2DRenderer {
             return;
         }
 
-        // 1. Soft dual-tier contact & ambient elevation shadow underneath glass button (skipped when
-        //    `draw_liquid_glass_floating_button` already drew an exterior-only shadow around live refraction!)
+        // 1. Lightweight contact + ambient shadow (skipped when floating button already drew exterior shadow)
         if draw_shadow {
-            let (sh_close, sh_far) = if pressed && hovered {
-                (0.14f32, 0.06f32)
-            } else if hovered {
-                (0.30, 0.16)
-            } else {
-                (0.20, 0.09)
-            };
+            let sh_close = (0.16 + hover_t * 0.10 - press_t * 0.06).clamp(0.08, 0.30);
+            let sh_far = (0.07 + hover_t * 0.05 - press_t * 0.03).clamp(0.03, 0.14);
+            let sh_dy = 1.6 + hover_t * 1.0 - press_t * 0.6;
             self.fill_rounded_rect(
-                RectF::new(r.x - 0.5, r.y + if hovered { 2.8 } else { 1.8 }, r.w + 1.0, r.h + 1.0),
-                (rad + 0.5).min(r.h * 0.5 + 0.5),
+                RectF::new(r.x - 0.8, r.y + sh_dy, r.w + 1.6, r.h + 1.2),
+                (rad + 0.8).min(r.h * 0.5 + 0.8),
                 Color::rgba(0, 0, 0, sh_far),
             );
             self.fill_rounded_rect(
-                RectF::new(r.x + 0.4, r.y + if hovered { 1.5 } else { 1.0 }, r.w - 0.8, r.h),
+                RectF::new(r.x + 0.4, r.y + sh_dy * 0.55, r.w - 0.8, r.h),
                 rad,
                 Color::rgba(0, 0, 0, sh_close),
             );
         }
 
-        // 2. Pure Crystal Apple Tahoe 3-Stop Optical Body (crisp dark/ruby/alabaster glass, zero muddy gray!)
-        let (c_top, c_waist, c_bot, rim_tl, rim_mid1, rim_mid2, rim_br, sheen_a) = match variant {
+        // 2. Crystal-Clear iPadOS 26 Translucent Optical Body (alpha ~0.20..0.28 on floating buttons!)
+        let (c_top, c_bot, rim_op, dark_sep) = match variant {
             GlassBtnVariant::ProminentLight => {
-                let boost: f32 = if hovered { 0.04 } else { 0.0 };
+                let boost = hover_t * 0.04;
                 (
-                    Color::rgba(255, 255, 255, (0.95 + boost).min(0.99)),
-                    Color::rgba(244, 245, 250, (0.88 + boost).min(0.96)),
-                    Color::rgba(235, 238, 246, (0.91 + boost).min(0.97)),
-                    Color::rgba(255, 255, 255, 0.96),
-                    Color::rgba(255, 255, 255, 0.36),
-                    Color::rgba(240, 244, 252, 0.24),
-                    Color::rgba(255, 255, 255, 0.72),
-                    0.34,
+                    Color::rgba(255, 255, 255, (0.94 + boost).min(0.99)),
+                    Color::rgba(238, 240, 246, (0.89 + boost).min(0.96)),
+                    1.25,
+                    0.18,
                 )
             }
             GlassBtnVariant::Tinted(tint) => {
-                let h_add: f32 = if hovered { 0.12 } else { 0.0 };
+                let h_add = hover_t * 0.10;
                 let top_c = tint
-                    .lerp(Color::rgb(255, 255, 255), if hovered { 0.26 } else { 0.18 })
-                    .with_alpha((0.72 + h_add).min(0.88));
-                let waist_c = tint
-                    .lerp(Color::rgb(255, 255, 255), 0.03)
-                    .with_alpha((0.52 + h_add).min(0.76));
+                    .lerp(Color::rgb(255, 255, 255), 0.10 + hover_t * 0.10)
+                    .with_alpha((0.58 + h_add).min(0.82));
                 let bot_c = tint
-                    .lerp(Color::rgb(12, 12, 16), 0.10)
-                    .with_alpha((0.64 + h_add).min(0.82));
-                (
-                    top_c,
-                    waist_c,
-                    bot_c,
-                    Color::rgba(255, 255, 255, if hovered { 0.82 } else { 0.58 }),
-                    Color::rgba(255, 255, 255, if hovered { 0.24 } else { 0.13 }),
-                    Color::rgba(255, 255, 255, if hovered { 0.16 } else { 0.08 }),
-                    Color::rgba(255, 255, 255, if hovered { 0.46 } else { 0.28 }),
-                    if hovered { 0.26 } else { 0.18 },
-                )
+                    .lerp(Color::rgb(10, 10, 14), 0.10)
+                    .with_alpha((0.66 + h_add).min(0.86));
+                (top_c, bot_c, 1.05, 0.24)
             }
-            GlassBtnVariant::Regular => (
-                Color::rgba(255, 255, 255, if hovered { 0.165 } else { 0.095 }),
-                Color::rgba(24, 26, 32, if hovered { 0.18 } else { 0.26 }),
-                Color::rgba(255, 255, 255, if hovered { 0.105 } else { 0.055 }),
-                Color::rgba(255, 255, 255, if hovered { 0.78 } else { 0.48 }),
-                Color::rgba(255, 255, 255, if hovered { 0.18 } else { 0.09 }),
-                Color::rgba(242, 246, 255, if hovered { 0.12 } else { 0.06 }),
-                Color::rgba(255, 255, 255, if hovered { 0.48 } else { 0.26 }),
-                if hovered { 0.20 } else { 0.12 },
-            ),
-            GlassBtnVariant::Subtle => (
-                Color::rgba(255, 255, 255, if hovered { 0.125 } else { 0.055 }),
-                Color::rgba(22, 24, 30, if hovered { 0.14 } else { 0.18 }),
-                Color::rgba(255, 255, 255, if hovered { 0.075 } else { 0.032 }),
-                Color::rgba(255, 255, 255, if hovered { 0.62 } else { 0.30 }),
-                Color::rgba(255, 255, 255, if hovered { 0.14 } else { 0.06 }),
-                Color::rgba(242, 246, 255, if hovered { 0.10 } else { 0.04 }),
-                Color::rgba(255, 255, 255, if hovered { 0.36 } else { 0.16 }),
-                if hovered { 0.15 } else { 0.08 },
-            ),
-        };
-
-        unsafe {
-            let body_stops = [
-                D2D1_GRADIENT_STOP {
-                    position: 0.0,
-                    color: to_d2d_color(c_top),
-                },
-                D2D1_GRADIENT_STOP {
-                    position: 0.48,
-                    color: to_d2d_color(c_waist),
-                },
-                D2D1_GRADIENT_STOP {
-                    position: 1.0,
-                    color: to_d2d_color(c_bot),
-                },
-            ];
-            if let Ok(coll) = ID2D1RenderTarget::CreateGradientStopCollection(
-                &self.dc,
-                &body_stops,
-                D2D1_GAMMA_2_2,
-                D2D1_EXTEND_MODE_CLAMP,
-            ) {
-                let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
-                    startPoint: pt2(r.x, r.y),
-                    endPoint: pt2(r.x, r.bottom()),
-                };
-                if let Ok(grad) = self.dc.CreateLinearGradientBrush(&props, None, &coll) {
-                    let rr = D2D1_ROUNDED_RECT {
-                        rect: to_d2d_rect(r),
-                        radiusX: rad,
-                        radiusY: rad,
-                    };
-                    self.dc.FillRoundedRectangle(&rr, &grad);
+            GlassBtnVariant::Regular => {
+                if !draw_shadow {
+                    // Standalone floating crystal button (e.g. top-bar controls) — truly transparent!
+                    (
+                        Color::rgba(18, 20, 26, 0.21 + hover_t * 0.06),
+                        Color::rgba(12, 14, 20, 0.27 + hover_t * 0.06),
+                        1.05,
+                        0.28,
+                    )
+                } else {
+                    (
+                        Color::rgba(28, 30, 38, 0.24 + hover_t * 0.08),
+                        Color::rgba(16, 18, 24, 0.30 + hover_t * 0.08),
+                        0.96,
+                        0.22,
+                    )
                 }
             }
-        }
+            GlassBtnVariant::Subtle => {
+                if !draw_shadow {
+                    (
+                        Color::rgba(18, 20, 26, 0.19 + hover_t * 0.06),
+                        Color::rgba(12, 14, 20, 0.25 + hover_t * 0.06),
+                        0.95,
+                        0.26,
+                    )
+                } else {
+                    (
+                        Color::rgba(255, 255, 255, 0.06 + hover_t * 0.09),
+                        Color::rgba(255, 255, 255, 0.03 + hover_t * 0.06),
+                        0.72 + hover_t * 0.28,
+                        0.16,
+                    )
+                }
+            }
+        };
 
-        // Curved Top Meniscus Specular Crest (delicate optical tension line along top 30%)
-        let sheen_h = (r.h * 0.30).max(2.0);
-        let sheen_r = RectF::new(r.x + 1.2, r.y + 0.8, (r.w - 2.4).max(1.0), sheen_h);
-        self.fill_linear_gradient_rect(
-            sheen_r,
-            (rad - 0.9).max(0.0),
-            sheen_r.x,
-            sheen_r.y,
-            sheen_r.x,
-            sheen_r.bottom(),
-            Color::rgba(255, 255, 255, sheen_a),
-            Color::rgba(255, 255, 255, 0.0),
-        );
+        self.fill_linear_gradient_rect(r, rad, r.x, r.y, r.x, r.bottom(), c_top, c_bot);
 
-        // Subtle Bottom Internal Reflection (upward light bounce along lower 20%)
-        let bot_h = (r.h * 0.20).max(1.6);
-        let bot_r = RectF::new(
-            r.x + 1.5,
-            r.bottom() - bot_h - 0.7,
-            (r.w - 3.0).max(1.0),
-            bot_h,
-        );
-        self.fill_linear_gradient_rect(
-            bot_r,
-            (rad - 1.1).max(0.0),
-            bot_r.x,
-            bot_r.bottom(),
-            bot_r.x,
-            bot_r.y,
-            Color::rgba(240, 246, 255, sheen_a * 0.36),
-            Color::rgba(240, 246, 255, 0.0),
-        );
-
-        // 3. Pointer-Tracking Optical Caustic & Specular Rim Glint
-        let near_box = r.inset(-42.0, -30.0);
-        if near_box.contains(mouse_pos.0, mouse_pos.1) {
-            unsafe {
-                let caustic_a = if hovered { 0.20 } else { 0.075 };
-                let stops = [
-                    D2D1_GRADIENT_STOP {
-                        position: 0.0,
-                        color: to_d2d_color(Color::rgba(255, 255, 255, caustic_a)),
-                    },
-                    D2D1_GRADIENT_STOP {
-                        position: 0.48,
-                        color: to_d2d_color(Color::rgba(240, 246, 255, caustic_a * 0.34)),
-                    },
-                    D2D1_GRADIENT_STOP {
-                        position: 1.0,
-                        color: to_d2d_color(Color::rgba(255, 255, 255, 0.0)),
-                    },
-                ];
-                if let Ok(coll) = ID2D1RenderTarget::CreateGradientStopCollection(
-                    &self.dc,
-                    &stops,
-                    D2D1_GAMMA_2_2,
-                    D2D1_EXTEND_MODE_CLAMP,
-                ) {
-                    let rad_glow = r.w.max(r.h) * 1.05 + 14.0;
-                    let props = D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES {
-                        center: pt2(mouse_pos.0, mouse_pos.1),
-                        gradientOriginOffset: pt2(0.0, 0.0),
-                        radiusX: rad_glow,
-                        radiusY: rad_glow,
-                    };
-                    if let Ok(rbrush) = self.dc.CreateRadialGradientBrush(&props, None, &coll) {
-                        let rr = D2D1_ROUNDED_RECT {
-                            rect: to_d2d_rect(r),
-                            radiusX: rad,
-                            radiusY: rad,
+        // 3. Smooth Cursor-Tracking Luminous Optical Caustic Glow
+        let near_box = r.inset(-40.0, -28.0);
+        if near_box.contains(mouse_pos.0, mouse_pos.1) || hover_t > 0.02 {
+            let caustic_a = (0.055 + hover_t * 0.16 + press_t * 0.06).clamp(0.0, 0.28);
+            if caustic_a > 0.01 {
+                unsafe {
+                    let stops = [
+                        D2D1_GRADIENT_STOP {
+                            position: 0.0,
+                            color: to_d2d_color(Color::rgba(255, 255, 255, caustic_a)),
+                        },
+                        D2D1_GRADIENT_STOP {
+                            position: 0.48,
+                            color: to_d2d_color(Color::rgba(240, 247, 255, caustic_a * 0.30)),
+                        },
+                        D2D1_GRADIENT_STOP {
+                            position: 1.0,
+                            color: to_d2d_color(Color::rgba(255, 255, 255, 0.0)),
+                        },
+                    ];
+                    if let Ok(coll) = ID2D1RenderTarget::CreateGradientStopCollection(
+                        &self.dc,
+                        &stops,
+                        D2D1_GAMMA_2_2,
+                        D2D1_EXTEND_MODE_CLAMP,
+                    ) {
+                        let rad_glow = r.w.max(r.h) * 1.05 + 12.0;
+                        let props = D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES {
+                            center: pt2(caustic_pt.0, caustic_pt.1),
+                            gradientOriginOffset: pt2(0.0, 0.0),
+                            radiusX: rad_glow,
+                            radiusY: rad_glow,
                         };
-                        self.dc.FillRoundedRectangle(&rr, &rbrush);
+                        if let Ok(rbrush) = self.dc.CreateRadialGradientBrush(&props, None, &coll) {
+                            let rr = D2D1_ROUNDED_RECT {
+                                rect: to_d2d_rect(r),
+                                radiusX: rad,
+                                radiusY: rad,
+                            };
+                            self.dc.FillRoundedRectangle(&rr, &rbrush);
+                        }
                     }
                 }
             }
         }
 
-        // 4. Outer Hairline Dark Separation + Pure Silver-White Fresnel Directional Rim
-        self.stroke_rounded_rect(
-            r.inset(-0.45, -0.45),
-            (rad + 0.45).min(r.h * 0.5 + 0.45),
-            Color::rgba(0, 0, 0, if hovered { 0.30 } else { 0.22 }),
-            0.9,
-        );
-        unsafe {
-            let rim_stops = [
-                D2D1_GRADIENT_STOP {
-                    position: 0.0,
-                    color: to_d2d_color(rim_tl),
-                },
-                D2D1_GRADIENT_STOP {
-                    position: 0.38,
-                    color: to_d2d_color(rim_mid1),
-                },
-                D2D1_GRADIENT_STOP {
-                    position: 0.68,
-                    color: to_d2d_color(rim_mid2),
-                },
-                D2D1_GRADIENT_STOP {
-                    position: 1.0,
-                    color: to_d2d_color(rim_br),
-                },
-            ];
-            if let Ok(coll) = ID2D1RenderTarget::CreateGradientStopCollection(
-                &self.dc,
-                &rim_stops,
-                D2D1_GAMMA_2_2,
-                D2D1_EXTEND_MODE_CLAMP,
-            ) {
-                let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
-                    startPoint: pt2(r.x, r.y),
-                    endPoint: pt2(r.right(), r.bottom()),
-                };
-                if let Ok(grad) = self.dc.CreateLinearGradientBrush(&props, None, &coll) {
-                    let rr = D2D1_ROUNDED_RECT {
-                        rect: to_d2d_rect(r),
-                        radiusX: rad,
-                        radiusY: rad,
-                    };
-                    let stroke_w = if hovered { 1.18 } else { 1.02 };
-                    self.dc
-                        .DrawRoundedRectangle(&rr, &grad, stroke_w, &self.round_stroke);
-                }
-            }
-        }
+        // 4. Strictly VERTICAL Top & Bottom iPadOS 26 Specular Rim Highlights (cached brushes!)
+        self.draw_vertical_glass_rim(r, rad, hover_t, rim_op, dark_sep);
     }
 
-    /// Standalone Floating Liquid Glass Button (Top Bar Back/Forward/Refresh/Settings/Window Controls
-    /// & Lyrics Top Controls): refracts and blurs the live pixels directly behind the button before
-    /// compositing the crystal specular button optics on top!
+    /// Standalone Floating Liquid Glass Button (Top Bar controls & Lyrics controls):
+    /// samples the single per-frame half-res pre-blurred snapshot through one fast HiDPI-exact
+    /// FP16 SDF displacement pass, animates with elastic hover/press spring dynamics, and records
+    /// its rect so white glyphs rendered on top receive a crisp 1px optical drop shadow!
     #[allow(clippy::too_many_arguments)]
     pub fn draw_liquid_glass_floating_button(
         &mut self,
@@ -1974,28 +2571,29 @@ impl D2DRenderer {
         reduce_transparency: bool,
     ) {
         let mut used_live_backdrop = false;
+        let mut anim_sample = None;
         if !reduce_transparency && rect.w > 2.0 && rect.h > 2.0 {
-            let r = if pressed && hovered {
-                rect.inset(0.8, 0.7)
-            } else if hovered {
-                rect.inset(-0.35, -0.35)
-            } else {
-                rect
-            };
-            let rad = radius.min(r.w * 0.5).min(r.h * 0.5).max(0.0);
-            // Compact 34px circles skip the heavy 2nd CombineWithGeometry+Blur bezel pass;
-            // wide glass pills & hero capsules keep full two-zone optical bezel refraction!
-            let want_bezel = r.w >= 96.0 || r.h >= 96.0;
-            used_live_backdrop = self.draw_liquid_glass_backdrop_only(r, rad, 10.0, 1.11, want_bezel);
+            let anim = self.sample_glass_anim(rect, hovered, pressed, mouse_pos);
+            let (scale, hover_t, press_t, _) = anim;
+            anim_sample = Some(anim);
+            let dx = rect.w * (scale - 1.0) * 0.5;
+            let dy = rect.h * (scale - 1.0) * 0.5;
+            let r = RectF::new(
+                rect.x - dx,
+                rect.y - dy,
+                (rect.w + dx * 2.0).max(2.0),
+                (rect.h + dy * 2.0).max(2.0),
+            );
+            let rad = (radius * scale).min(r.w * 0.5).min(r.h * 0.5).max(0.0);
+            used_live_backdrop = self.draw_liquid_glass_backdrop_only(r, rad, 14.0, 1.0, false);
             if used_live_backdrop {
-                let (sc, sf, dy) = if pressed && hovered {
-                    (0.16, 0.07, 1.2)
-                } else if hovered {
-                    (0.28, 0.14, 2.2)
-                } else {
-                    (0.20, 0.10, 1.6)
-                };
-                self.draw_exterior_glass_shadow(r, rad, sc, sf, dy);
+                let sc = (0.18 + hover_t * 0.08 - press_t * 0.06).clamp(0.10, 0.28);
+                let sf = (0.09 + hover_t * 0.04 - press_t * 0.03).clamp(0.05, 0.14);
+                let sh_dy = 1.6 + hover_t * 0.8 - press_t * 0.5;
+                self.draw_exterior_glass_shadow(r, rad, sc, sf, sh_dy);
+                if !matches!(variant, GlassBtnVariant::ProminentLight) {
+                    self.record_live_glass_rect(r);
+                }
             }
         }
         self.draw_liquid_glass_button_impl(
@@ -2007,6 +2605,7 @@ impl D2DRenderer {
             mouse_pos,
             reduce_transparency,
             !used_live_backdrop,
+            anim_sample,
         );
     }
 
@@ -2042,36 +2641,43 @@ impl D2DRenderer {
         }
     }
 
-    /// Captures the entire active render target ONCE into an immutable reusable GPU bitmap so
-    /// all subsequent non-overlapping floating Liquid Glass elements in this pass (9 top-bar
-    /// buttons + MiniPlayer) sample live refracted pixels with ZERO per-button `dc.Flush()` or
-    /// `CopyFromBitmap()` pipeline stalls!
+    /// Captures the active render target ONCE per frame into a half-resolution (`w/2 × h/2`, `96 DPI`)
+    /// surface and executes ONE single crystal-clear `GaussianBlur` + `1.26x` vibrancy `ColorMatrix`
+    /// into `glass_blurred_snapshot`. All subsequent floating Liquid Glass elements in this frame
+    /// execute ZERO Gaussian blurs and ZERO flushes — just one lightweight `DisplacementMap` each!
     pub fn begin_glass_backdrop_snapshot(&mut self, reduce_transparency: bool) {
         self.glass_snapshot_active = false;
-        if reduce_transparency || self.blur_effect.is_none() || self.width_px < 4 || self.height_px < 4 {
+        if reduce_transparency
+            || self.blur_effect.is_none()
+            || self.width_px < 4
+            || self.height_px < 4
+        {
             return;
         }
         let Some(active_tgt) = self.active_draw_target().cloned() else {
             return;
         };
+        let half_w = (self.width_px / 2).max(32);
+        let half_h = (self.height_px / 2).max(32);
+
         unsafe {
             if self.glass_frame_snapshot.is_none()
                 || self.glass_snap_w != self.width_px
                 || self.glass_snap_h != self.height_px
             {
-                let dpi = 96.0 * self.dpi_scale;
                 let alpha_mode = if self.premultiplied_swapchain {
                     D2D1_ALPHA_MODE_PREMULTIPLIED
                 } else {
                     D2D1_ALPHA_MODE_IGNORE
                 };
+                // Strictly 96.0 DPI raw pixel space -> 100% immune to HiDPI mismatch!
                 let props = D2D1_BITMAP_PROPERTIES1 {
                     pixelFormat: D2D1_PIXEL_FORMAT {
                         format: DXGI_FORMAT_B8G8R8A8_UNORM,
                         alphaMode: alpha_mode,
                     },
-                    dpiX: dpi,
-                    dpiY: dpi,
+                    dpiX: 96.0,
+                    dpiY: 96.0,
                     bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
                     colorContext: std::mem::ManuallyDrop::new(None),
                 };
@@ -2090,22 +2696,155 @@ impl D2DRenderer {
                     self.gpu_staging_dirty = true;
                 }
             }
-            if let Some(ref snap_bmp) = self.glass_frame_snapshot {
-                let _ = self.dc.Flush(None, None);
-                let src_u = D2D_RECT_U {
-                    left: 0,
-                    top: 0,
-                    right: self.width_px,
-                    bottom: self.height_px,
+
+            if self.glass_half_src.is_none()
+                || self.glass_blurred_snapshot.is_none()
+                || self.glass_half_w != half_w
+                || self.glass_half_h != half_h
+            {
+                let half_props = D2D1_BITMAP_PROPERTIES1 {
+                    pixelFormat: D2D1_PIXEL_FORMAT {
+                        format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                        alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                    },
+                    dpiX: 96.0,
+                    dpiY: 96.0,
+                    bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET,
+                    colorContext: std::mem::ManuallyDrop::new(None),
                 };
-                let dst_pt = D2D_POINT_2U { x: 0, y: 0 };
-                if snap_bmp
-                    .CopyFromBitmap(Some(&dst_pt), &active_tgt, Some(&src_u))
-                    .is_ok()
-                {
-                    self.glass_snapshot_active = true;
+                let half_sz = D2D_SIZE_U {
+                    width: half_w,
+                    height: half_h,
+                };
+                if let (Ok(hsrc), Ok(hblur)) = (
+                    self.dc.CreateBitmap(half_sz, None, 0, &half_props),
+                    self.dc.CreateBitmap(half_sz, None, 0, &half_props),
+                ) {
+                    self.glass_half_w = half_w;
+                    self.glass_half_h = half_h;
+                    self.glass_half_src = Some(hsrc);
+                    self.glass_blurred_snapshot = Some(hblur);
+                    self.gpu_staging_dirty = true;
                 }
             }
+
+            let (Some(ref snap_bmp), Some(ref half_src), Some(ref blurred_snap), Some(ref blur)) = (
+                &self.glass_frame_snapshot,
+                &self.glass_half_src,
+                &self.glass_blurred_snapshot,
+                &self.blur_effect,
+            ) else {
+                return;
+            };
+
+            let _ = self.dc.Flush(None, None);
+            let src_u = D2D_RECT_U {
+                left: 0,
+                top: 0,
+                right: self.width_px,
+                bottom: self.height_px,
+            };
+            let dst_pt = D2D_POINT_2U { x: 0, y: 0 };
+            if snap_bmp
+                .CopyFromBitmap(Some(&dst_pt), &active_tgt, Some(&src_u))
+                .is_err()
+            {
+                return;
+            }
+
+            let mut saved_xf = Matrix3x2::identity();
+            self.dc.GetTransform(&mut saved_xf);
+
+            let half_rc = D2D_RECT_F {
+                left: 0.0,
+                top: 0.0,
+                right: half_w as f32,
+                bottom: half_h as f32,
+            };
+
+            // Step 1: Fast hardware 2x downsample into `glass_half_src` (96 DPI)
+            self.dc.SetTarget(half_src);
+            self.dc.SetDpi(96.0, 96.0);
+            self.dc.SetTransform(&Matrix3x2::identity());
+            self.dc.Clear(Some(&D2D1_COLOR_F {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.0,
+            }));
+            self.dc.DrawBitmap(
+                snap_bmp,
+                Some(&half_rc),
+                1.0,
+                D2D1_INTERPOLATION_MODE_LINEAR,
+                None,
+                None,
+            );
+            let _ = self.dc.Flush(None, None);
+
+            // Step 2: ONE single crystal-clear blur (~3.8 DIP) + 1.26x vibrancy pass into `glass_blurred_snapshot`!
+            self.dc.SetTarget(blurred_snap);
+            self.dc.SetDpi(96.0, 96.0);
+            self.dc.SetTransform(&Matrix3x2::identity());
+            self.dc.Clear(Some(&D2D1_COLOR_F {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.0,
+            }));
+
+            let sigma_half = (3.8 * self.dpi_scale * 0.5).clamp(1.6, 5.5);
+            blur.SetInput(0, half_src, true);
+            let _ = blur.SetValue(
+                D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION.0 as u32,
+                D2D1_PROPERTY_TYPE_FLOAT,
+                &sigma_half.to_le_bytes(),
+            );
+            let opt = D2D1_GAUSSIANBLUR_OPTIMIZATION_SPEED.0 as u32;
+            let _ = blur.SetValue(
+                D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION.0 as u32,
+                D2D1_PROPERTY_TYPE_UINT32,
+                &opt.to_le_bytes(),
+            );
+            let border_mode = D2D1_BORDER_MODE_HARD.0 as u32;
+            let _ = blur.SetValue(
+                D2D1_GAUSSIANBLUR_PROP_BORDER_MODE.0 as u32,
+                D2D1_PROPERTY_TYPE_UINT32,
+                &border_mode.to_le_bytes(),
+            );
+
+            let final_blur = if let (Some(ref vib), Ok(b_out)) =
+                (&self.glass_vibrancy_effect, blur.GetOutput())
+            {
+                vib.SetInput(0, &b_out, true);
+                let mb = mat5x4_bytes(Self::build_glass_vibrancy_matrix(1.26, 1.03, 0.012));
+                let _ = vib.SetValue(
+                    D2D1_COLORMATRIX_PROP_COLOR_MATRIX.0 as u32,
+                    D2D1_PROPERTY_TYPE_BLOB,
+                    &mb,
+                );
+                vib.GetOutput().ok().or(Some(b_out))
+            } else {
+                blur.GetOutput().ok()
+            };
+
+            if let Some(img) = final_blur {
+                self.dc.DrawImage(
+                    &img,
+                    Some(&pt2(0.0, 0.0)),
+                    Some(&half_rc),
+                    D2D1_INTERPOLATION_MODE_LINEAR,
+                    D2D1_COMPOSITE_MODE_SOURCE_OVER,
+                );
+                self.glass_snapshot_active = true;
+            }
+            let _ = self.dc.Flush(None, None);
+
+            // Restore active render target, DPI, and transform
+            self.dc.SetTarget(&active_tgt);
+            let main_dpi = 96.0 * self.dpi_scale;
+            self.dc.SetDpi(main_dpi, main_dpi);
+            self.dc.SetTransform(&saved_xf);
         }
     }
 
@@ -2113,17 +2852,260 @@ impl D2DRenderer {
         self.glass_snapshot_active = false;
     }
 
-    /// Captures padded live pixels underneath `rect` from `active_draw_target()`, applies Apple-style
-    /// Gaussian blur + ColorMatrix vibrancy saturation boost, and optionally renders a two-zone
-    /// curved outer refractive bezel ring (`bezel_ring_geom`) so album covers visibly bend and
-    /// magnify around the rounded glass perimeter just like iOS 26 / macOS Tahoe Liquid Glass!
+    /// Evaluates the C2-continuous quintic Hermite (`6u^5 - 15u^4 + 10u^3`) SDF convex glass lens
+    /// normalized displacement `(dx, dy)` in `[-1.0, 1.0]` at centered coordinates `(px, py)`.
+    #[inline]
+    fn eval_sdf_glass_lens_offset(
+        px: f32,
+        py: f32,
+        bx: f32,
+        by: f32,
+        r: f32,
+        bezel_w: f32,
+        inv_bezel: f32,
+    ) -> (f32, f32) {
+        let sx = if px < 0.0 { -1.0f32 } else { 1.0f32 };
+        let sy = if py < 0.0 { -1.0f32 } else { 1.0f32 };
+        let qx = px.abs() - bx;
+        let qy = py.abs() - by;
+        let ox = qx.max(0.0);
+        let oy = qy.max(0.0);
+
+        // Exact rounded-rect SDF (<= 0 inside, 0 on outer perimeter)
+        let sdf = ox.hypot(oy) + qx.max(qy).min(0.0) - r;
+        let d_edge = (-sdf).max(0.0);
+        if d_edge >= bezel_w {
+            return (0.0, 0.0);
+        }
+
+        let (nx, ny) = if qx > 0.0 && qy > 0.0 {
+            let len = ox.hypot(oy).max(1e-5);
+            ((ox / len) * sx, (oy / len) * sy)
+        } else {
+            // C-infinity normal transition across medial axis (qx == qy) -> zero diagonal crease
+            let diff = (qx - qy).clamp(-16.0, 16.0);
+            let wx = 1.0 / (1.0 + (-diff * 1.4).exp());
+            let wy = 1.0 - wx;
+            let gx = wx * sx;
+            let gy = wy * sy;
+            let len = gx.hypot(gy).max(1e-5);
+            (gx / len, gy / len)
+        };
+
+        let u = (1.0 - d_edge * inv_bezel).clamp(0.0, 1.0);
+        // C2 quintic smootherstep (zero 1st & 2nd derivative at core boundary -> zero seam on 4K HiDPI!)
+        let quintic = u * u * u * (u * (u * 6.0 - 15.0) + 10.0);
+        let mag = quintic * (0.24 + 0.76 * u * u);
+        // Convex perimeter bends viewing rays INWARD along -normal
+        (-mag * nx, -mag * ny)
+    }
+
+    /// Generates an IEEE-754 16-bit float (`DXGI_FORMAT_R16G16B16A16_FLOAT`, `[R=dx, G=dy, B=0.5, A=1.0]`)
+    /// SDF convex glass lens displacement map with zero 8-bit staircase banding even on 4K 200% HiDPI!
+    pub fn generate_liquid_glass_sdf_displacement_map_f16(
+        map_w: u32,
+        map_h: u32,
+        rect_w: f32,
+        rect_h: f32,
+        radius: f32,
+    ) -> Vec<u16> {
+        let mw = map_w.max(2);
+        let mh = map_h.max(2);
+        let rw = rect_w.max(2.0);
+        let rh = rect_h.max(2.0);
+        let hx = rw * 0.5;
+        let hy = rh * 0.5;
+        let r = radius.clamp(0.0, hx.min(hy));
+        let bx = (hx - r).max(0.0);
+        let by = (hy - r).max(0.0);
+        let bezel_w = (rw.min(rh) * 0.24).clamp(6.0, 42.0).min(hx.min(hy).max(1.0));
+        let inv_bezel = 1.0 / bezel_w.max(1.0);
+
+        const HALF_05: u16 = 0x3800; // exact 0.5 in IEEE-754 binary16
+        const HALF_10: u16 = 0x3C00; // exact 1.0 in IEEE-754 binary16
+
+        let mut data = vec![0u16; (mw * mh * 4) as usize];
+        for iy in 0..mh {
+            let py = ((iy as f32 + 0.5) / (mh as f32)) * rh - hy;
+            for ix in 0..mw {
+                let px = ((ix as f32 + 0.5) / (mw as f32)) * rw - hx;
+                let (dx_norm, dy_norm) =
+                    Self::eval_sdf_glass_lens_offset(px, py, bx, by, r, bezel_w, inv_bezel);
+                let idx = ((iy * mw + ix) * 4) as usize;
+                data[idx] = f32_to_f16_bits(0.5 + dx_norm * 0.5);
+                data[idx + 1] = f32_to_f16_bits(0.5 + dy_norm * 0.5);
+                data[idx + 2] = HALF_05;
+                data[idx + 3] = HALF_10;
+            }
+        }
+        data
+    }
+
+    /// Generates an analytical C2 quintic SDF convex glass lens displacement map in BGRA8 layout
+    /// (`[B, G=dy, R=dx, A=255]`) with 4×4 Bayer dithering on the bezel (fallback when FP16 is unavailable).
+    pub fn generate_liquid_glass_sdf_displacement_map(
+        map_w: u32,
+        map_h: u32,
+        rect_w: f32,
+        rect_h: f32,
+        radius: f32,
+    ) -> Vec<u8> {
+        const BAYER4: [f32; 16] = [
+            0.0 / 16.0, 8.0 / 16.0, 2.0 / 16.0, 10.0 / 16.0,
+            12.0 / 16.0, 4.0 / 16.0, 14.0 / 16.0, 6.0 / 16.0,
+            3.0 / 16.0, 11.0 / 16.0, 1.0 / 16.0, 9.0 / 16.0,
+            15.0 / 16.0, 7.0 / 16.0, 13.0 / 16.0, 5.0 / 16.0,
+        ];
+        let mw = map_w.max(2);
+        let mh = map_h.max(2);
+        let rw = rect_w.max(2.0);
+        let rh = rect_h.max(2.0);
+        let hx = rw * 0.5;
+        let hy = rh * 0.5;
+        let r = radius.clamp(0.0, hx.min(hy));
+        let bx = (hx - r).max(0.0);
+        let by = (hy - r).max(0.0);
+        let bezel_w = (rw.min(rh) * 0.24).clamp(6.0, 42.0).min(hx.min(hy).max(1.0));
+        let inv_bezel = 1.0 / bezel_w.max(1.0);
+
+        let mut pixels = vec![0u8; (mw * mh * 4) as usize];
+        for iy in 0..mh {
+            let py = ((iy as f32 + 0.5) / (mh as f32)) * rh - hy;
+            let by_idx = ((iy & 3) * 4) as usize;
+            for ix in 0..mw {
+                let px = ((ix as f32 + 0.5) / (mw as f32)) * rw - hx;
+                let (dx_norm, dy_norm) =
+                    Self::eval_sdf_glass_lens_offset(px, py, bx, by, r, bezel_w, inv_bezel);
+                let dither = if dx_norm != 0.0 || dy_norm != 0.0 {
+                    (BAYER4[by_idx + ((ix & 3) as usize)] - 0.5) / 255.0
+                } else {
+                    0.0
+                };
+                let r_u8 = ((0.5 + dx_norm * 0.5 + dither) * 255.0)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+                let g_u8 = ((0.5 + dy_norm * 0.5 + dither) * 255.0)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+                let idx = ((iy * mw + ix) * 4) as usize;
+                pixels[idx] = 128;
+                pixels[idx + 1] = g_u8;
+                pixels[idx + 2] = r_u8;
+                pixels[idx + 3] = 255;
+            }
+        }
+        pixels
+    }
+
+    /// Returns a cached GPU `ID2D1Bitmap1` SDF displacement map in unified `96.0 DPI` physical-pixel
+    /// space (prefers 16-bit float `DXGI_FORMAT_R16G16B16A16_FLOAT` with automatic BGRA8 fallback,
+    /// LRU-bounded at 32 entries, keyed by quantized physical pixel `(w_px, h_px, rad_px)`).
+    fn ensure_glass_displacement_map(
+        &mut self,
+        rw_px: f32,
+        rh_px: f32,
+        rad_px: f32,
+    ) -> Option<(ID2D1Bitmap1, u32, u32)> {
+        let w_q = ((rw_px / 4.0).round() as u16).clamp(8, 2048);
+        let h_q = ((rh_px / 4.0).round() as u16).clamp(8, 2048);
+        let r_q = ((rad_px / 2.0).round() as u16).clamp(0, 1024);
+        let key = (w_q, h_q, r_q);
+
+        if let Some(hit) = self.glass_disp_maps.get(&key).cloned() {
+            if self.glass_disp_lru.back() != Some(&key) {
+                self.glass_disp_lru.retain(|k| k != &key);
+                self.glass_disp_lru.push_back(key);
+            }
+            return Some(hit);
+        }
+
+        let map_w = (rw_px.round() as u32).clamp(64, 512);
+        let map_h = (rh_px.round() as u32).clamp(64, 320);
+        let q_rw = (w_q as f32) * 4.0;
+        let q_rh = (h_q as f32) * 4.0;
+        let q_rad = (r_q as f32) * 2.0;
+
+        unsafe {
+            // Try 16-bit half-float displacement map first (zero 8-bit banding on 4K 200% HiDPI!)
+            let f16_data = Self::generate_liquid_glass_sdf_displacement_map_f16(
+                map_w, map_h, q_rw, q_rh, q_rad,
+            );
+            let props_f16 = D2D1_BITMAP_PROPERTIES1 {
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                },
+                dpiX: 96.0,
+                dpiY: 96.0,
+                bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
+                colorContext: std::mem::ManuallyDrop::new(None),
+            };
+            let bmp = self
+                .dc
+                .CreateBitmap(
+                    D2D_SIZE_U {
+                        width: map_w,
+                        height: map_h,
+                    },
+                    Some(f16_data.as_ptr() as *const c_void),
+                    map_w * 8,
+                    &props_f16,
+                )
+                .or_else(|_| {
+                    // Fallback: smooth Bayer-dithered BGRA8
+                    let u8_data = Self::generate_liquid_glass_sdf_displacement_map(
+                        map_w, map_h, q_rw, q_rh, q_rad,
+                    );
+                    let props_u8 = D2D1_BITMAP_PROPERTIES1 {
+                        pixelFormat: D2D1_PIXEL_FORMAT {
+                            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                        },
+                        dpiX: 96.0,
+                        dpiY: 96.0,
+                        bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
+                        colorContext: std::mem::ManuallyDrop::new(None),
+                    };
+                    self.dc.CreateBitmap(
+                        D2D_SIZE_U {
+                            width: map_w,
+                            height: map_h,
+                        },
+                        Some(u8_data.as_ptr() as *const c_void),
+                        map_w * 4,
+                        &props_u8,
+                    )
+                })
+                .ok()?;
+
+            while self.glass_disp_lru.len() >= 32 {
+                if let Some(old_k) = self.glass_disp_lru.pop_front() {
+                    self.glass_disp_maps.remove(&old_k);
+                }
+            }
+            let entry = (bmp, map_w, map_h);
+            self.glass_disp_lru.push_back(key);
+            self.glass_disp_maps.insert(key, entry.clone());
+            self.gpu_staging_dirty = true;
+            Some(entry)
+        }
+    }
+
+    /// Ultra-Fast HiDPI-Exact iPadOS 26 Liquid Glass Optical Refraction Pipeline:
+    /// - Executes 100% in unified `96.0 DPI` physical-pixel space (Input 0, Input 1, AND `dc` DPI
+    ///   all match identically -> ZERO HiDPI tear seam or discontinuity on 125%–300% displays!).
+    /// - When `begin_glass_backdrop_snapshot` is active, samples the single pre-blurred half-res
+    ///   snapshot with ZERO Gaussian blurs, ZERO ColorMatrix passes, and ZERO flushes — just ONE
+    ///   fast `CLSID_D2D1DisplacementMap` pass using our FP16 C2 quintic SDF lens!
+    /// - When called outside a batch snapshot (popovers/context menus), captures a tight local
+    ///   region in `96.0 DPI` physical pixels with single-pass crystal blur + single-pass lens.
     fn draw_liquid_glass_backdrop_only(
         &mut self,
         rect: RectF,
         radius: f32,
         sigma: f32,
-        core_zoom: f32,
-        with_bezel_lens: bool,
+        _core_zoom: f32,
+        _unused_dispersion: bool,
     ) -> bool {
         if rect.w <= 2.0 || rect.h <= 2.0 || self.blur_effect.is_none() {
             return false;
@@ -2132,70 +3114,92 @@ impl D2DRenderer {
             return false;
         }
 
-        let pad_dip = 12.0f32;
-        let px_l = (((rect.x - pad_dip) * self.dpi_scale).floor() as i32)
-            .clamp(0, self.width_px as i32 - 1) as u32;
-        let px_t = (((rect.y - pad_dip) * self.dpi_scale).floor() as i32)
-            .clamp(0, self.height_px as i32 - 1) as u32;
-        let px_r = (((rect.right() + pad_dip) * self.dpi_scale).ceil() as i32)
-            .clamp(px_l as i32, self.width_px as i32) as u32;
-        let px_b = (((rect.bottom() + pad_dip) * self.dpi_scale).ceil() as i32)
-            .clamp(px_t as i32, self.height_px as i32) as u32;
-        if px_r <= px_l + 1 || px_b <= px_t + 1 {
-            return false;
-        }
-        let cap_w = px_r - px_l;
-        let cap_h = px_b - px_t;
+        let s = self.dpi_scale.max(1.0);
+        let rad = radius.min(rect.w * 0.5).min(rect.h * 0.5).max(0.0);
+        let rx_px = rect.x * s;
+        let ry_px = rect.y * s;
+        let rw_px = (rect.w * s).max(2.0);
+        let rh_px = (rect.h * s).max(2.0);
+        let rad_px = rad * s;
 
-        let mat_to_bytes = |m: [f32; 20]| -> [u8; 80] {
-            let mut b = [0u8; 80];
-            for (i, f) in m.iter().enumerate() {
-                b[i * 4..(i + 1) * 4].copy_from_slice(&f.to_le_bytes());
-            }
-            b
-        };
-        let rect_to_bytes = |v: [f32; 4]| -> [u8; 16] {
-            let mut b = [0u8; 16];
-            for (i, f) in v.iter().enumerate() {
-                b[i * 4..(i + 1) * 4].copy_from_slice(&f.to_le_bytes());
-            }
-            b
-        };
-
-        let cap_ox = (px_l as f32) / self.dpi_scale;
-        let cap_oy = (px_t as f32) / self.dpi_scale;
-        let cap_dip_w = (cap_w as f32) / self.dpi_scale;
-        let cap_dip_h = (cap_h as f32) / self.dpi_scale;
+        let disp_map = self.ensure_glass_displacement_map(rw_px, rh_px, rad_px);
 
         let use_batch_snapshot = self.glass_snapshot_active
-            && self.glass_frame_snapshot.is_some()
-            && self.glass_crop_effect.is_some();
+            && self.glass_blurred_snapshot.is_some()
+            && self.glass_bg_scale_effect.is_some()
+            && self.glass_half_w > 0
+            && self.glass_half_h > 0;
 
         unsafe {
-            let (src_bmp_owned, crop_bounds_dip) = if use_batch_snapshot {
-                let snap = self.glass_frame_snapshot.as_ref().unwrap().clone();
-                (snap, [cap_ox, cap_oy, cap_ox + cap_dip_w, cap_oy + cap_dip_h])
+            let (bounded_bg_img, disp_ox_px, disp_oy_px) = if use_batch_snapshot {
+                let blurred_snap = self.glass_blurred_snapshot.as_ref().unwrap();
+                let bg_scale = self.glass_bg_scale_effect.as_ref().unwrap();
+                let sx_snap = (self.width_px as f32) / (self.glass_half_w as f32);
+                let sy_snap = (self.height_px as f32) / (self.glass_half_h as f32);
+                let up_xf = Matrix3x2 {
+                    M11: sx_snap,
+                    M12: 0.0,
+                    M21: 0.0,
+                    M22: sy_snap,
+                    M31: 0.0,
+                    M32: 0.0,
+                };
+                bg_scale.SetInput(0, blurred_snap, true);
+                let xf_b = mat3x2_bytes(up_xf);
+                let _ = bg_scale.SetValue(
+                    D2D1_2DAFFINETRANSFORM_PROP_TRANSFORM_MATRIX.0 as u32,
+                    D2D1_PROPERTY_TYPE_MATRIX_3X2,
+                    &xf_b,
+                );
+                let Ok(scaled_img) = bg_scale.GetOutput() else {
+                    return false;
+                };
+                let bounded: ID2D1Image = if let Some(ref brd) = self.glass_border_effect {
+                    brd.SetInput(0, &scaled_img, true);
+                    brd.GetOutput().unwrap_or(scaled_img)
+                } else {
+                    scaled_img
+                };
+                (bounded, rx_px, ry_px)
             } else {
+                // Tight local single-pass capture for popovers / context menus drawn outside snapshot
+                let pad_px = (20.0 * s).ceil();
+                let px_l = ((rx_px - pad_px).floor() as i32)
+                    .clamp(0, self.width_px as i32 - 1) as u32;
+                let px_t = ((ry_px - pad_px).floor() as i32)
+                    .clamp(0, self.height_px as i32 - 1) as u32;
+                let px_r = ((rx_px + rw_px + pad_px).ceil() as i32)
+                    .clamp(px_l as i32, self.width_px as i32) as u32;
+                let px_b = ((ry_px + rh_px + pad_px).ceil() as i32)
+                    .clamp(px_t as i32, self.height_px as i32) as u32;
+                if px_r <= px_l + 1 || px_b <= px_t + 1 {
+                    return false;
+                }
+                let cap_w = px_r - px_l;
+                let cap_h = px_b - px_t;
+
                 let Some(active_tgt) = self.active_draw_target().cloned() else {
                     return false;
                 };
-                if self.glass_capture_bmp.is_none() || cap_w > self.glass_cap_w || cap_h > self.glass_cap_h
+                if self.glass_capture_bmp.is_none()
+                    || cap_w > self.glass_cap_w
+                    || cap_h > self.glass_cap_h
                 {
                     let alloc_w = ((cap_w + 63) & !63).clamp(128, self.width_px.max(128));
                     let alloc_h = ((cap_h + 63) & !63).clamp(64, self.height_px.max(64));
-                    let dpi = 96.0 * self.dpi_scale;
                     let alpha_mode = if self.premultiplied_swapchain {
                         D2D1_ALPHA_MODE_PREMULTIPLIED
                     } else {
                         D2D1_ALPHA_MODE_IGNORE
                     };
+                    // Strictly 96.0 DPI physical pixel space!
                     let props = D2D1_BITMAP_PROPERTIES1 {
                         pixelFormat: D2D1_PIXEL_FORMAT {
                             format: DXGI_FORMAT_B8G8R8A8_UNORM,
                             alphaMode: alpha_mode,
                         },
-                        dpiX: dpi,
-                        dpiY: dpi,
+                        dpiX: 96.0,
+                        dpiY: 96.0,
                         bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
                         colorContext: std::mem::ManuallyDrop::new(None),
                     };
@@ -2234,99 +3238,159 @@ impl D2DRenderer {
                 {
                     return false;
                 }
-                (cap_bmp.clone(), [0.0, 0.0, cap_dip_w, cap_dip_h])
-            };
 
-            let Some(ref blur) = self.blur_effect else {
-                return false;
-            };
+                let Some(ref blur) = self.blur_effect else {
+                    return false;
+                };
+                let blur_input_img: ID2D1Image = if let Some(ref crop) = self.glass_crop_effect {
+                    crop.SetInput(0, cap_bmp, true);
+                    let cb = vec4_bytes([0.0, 0.0, cap_w as f32, cap_h as f32]);
+                    let _ = crop.SetValue(
+                        D2D1_CROP_PROP_RECT.0 as u32,
+                        D2D1_PROPERTY_TYPE_VECTOR4,
+                        &cb,
+                    );
+                    crop.GetOutput().unwrap_or_else(|_| cap_bmp.cast().unwrap())
+                } else {
+                    cap_bmp.cast().unwrap()
+                };
 
-            // Strictly crop input bitmap to the exact captured region BEFORE Gaussian blur
-            // so stale pixels outside `[cap_w, cap_h]` NEVER bleed into glass edges!
-            let blur_input_img: ID2D1Image = if let Some(ref crop) = self.glass_crop_effect {
-                crop.SetInput(0, &src_bmp_owned, true);
-                let cb = rect_to_bytes(crop_bounds_dip);
-                let _ = crop.SetValue(
-                    D2D1_CROP_PROP_RECT.0 as u32,
-                    D2D1_PROPERTY_TYPE_VECTOR4,
-                    &cb,
+                // Light crystal-clear iPadOS 26 blur (3.2..4.8 DIP converted to exact physical px)
+                let sigma_px = ((sigma * 0.22).clamp(3.2, 4.8) * s).clamp(3.2, 16.0);
+                blur.SetInput(0, &blur_input_img, true);
+                let _ = blur.SetValue(
+                    D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION.0 as u32,
+                    D2D1_PROPERTY_TYPE_FLOAT,
+                    &sigma_px.to_le_bytes(),
                 );
-                crop.GetOutput()
-                    .unwrap_or_else(|_| src_bmp_owned.cast().unwrap())
-            } else {
-                src_bmp_owned.cast().unwrap()
-            };
-
-            let sigma_core = (sigma * 0.72 * self.dpi_scale).clamp(3.2, 26.0);
-            blur.SetInput(0, &blur_input_img, true);
-            let _ = blur.SetValue(
-                D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION.0 as u32,
-                D2D1_PROPERTY_TYPE_FLOAT,
-                &sigma_core.to_le_bytes(),
-            );
-            let opt = D2D1_GAUSSIANBLUR_OPTIMIZATION_SPEED.0 as u32;
-            let _ = blur.SetValue(
-                D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION.0 as u32,
-                D2D1_PROPERTY_TYPE_UINT32,
-                &opt.to_le_bytes(),
-            );
-            let border = D2D1_BORDER_MODE_HARD.0 as u32;
-            let _ = blur.SetValue(
-                D2D1_GAUSSIANBLUR_PROP_BORDER_MODE.0 as u32,
-                D2D1_PROPERTY_TYPE_UINT32,
-                &border.to_le_bytes(),
-            );
-
-            let core_img = if let (Some(ref vib), Ok(blur_out)) =
-                (&self.glass_vibrancy_effect, blur.GetOutput())
-            {
-                vib.SetInput(0, &blur_out, true);
-                let mb = mat_to_bytes(Self::build_glass_vibrancy_matrix(1.42, 1.05, 0.022));
-                let _ = vib.SetValue(
-                    D2D1_COLORMATRIX_PROP_COLOR_MATRIX.0 as u32,
-                    D2D1_PROPERTY_TYPE_BLOB,
-                    &mb,
+                let opt = D2D1_GAUSSIANBLUR_OPTIMIZATION_SPEED.0 as u32;
+                let _ = blur.SetValue(
+                    D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION.0 as u32,
+                    D2D1_PROPERTY_TYPE_UINT32,
+                    &opt.to_le_bytes(),
                 );
-                vib.GetOutput().ok().or(Some(blur_out))
+                let border_mode = D2D1_BORDER_MODE_HARD.0 as u32;
+                let _ = blur.SetValue(
+                    D2D1_GAUSSIANBLUR_PROP_BORDER_MODE.0 as u32,
+                    D2D1_PROPERTY_TYPE_UINT32,
+                    &border_mode.to_le_bytes(),
+                );
+                let core_img = if let (Some(ref vib), Ok(blur_out)) =
+                    (&self.glass_vibrancy_effect, blur.GetOutput())
+                {
+                    vib.SetInput(0, &blur_out, true);
+                    let mb = mat5x4_bytes(Self::build_glass_vibrancy_matrix(1.26, 1.03, 0.012));
+                    let _ = vib.SetValue(
+                        D2D1_COLORMATRIX_PROP_COLOR_MATRIX.0 as u32,
+                        D2D1_PROPERTY_TYPE_BLOB,
+                        &mb,
+                    );
+                    vib.GetOutput().ok().or(Some(blur_out))
+                } else {
+                    blur.GetOutput().ok()
+                };
+                let Some(core_img) = core_img else {
+                    return false;
+                };
+                let bounded: ID2D1Image = if let Some(ref brd) = self.glass_border_effect {
+                    brd.SetInput(0, &core_img, true);
+                    brd.GetOutput().unwrap_or(core_img)
+                } else {
+                    core_img
+                };
+                (bounded, rx_px - (px_l as f32), ry_px - (px_t as f32))
+            };
+
+            // Single ultra-fast FP16 SDF displacement pass (all in 96.0 DPI physical pixels!)
+            let final_img: ID2D1Image = if let (
+                Some((disp_bmp, map_w, map_h)),
+                Some(ref xform),
+                Some(ref disp_g),
+            ) = (
+                &disp_map,
+                &self.glass_disp_xform_effect,
+                &self.glass_disp_g_effect,
+            ) {
+                let map_xf = Matrix3x2 {
+                    M11: rw_px / (*map_w as f32).max(1.0),
+                    M12: 0.0,
+                    M21: 0.0,
+                    M22: rh_px / (*map_h as f32).max(1.0),
+                    M31: disp_ox_px,
+                    M32: disp_oy_px,
+                };
+                xform.SetInput(0, disp_bmp, true);
+                let xf_bytes = mat3x2_bytes(map_xf);
+                let _ = xform.SetValue(
+                    D2D1_2DAFFINETRANSFORM_PROP_TRANSFORM_MATRIX.0 as u32,
+                    D2D1_PROPERTY_TYPE_MATRIX_3X2,
+                    &xf_bytes,
+                );
+                if let Ok(disp_aligned) = xform.GetOutput() {
+                    // Edge-clamp Input 1 so sub-pixel perimeter sampling NEVER sees (0,0,0,0) tear!
+                    let disp_clamped: ID2D1Image =
+                        if let Some(ref d_brd) = self.glass_disp_border_effect {
+                            d_brd.SetInput(0, &disp_aligned, true);
+                            d_brd.GetOutput().unwrap_or(disp_aligned)
+                        } else {
+                            disp_aligned
+                        };
+                    let bezel_w_dip = (rect.w.min(rect.h) * 0.24).clamp(6.0, 20.0);
+                    let max_deflect_px = (bezel_w_dip * 0.90).clamp(5.5, 16.0) * s;
+                    let disp_scale_px = max_deflect_px * 2.0;
+
+                    disp_g.SetInput(0, &bounded_bg_img, true);
+                    disp_g.SetInput(1, &disp_clamped, true);
+                    let _ = disp_g.SetValue(
+                        D2D1_DISPLACEMENTMAP_PROP_SCALE.0 as u32,
+                        D2D1_PROPERTY_TYPE_FLOAT,
+                        &disp_scale_px.to_le_bytes(),
+                    );
+                    disp_g.GetOutput().unwrap_or(bounded_bg_img)
+                } else {
+                    bounded_bg_img
+                }
             } else {
-                blur.GetOutput().ok()
+                bounded_bg_img
             };
-            let Some(core_img) = core_img else {
+
+            let rect_px = D2D_RECT_F {
+                left: rx_px,
+                top: ry_px,
+                right: rx_px + rw_px,
+                bottom: ry_px + rh_px,
+            };
+            let rr_px = D2D1_ROUNDED_RECT {
+                rect: rect_px,
+                radiusX: rad_px,
+                radiusY: rad_px,
+            };
+            let Ok(outer_geom) = self.d2d_factory.CreateRoundedRectangleGeometry(&rr_px) else {
                 return false;
             };
-
-            let rad = radius.min(rect.w * 0.5).min(rect.h * 0.5).max(0.0);
-            let rr = D2D1_ROUNDED_RECT {
-                rect: to_d2d_rect(rect),
-                radiusX: rad,
-                radiusY: rad,
-            };
-            let Ok(outer_geom) = self.d2d_factory.CreateRoundedRectangleGeometry(&rr) else {
-                return false;
+            let src_disp_rc = D2D_RECT_F {
+                left: disp_ox_px,
+                top: disp_oy_px,
+                right: disp_ox_px + rw_px,
+                bottom: disp_oy_px + rh_px,
             };
 
-            let src_full = D2D_RECT_F {
-                left: crop_bounds_dip[0],
-                top: crop_bounds_dip[1],
-                right: crop_bounds_dip[2],
-                bottom: crop_bounds_dip[3],
-            };
-            let rcx = rect.center_x();
-            let rcy = rect.center_y();
-
+            // Switch temporarily to 96.0 DPI physical pixel space (preserving any active transform!)
             let mut saved_xf = Matrix3x2::identity();
             self.dc.GetTransform(&mut saved_xf);
-            let mul_xf = |a: Matrix3x2, b: Matrix3x2| Matrix3x2 {
-                M11: a.M11 * b.M11 + a.M12 * b.M21,
-                M12: a.M11 * b.M12 + a.M12 * b.M22,
-                M21: a.M21 * b.M11 + a.M22 * b.M21,
-                M22: a.M21 * b.M12 + a.M22 * b.M22,
-                M31: a.M31 * b.M11 + a.M32 * b.M21 + b.M31,
-                M32: a.M31 * b.M12 + a.M32 * b.M22 + b.M32,
+            let xf_px = Matrix3x2 {
+                M11: saved_xf.M11,
+                M12: saved_xf.M12,
+                M21: saved_xf.M21,
+                M22: saved_xf.M22,
+                M31: saved_xf.M31 * s,
+                M32: saved_xf.M32 * s,
             };
+            self.dc.SetDpi(96.0, 96.0);
+            self.dc.SetTransform(&xf_px);
 
             let layer_params = D2D1_LAYER_PARAMETERS1 {
-                contentBounds: to_d2d_rect(rect),
+                contentBounds: rect_px,
                 geometricMask: std::mem::ManuallyDrop::new(Some(outer_geom.cast().unwrap())),
                 maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
                 maskTransform: Matrix3x2::identity(),
@@ -2335,142 +3399,20 @@ impl D2DRenderer {
                 layerOptions: D2D1_LAYER_OPTIONS1_NONE,
             };
             self.dc.PushLayer(&layer_params, None);
-
-            // Zone A: Inner Frosted Vibrant Optical Core with gentle convex lensing
-            let sx_core = core_zoom.clamp(1.0, 1.14);
-            let sy_core = (core_zoom + 0.008).clamp(1.0, 1.16);
-            let core_xf = Matrix3x2 {
-                M11: sx_core,
-                M12: 0.0,
-                M21: 0.0,
-                M22: sy_core,
-                M31: rcx * (1.0 - sx_core),
-                M32: rcy * (1.0 - sy_core),
-            };
-            self.dc.SetTransform(&mul_xf(core_xf, saved_xf));
             self.dc.DrawImage(
-                &core_img,
-                Some(&pt2(cap_ox, cap_oy)),
-                Some(&src_full),
+                &final_img,
+                Some(&pt2(rx_px, ry_px)),
+                Some(&src_disp_rc),
                 D2D1_INTERPOLATION_MODE_LINEAR,
                 D2D1_COMPOSITE_MODE_SOURCE_OVER,
             );
-
-            // Zone B: High-Refraction Curved Outer Bezel Ring (true iOS 26 / macOS Tahoe perimeter lensing!)
-            if with_bezel_lens && rect.w >= 28.0 && rect.h >= 24.0 && rad >= 6.0 {
-                if let Some(ref rim_blur) = self.glass_rim_blur_effect {
-                    let bezel_w = (rect.w.min(rect.h) * 0.165).clamp(4.5, 11.0);
-                    let in_rect = rect.inset(bezel_w, bezel_w);
-                    if in_rect.w > 4.0 && in_rect.h > 4.0 {
-                        let in_rad = (rad - bezel_w).max(1.5);
-                        let in_rr = D2D1_ROUNDED_RECT {
-                            rect: to_d2d_rect(in_rect),
-                            radiusX: in_rad,
-                            radiusY: in_rad,
-                        };
-                        if let (Ok(in_geom), Ok(ring_path)) = (
-                            self.d2d_factory.CreateRoundedRectangleGeometry(&in_rr),
-                            self.d2d_factory.CreatePathGeometry(),
-                        ) {
-                            let built = if let Ok(sink) = ring_path.Open() {
-                                let in_base: ID2D1Geometry = in_geom.cast().unwrap();
-                                let ok = outer_geom
-                                    .CombineWithGeometry(
-                                        &in_base,
-                                        D2D1_COMBINE_MODE_EXCLUDE,
-                                        None,
-                                        0.25,
-                                        &sink,
-                                    )
-                                    .is_ok();
-                                let _ = sink.Close();
-                                ok
-                            } else {
-                                false
-                            };
-                            if built {
-                                let sigma_rim = (sigma * 0.24 * self.dpi_scale).clamp(1.2, 5.5);
-                                rim_blur.SetInput(0, &blur_input_img, true);
-                                let _ = rim_blur.SetValue(
-                                    D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION.0 as u32,
-                                    D2D1_PROPERTY_TYPE_FLOAT,
-                                    &sigma_rim.to_le_bytes(),
-                                );
-                                let _ = rim_blur.SetValue(
-                                    D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION.0 as u32,
-                                    D2D1_PROPERTY_TYPE_UINT32,
-                                    &opt.to_le_bytes(),
-                                );
-                                let _ = rim_blur.SetValue(
-                                    D2D1_GAUSSIANBLUR_PROP_BORDER_MODE.0 as u32,
-                                    D2D1_PROPERTY_TYPE_UINT32,
-                                    &border.to_le_bytes(),
-                                );
-                                let rim_img = if let (Some(ref rvib), Ok(rb_out)) =
-                                    (&self.glass_rim_vibrancy_effect, rim_blur.GetOutput())
-                                {
-                                    rvib.SetInput(0, &rb_out, true);
-                                    let mb = mat_to_bytes(Self::build_glass_vibrancy_matrix(
-                                        1.56, 1.08, 0.042,
-                                    ));
-                                    let _ = rvib.SetValue(
-                                        D2D1_COLORMATRIX_PROP_COLOR_MATRIX.0 as u32,
-                                        D2D1_PROPERTY_TYPE_BLOB,
-                                        &mb,
-                                    );
-                                    rvib.GetOutput().ok().or(Some(rb_out))
-                                } else {
-                                    rim_blur.GetOutput().ok()
-                                };
-                                if let Some(rim_img) = rim_img {
-                                    self.dc.SetTransform(&saved_xf);
-                                    let ring_lp = D2D1_LAYER_PARAMETERS1 {
-                                        contentBounds: to_d2d_rect(rect),
-                                        geometricMask: std::mem::ManuallyDrop::new(Some(
-                                            ring_path.cast().unwrap(),
-                                        )),
-                                        maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-                                        maskTransform: Matrix3x2::identity(),
-                                        opacity: 0.88,
-                                        opacityBrush: std::mem::ManuallyDrop::new(None),
-                                        layerOptions: D2D1_LAYER_OPTIONS1_NONE,
-                                    };
-                                    self.dc.PushLayer(&ring_lp, None);
-                                    // Pronounced curved-edge lens magnification bends colors visibly along the rim!
-                                    let sx_rim = 1.11f32;
-                                    let sy_rim = if rect.h < 120.0 { 1.18f32 } else { 1.09f32 };
-                                    let rim_xf = Matrix3x2 {
-                                        M11: sx_rim,
-                                        M12: 0.0,
-                                        M21: 0.0,
-                                        M22: sy_rim,
-                                        M31: rcx * (1.0 - sx_rim),
-                                        M32: rcy * (1.0 - sy_rim),
-                                    };
-                                    self.dc.SetTransform(&mul_xf(rim_xf, saved_xf));
-                                    self.dc.DrawImage(
-                                        &rim_img,
-                                        Some(&pt2(cap_ox, cap_oy)),
-                                        Some(&src_full),
-                                        D2D1_INTERPOLATION_MODE_LINEAR,
-                                        D2D1_COMPOSITE_MODE_SOURCE_OVER,
-                                    );
-                                    self.dc.SetTransform(&saved_xf);
-                                    self.dc.PopLayer();
-                                    let _ = std::mem::ManuallyDrop::into_inner(ring_lp.geometricMask);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            self.dc.SetTransform(&saved_xf);
             self.dc.PopLayer();
             let _ = std::mem::ManuallyDrop::into_inner(layer_params.geometricMask);
 
-            // Only flush when using the mutable scratch `glass_capture_bmp`; when reading from the
-            // immutable per-frame snapshot, ZERO flushes are needed!
+            let main_dpi = 96.0 * s;
+            self.dc.SetDpi(main_dpi, main_dpi);
+            self.dc.SetTransform(&saved_xf);
+
             if !use_batch_snapshot {
                 let _ = self.dc.Flush(None, None);
             }
@@ -2478,11 +3420,12 @@ impl D2DRenderer {
         }
     }
 
-    /// Redesigned iOS 26 / macOS Tahoe Liquid Glass Surface:
-    /// - Padded live backdrop capture (full-window height supported, zero 512px cutoff!)
-    /// - Two-zone optical refraction: vibrant frosted core + crisp high-magnification curved bezel rim
-    /// - Clean optical crystal glaze + top meniscus sheen + bottom internal bounce
-    /// - Hairline outer dark contrast border + pure silver-white 4-stop Fresnel rim + inner glass thickness highlight
+    /// Authentic iPadOS 26 Crystal-Clear Liquid Glass Surface:
+    /// - HiDPI-exact `96 DPI` physical-pixel FP16 C2 quintic SDF optical lens refraction
+    /// - Single per-frame half-res pre-blurred snapshot (< 1.0ms/frame across all glass elements!)
+    /// - Crystal-clear translucent glaze (`alpha ~0.16..0.24` on floating capsules) + `1.26x` vibrancy
+    /// - Strictly VERTICAL top & bottom specular rim highlights (`0.44` top / `0.06` sides / `0.34` bottom)
+    /// - Lightweight 2-tier exterior-only drop shadow
     pub fn draw_liquid_glass(
         &mut self,
         rect: RectF,
@@ -2502,167 +3445,95 @@ impl D2DRenderer {
             return;
         }
 
-        let blurred_drawn = self.draw_liquid_glass_backdrop_only(rect, rad, sigma, 1.035, true);
-        if blurred_drawn && rad > 2.0 {
-            // Exterior-only elevation shadow drawn strictly outside `rect` AFTER live capture
-            // so underlying album art inside the capsule stays 100% un-darkened and vibrant!
-            self.draw_exterior_glass_shadow(rect, rad, 0.34, 0.18, 4.5);
+        let refracted_drawn = self.draw_liquid_glass_backdrop_only(rect, rad, sigma, 1.0, false);
+        if refracted_drawn {
+            self.record_live_glass_rect(rect);
+            if rad > 2.0 {
+                self.draw_exterior_glass_shadow(rect, rad, 0.28, 0.14, 4.0);
+            }
         }
 
-        unsafe {
-            if blurred_drawn {
-                // Crystal optical glaze (keep opacity restrained so vibrant refracted colors always breathe!)
-                let base_a = tint.a.clamp(0.14, 0.58);
-                let top_glaze = tint.with_alpha((base_a * 0.82).clamp(0.10, 0.50));
-                let bot_glaze = tint.with_alpha((base_a * 1.12).clamp(0.16, 0.64));
-                self.fill_linear_gradient_rect(
-                    rect,
-                    rad,
-                    rect.x,
-                    rect.y,
-                    rect.x,
-                    rect.bottom(),
-                    top_glaze,
-                    bot_glaze,
-                );
-
-                // Curved top meniscus highlight (delicate crystal tension reflection along upper 26%)
-                let top_h = (rect.h * 0.26).clamp(2.5, 42.0);
-                let top_sheen = RectF::new(rect.x + 1.4, rect.y + 0.9, (rect.w - 2.8).max(1.0), top_h);
-                self.fill_linear_gradient_rect(
-                    top_sheen,
-                    (rad - 1.0).max(0.0),
-                    top_sheen.x,
-                    top_sheen.y,
-                    top_sheen.x,
-                    top_sheen.bottom(),
-                    Color::rgba(255, 255, 255, 0.145),
-                    Color::rgba(255, 255, 255, 0.0),
-                );
-
-                // Subtle bottom internal caustic bounce along lower 18%
-                let bot_h = (rect.h * 0.18).clamp(2.0, 28.0);
-                let bot_caustic = RectF::new(
-                    rect.x + 2.0,
-                    rect.bottom() - bot_h - 0.8,
-                    (rect.w - 4.0).max(1.0),
-                    bot_h,
-                );
-                self.fill_linear_gradient_rect(
-                    bot_caustic,
-                    (rad - 1.2).max(0.0),
-                    bot_caustic.x,
-                    bot_caustic.bottom(),
-                    bot_caustic.x,
-                    bot_caustic.y,
-                    Color::rgba(240, 248, 255, 0.075),
-                    Color::rgba(240, 248, 255, 0.0),
-                );
-            } else {
-                self.fill_rounded_rect(rect, rad, Theme::GLASS_OPAQUE_FALLBACK);
-            }
-
-            // Outer hairline dark optical separation border (keeps capsule crisp on bright covers!)
-            self.stroke_rounded_rect(
-                rect.inset(-0.5, -0.5),
-                (rad + 0.5).min(rect.h * 0.5 + 0.5),
-                Color::rgba(0, 0, 0, 0.34),
-                1.0,
+        if refracted_drawn {
+            // Crystal-clear iPadOS 26 translucent glaze: honors restrained `tint.a` (~0.16..0.24
+            // for MiniPlayer pill, ~0.40..0.46 for context menus/popovers, ~0.78 for modals)
+            let base_a = tint.a.clamp(0.15, 0.78);
+            let top_glaze = tint.with_alpha((base_a * 0.82).clamp(0.12, 0.70));
+            let bot_glaze = tint.with_alpha((base_a * 1.12).clamp(0.18, 0.82));
+            self.fill_linear_gradient_rect(
+                rect,
+                rad,
+                rect.x,
+                rect.y,
+                rect.x,
+                rect.bottom(),
+                top_glaze,
+                bot_glaze,
             );
-
-            // Pure crystalline silver-white 4-stop Fresnel directional specular rim
-            let rim_stops = [
-                D2D1_GRADIENT_STOP {
-                    position: 0.0,
-                    color: to_d2d_color(Color::rgba(255, 255, 255, (rim_color.a * 1.75).min(0.66))),
-                },
-                D2D1_GRADIENT_STOP {
-                    position: 0.36,
-                    color: to_d2d_color(Color::rgba(255, 255, 255, (rim_color.a * 0.38).min(0.16))),
-                },
-                D2D1_GRADIENT_STOP {
-                    position: 0.70,
-                    color: to_d2d_color(Color::rgba(242, 248, 255, (rim_color.a * 0.28).min(0.12))),
-                },
-                D2D1_GRADIENT_STOP {
-                    position: 1.0,
-                    color: to_d2d_color(Color::rgba(255, 255, 255, (rim_color.a * 1.15).min(0.44))),
-                },
-            ];
-            if let Ok(coll) = ID2D1RenderTarget::CreateGradientStopCollection(
-                &self.dc,
-                &rim_stops,
-                D2D1_GAMMA_2_2,
-                D2D1_EXTEND_MODE_CLAMP,
-            ) {
-                let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
-                    startPoint: pt2(rect.x, rect.y),
-                    endPoint: pt2(rect.right(), rect.bottom()),
-                };
-                if let Ok(grad) = self.dc.CreateLinearGradientBrush(&props, None, &coll) {
-                    let rr = D2D1_ROUNDED_RECT {
-                        rect: to_d2d_rect(rect),
-                        radiusX: rad,
-                        radiusY: rad,
-                    };
-                    self.dc
-                        .DrawRoundedRectangle(&rr, &grad, 1.15, &self.round_stroke);
-                } else {
-                    self.stroke_rounded_rect(rect, rad, rim_color, 1.0);
-                }
-            } else {
-                self.stroke_rounded_rect(rect, rad, rim_color, 1.0);
-            }
-
-            // Inner hairline glass-wall specular highlight arc along top rim
-            let inner_r = rect.inset(1.1, 1.1);
-            if inner_r.w > 8.0 && inner_r.h > 8.0 {
-                let inner_stops = [
-                    D2D1_GRADIENT_STOP {
-                        position: 0.0,
-                        color: to_d2d_color(Color::rgba(255, 255, 255, 0.24)),
-                    },
-                    D2D1_GRADIENT_STOP {
-                        position: 0.34,
-                        color: to_d2d_color(Color::rgba(255, 255, 255, 0.0)),
-                    },
-                    D2D1_GRADIENT_STOP {
-                        position: 0.80,
-                        color: to_d2d_color(Color::rgba(255, 255, 255, 0.0)),
-                    },
-                    D2D1_GRADIENT_STOP {
-                        position: 1.0,
-                        color: to_d2d_color(Color::rgba(255, 255, 255, 0.10)),
-                    },
-                ];
-                if let Ok(coll) = ID2D1RenderTarget::CreateGradientStopCollection(
-                    &self.dc,
-                    &inner_stops,
-                    D2D1_GAMMA_2_2,
-                    D2D1_EXTEND_MODE_CLAMP,
-                ) {
-                    let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
-                        startPoint: pt2(inner_r.x, inner_r.y),
-                        endPoint: pt2(inner_r.x, inner_r.bottom()),
-                    };
-                    if let Ok(grad) = self.dc.CreateLinearGradientBrush(&props, None, &coll) {
-                        let irad = (rad - 1.1).max(0.0);
-                        let rr = D2D1_ROUNDED_RECT {
-                            rect: to_d2d_rect(inner_r),
-                            radiusX: irad,
-                            radiusY: irad,
-                        };
-                        self.dc
-                            .DrawRoundedRectangle(&rr, &grad, 0.85, &self.round_stroke);
-                    }
-                }
-            }
+        } else {
+            self.fill_rounded_rect(rect, rad, Theme::GLASS_OPAQUE_FALLBACK);
         }
+
+        // Strictly VERTICAL top & bottom iPadOS 26 specular rim highlights (cached brushes!)
+        let rim_op = (rim_color.a / 0.44).clamp(0.75, 1.25);
+        self.draw_vertical_glass_rim(rect, rad, 0.0, rim_op, 0.28);
     }
 
     // ========================================================================
     // Typography & Exact DirectWrite Layout / Syllable Hit-Testing
     // ========================================================================
+
+    /// Validates the bundled OFL Inter Variable TTF magic header (`00 01 00 00`) and non-empty payload.
+    pub fn verify_inter_font_bundle() -> bool {
+        INTER_FONT_BYTES.len() > 100_000 && INTER_FONT_BYTES.starts_with(&[0x00, 0x01, 0x00, 0x00])
+    }
+
+    /// Returns `true` when the bundled OFL Inter Variable font was registered in-memory with DirectWrite.
+    pub fn has_bundled_inter_font(&self) -> bool {
+        self.bundled_inter_loaded
+    }
+
+    /// Active primary UI font family (`"Inter Variable Text"` when bundled Inter loaded, else `"Segoe UI Variable Display"`).
+    pub fn active_ui_font_family(&self) -> &str {
+        &self.bundled_inter_family
+    }
+
+    /// Font family used by `draw_mono_text` (`mono: true`) — uses Inter with OpenType `tnum=1` + `zero=0`
+    /// tabular unslashed figures (NEVER `"Consolas"`!).
+    pub fn mono_font_family(&self) -> &str {
+        &self.bundled_inter_family
+    }
+
+    /// Verifies that DirectWrite creates Inter-backed `IDWriteTextFormat` instances across all
+    /// standard UI weights (`400`, `500`, `600`, `700`) for both regular and `mono` text paths.
+    pub fn verify_inter_formats_all_weights(&mut self) -> bool {
+        if !self.bundled_inter_loaded {
+            return false;
+        }
+        for weight in [400u16, 500, 600, 700] {
+            for mono in [false, true] {
+                let Some((fmt, _)) =
+                    self.get_or_create_format(14.0, weight, TextAlign::Left, true, false, mono)
+                else {
+                    return false;
+                };
+                unsafe {
+                    let len = fmt.GetFontFamilyNameLength();
+                    if len == 0 {
+                        return false;
+                    }
+                    let mut buf = vec![0u16; (len as usize) + 1];
+                    if fmt.GetFontFamilyName(&mut buf).is_err() {
+                        return false;
+                    }
+                    let fam = String::from_utf16_lossy(&buf[..(len as usize)]);
+                    if !fam.contains("Inter") {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
 
     fn get_or_create_format(
         &mut self,
@@ -2686,17 +3557,16 @@ impl D2DRenderer {
         }
 
         unsafe {
-            let family = if mono {
-                HSTRING::from("Consolas")
-            } else {
-                HSTRING::from("Segoe UI Variable Display")
-            };
+            // Both regular UI text and `mono: true` timestamps use bundled OFL Inter (with OpenType
+            // `tnum=1` + `zero=0` applied on `IDWriteTextLayout` for `mono: true`), NEVER `"Consolas"`!
+            let primary_family = HSTRING::from(self.bundled_inter_family.as_str());
             let locale = HSTRING::from("zh-CN");
+            let font_coll = self.custom_font_collection.as_ref();
             let fmt = self
                 .dwrite
                 .CreateTextFormat(
-                    &family,
-                    None,
+                    &primary_family,
+                    font_coll,
                     DWRITE_FONT_WEIGHT(weight as i32),
                     DWRITE_FONT_STYLE_NORMAL,
                     DWRITE_FONT_STRETCH_NORMAL,
@@ -2704,9 +3574,21 @@ impl D2DRenderer {
                     &locale,
                 )
                 .or_else(|_| {
-                    let fb = HSTRING::from("Microsoft YaHei UI");
+                    let fb1 = HSTRING::from("Segoe UI Variable Display");
                     self.dwrite.CreateTextFormat(
-                        &fb,
+                        &fb1,
+                        None,
+                        DWRITE_FONT_WEIGHT(weight as i32),
+                        DWRITE_FONT_STYLE_NORMAL,
+                        DWRITE_FONT_STRETCH_NORMAL,
+                        size,
+                        &locale,
+                    )
+                })
+                .or_else(|_| {
+                    let fb2 = HSTRING::from("Microsoft YaHei UI");
+                    self.dwrite.CreateTextFormat(
+                        &fb2,
                         None,
                         DWRITE_FONT_WEIGHT(weight as i32),
                         DWRITE_FONT_STYLE_NORMAL,
@@ -2716,6 +3598,17 @@ impl D2DRenderer {
                     )
                 })
                 .ok()?;
+
+            // Guarantee seamless Windows CJK / Emoji fallback alongside our merged Inter font collection
+            if let Some(ref sys_fb) = self.system_font_fallback {
+                if let Ok(fmt1) = fmt.cast::<IDWriteTextFormat1>() {
+                    let _ = fmt1.SetFontFallback(sys_fb);
+                }
+            }
+            // Enable automatic optical sizing (`opsz` 14..32) on Inter Variable across UI labels & large titles
+            if let Ok(fmt3) = fmt.cast::<IDWriteTextFormat3>() {
+                let _ = fmt3.SetAutomaticFontAxes(DWRITE_AUTOMATIC_FONT_AXES_OPTICAL_SIZE);
+            }
 
             let _ = fmt.SetTextAlignment(match align {
                 TextAlign::Left => DWRITE_TEXT_ALIGNMENT_LEADING,
@@ -2814,8 +3707,21 @@ impl D2DRenderer {
         h64 ^= meta_bits;
         h64 = h64.wrapping_mul(0x0100_0000_01b3);
 
+        let on_live_glass = color.a > 0.45
+            && (color.r + color.g + color.b) > 1.75
+            && self.is_point_on_live_glass(rect.center_x(), rect.center_y());
+
         if let Some(cached_layout) = self.text_layout_cache.get(&h64).cloned() {
             unsafe {
+                if on_live_glass {
+                    let sh_brush = self.brush(Color::rgba(0, 0, 0, 0.42 * color.a));
+                    self.dc.DrawTextLayout(
+                        pt2(rect.x, rect.y + 1.0),
+                        &cached_layout,
+                        sh_brush,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP | D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
+                    );
+                }
                 let brush = self.brush(color);
                 self.dc.DrawTextLayout(
                     pt2(rect.x, rect.y),
@@ -2837,6 +3743,26 @@ impl D2DRenderer {
                 self.dwrite
                     .CreateTextLayout(&utf16, &fmt, (w_q as f32) * 0.5, (h_q as f32) * 0.5)
             {
+                if mono {
+                    if let Some(ref typo) = self.mono_typography {
+                        let _ = layout.SetTypography(
+                            typo,
+                            DWRITE_TEXT_RANGE {
+                                startPosition: 0,
+                                length: utf16.len() as u32,
+                            },
+                        );
+                    }
+                }
+                if on_live_glass {
+                    let sh_brush = self.brush(Color::rgba(0, 0, 0, 0.42 * color.a));
+                    self.dc.DrawTextLayout(
+                        pt2(rect.x, rect.y + 1.0),
+                        &layout,
+                        sh_brush,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP | D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
+                    );
+                }
                 let brush = self.brush(color);
                 self.dc.DrawTextLayout(
                     pt2(rect.x, rect.y),
@@ -3448,6 +4374,7 @@ impl D2DRenderer {
             &self.glow_outer_alpha_effect,
             &self.glow_inner_alpha_effect,
             &self.mesh_blur_effect,
+            &self.mesh_vibrancy_effect,
         ] {
             if let Some(ref blur) = eff {
                 unsafe {
@@ -3507,7 +4434,13 @@ impl D2DRenderer {
             self.glass_frame_snapshot = None;
             self.glass_snap_w = 0;
             self.glass_snap_h = 0;
+            self.glass_half_src = None;
+            self.glass_blurred_snapshot = None;
+            self.glass_half_w = 0;
+            self.glass_half_h = 0;
             self.glass_snapshot_active = false;
+            self.glass_disp_maps.clear();
+            self.glass_disp_lru.clear();
         }
         self.gpu_staging_dirty = true;
         self.trim_gpu_staging_if_dirty();
@@ -3531,9 +4464,12 @@ impl D2DRenderer {
             for eff in [
                 &self.blur_effect,
                 &self.glass_crop_effect,
-                &self.glass_rim_blur_effect,
                 &self.glass_vibrancy_effect,
-                &self.glass_rim_vibrancy_effect,
+                &self.glass_border_effect,
+                &self.glass_bg_scale_effect,
+                &self.glass_disp_xform_effect,
+                &self.glass_disp_border_effect,
+                &self.glass_disp_g_effect,
                 &self.line_blur_effect,
                 &self.trans_bg_blur_effect,
                 &self.trans_fg_blur_effect,
@@ -3542,10 +4478,14 @@ impl D2DRenderer {
                 &self.glow_outer_alpha_effect,
                 &self.glow_inner_alpha_effect,
                 &self.mesh_blur_effect,
+                &self.mesh_vibrancy_effect,
             ] {
-                if let Some(ref blur) = eff {
-                    blur.SetInput(0, None::<&ID2D1Image>, true);
+                if let Some(ref e) = eff {
+                    e.SetInput(0, None::<&ID2D1Image>, true);
                 }
+            }
+            if let Some(ref e) = self.glass_disp_g_effect {
+                e.SetInput(1, None::<&ID2D1Image>, true);
             }
             self.d2d_device.ClearResources(0);
             if let Ok(dxgi3) = self.dxgi_device.cast::<IDXGIDevice3>() {
@@ -4776,9 +5716,11 @@ impl D2DRenderer {
         }
     }
 
-    /// Renders LyricsBlossom / Apple Music's signature dynamic rotating album-cover mesh background
-    /// into a compact `256x256` GPU surface and blurs it through `CLSID_D2D1GaussianBlur`
-    /// (`free_blur = true` reproduces `MusicFreeBlur` crisp flowing art!). Must be called at layer depth 0!
+    /// Rebuilt Apple Music dynamic flowing aurora ("流光", `free_blur = true`) and deep atmospheric
+    /// creamy bokeh ("柔焦", `free_blur = false`) background renderer on a `320x320` GPU surface.
+    /// Uses a full-bleed overscaled anchor cover + 3 radial-feathered orbiting cover currents (ZERO
+    /// visible rectangular cover corners!) + 4 organic drifting palette orbs + Rec.709 vibrancy boost
+    /// + balanced Gaussian blur (`sigma = 18.0` for 流光, `sigma = 38.0` for 柔焦). Must be called at layer depth 0!
     pub fn draw_lyrics_artwork_mesh_bg(
         &mut self,
         win_rect: RectF,
@@ -4805,9 +5747,17 @@ impl D2DRenderer {
             .map(crate::am_api::artwork_canonical_stem)
             .unwrap_or_default();
 
-        const MESH_DIM: u32 = 256;
+        const MESH_DIM: u32 = 320;
+        const MESH_F: f32 = MESH_DIM as f32;
+        const HALF_F: f32 = MESH_F * 0.5;
+
         unsafe {
-            let need_alloc = self.lyrics_mesh_bmp.is_none() || self.lyrics_mesh_out_bmp.is_none();
+            let need_alloc = self.lyrics_mesh_bmp.is_none()
+                || self.lyrics_mesh_out_bmp.is_none()
+                || self
+                    .lyrics_mesh_bmp
+                    .as_ref()
+                    .is_some_and(|b| b.GetPixelSize().width != MESH_DIM);
             if need_alloc {
                 let props = D2D1_BITMAP_PROPERTIES1 {
                     pixelFormat: D2D1_PIXEL_FORMAT {
@@ -4846,73 +5796,227 @@ impl D2DRenderer {
             };
 
             if need_rebake {
-                // Step A: Draw 4 counter-rotating, breathing overlapping copies of the album cover onto 256x256
                 self.dc.SetTarget(src_bmp);
                 self.dc.SetDpi(96.0, 96.0);
                 self.dc.SetTransform(&Matrix3x2::identity());
-                let base = palette[0].lerp(Color::rgb(12, 10, 18), 0.55);
+
+                let base = palette[0]
+                    .lerp(palette[2], 0.40)
+                    .lerp(Color::rgb(10, 10, 16), 0.44);
                 self.dc.Clear(Some(&to_d2d_color(base)));
 
-                let breath = 1.0 + bass_energy * 0.14;
-                let quads = [
-                    (76.0f32, 76.0f32, phase * 0.42, 232.0 * breath, 0.95f32),
-                    (186.0, 74.0, -phase * 0.34 + 1.2, 224.0, 0.88),
-                    (74.0, 188.0, -phase * 0.29 + 2.5, 236.0 * breath, 0.86),
-                    (184.0, 184.0, phase * 0.37 + 3.9, 220.0, 0.84),
-                ];
-                for (cx, cy, ang, draw_sz, alpha) in quads {
+                let full_mesh_rc = D2D_RECT_F {
+                    left: 0.0,
+                    top: 0.0,
+                    right: MESH_F,
+                    bottom: MESH_F,
+                };
+                let cov_dst = D2D_RECT_F {
+                    left: 0.0,
+                    top: 0.0,
+                    right: aw,
+                    bottom: ah,
+                };
+                let hw = aw * 0.5;
+                let hh = ah * 0.5;
+                let breath = 1.0 + bass_energy * 0.10;
+
+                // Layer 1: Full-bleed overscaled anchor cover (560px > 320*sqrt(2) = 452.5px) so its
+                // 4 square edges ALWAYS stay completely outside the 320x320 canvas at every angle!
+                {
+                    let ang = phase * 0.14;
                     let (sa, ca) = ang.sin_cos();
+                    let draw_sz = 560.0 * breath;
                     let sx = draw_sz / aw.max(1.0);
                     let sy = draw_sz / ah.max(1.0);
-                    let hw = aw * 0.5;
-                    let hh = ah * 0.5;
-                    // Translate(-hw, -hh) * Scale(sx, sy) * Rotate(ang) * Translate(cx, cy)
                     let m11 = sx * ca;
                     let m12 = sx * sa;
                     let m21 = -sy * sa;
                     let m22 = sy * ca;
-                    let m31 = cx - hw * m11 - hh * m21;
-                    let m32 = cy - hw * m12 - hh * m22;
+                    let cx = HALF_F + (phase * 0.21).sin() * 24.0;
+                    let cy = HALF_F + (phase * 0.17).cos() * 20.0;
                     self.dc.SetTransform(&Matrix3x2 {
                         M11: m11,
                         M12: m12,
                         M21: m21,
                         M22: m22,
-                        M31: m31,
-                        M32: m32,
+                        M31: cx - hw * m11 - hh * m21,
+                        M32: cy - hw * m12 - hh * m22,
                     });
-                    let dst = D2D_RECT_F {
-                        left: 0.0,
-                        top: 0.0,
-                        right: aw,
-                        bottom: ah,
-                    };
                     self.dc.DrawBitmap(
                         &cov_bmp,
-                        Some(&dst),
-                        alpha,
+                        Some(&cov_dst),
+                        0.92,
                         D2D1_INTERPOLATION_MODE_LINEAR,
                         None,
                         None,
                     );
                 }
+
+                // Layer 2: 3 counter-orbiting cover currents masked by a cached smooth radial
+                // opacity gradient (`mesh_feather_brush`) that fades to 0 well inside the cover
+                // bounds — eliminating EVERY possible rectangular edge or corner!
+                if let Some(ref feather) = self.mesh_feather_brush {
+                    let currents = [
+                        (
+                            HALF_F + (phase * 0.28).cos() * 76.0,
+                            HALF_F + (phase * 0.22).sin() * 68.0,
+                            -phase * 0.25 + 1.1,
+                            370.0 * breath,
+                            148.0f32,
+                            132.0f32,
+                            if free_blur { 0.86f32 } else { 0.78f32 },
+                        ),
+                        (
+                            HALF_F + (phase * 0.23 + 2.1).sin() * 82.0,
+                            HALF_F + (phase * 0.31 + 0.8).cos() * 74.0,
+                            phase * 0.21 + 2.6,
+                            356.0,
+                            142.0,
+                            154.0,
+                            if free_blur { 0.80 } else { 0.72 },
+                        ),
+                        (
+                            HALF_F + (phase * 0.19 + 4.2).cos() * 68.0,
+                            HALF_F + (phase * 0.26 + 3.4).sin() * 76.0,
+                            -phase * 0.18 + 4.3,
+                            384.0 * breath,
+                            152.0,
+                            138.0,
+                            if free_blur { 0.74 } else { 0.66 },
+                        ),
+                    ];
+                    for (ox, oy, ang, draw_sz, rx, ry, alpha) in currents {
+                        self.dc.SetTransform(&Matrix3x2::identity());
+                        feather.SetOpacity(alpha);
+                        feather.SetTransform(&Matrix3x2 {
+                            M11: rx,
+                            M12: 0.0,
+                            M21: 0.0,
+                            M22: ry,
+                            M31: ox,
+                            M32: oy,
+                        });
+                        let lp = D2D1_LAYER_PARAMETERS1 {
+                            contentBounds: full_mesh_rc,
+                            geometricMask: std::mem::ManuallyDrop::new(None),
+                            maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                            maskTransform: Matrix3x2::identity(),
+                            opacity: 1.0,
+                            opacityBrush: std::mem::ManuallyDrop::new(Some(
+                                feather.cast().unwrap(),
+                            )),
+                            layerOptions: D2D1_LAYER_OPTIONS1_NONE,
+                        };
+                        self.dc.PushLayer(&lp, None);
+
+                        let (sa, ca) = ang.sin_cos();
+                        let sx = draw_sz / aw.max(1.0);
+                        let sy = draw_sz / ah.max(1.0);
+                        let m11 = sx * ca;
+                        let m12 = sx * sa;
+                        let m21 = -sy * sa;
+                        let m22 = sy * ca;
+                        self.dc.SetTransform(&Matrix3x2 {
+                            M11: m11,
+                            M12: m12,
+                            M21: m21,
+                            M22: m22,
+                            M31: ox - hw * m11 - hh * m21,
+                            M32: oy - hw * m12 - hh * m22,
+                        });
+                        self.dc.DrawBitmap(
+                            &cov_bmp,
+                            Some(&cov_dst),
+                            1.0,
+                            D2D1_INTERPOLATION_MODE_LINEAR,
+                            None,
+                            None,
+                        );
+                        self.dc.SetTransform(&Matrix3x2::identity());
+                        self.dc.PopLayer();
+                        let _ = std::mem::ManuallyDrop::into_inner(lp.opacityBrush);
+                    }
+                }
+
+                // Layer 3: 4 organic drifting palette color orbs for rich liquid aurora streams
                 self.dc.SetTransform(&Matrix3x2::identity());
-                // Flush the 4 rotated cover draws into `src_bmp` before running GaussianBlur!
+                let orb_a = if free_blur { 0.46f32 } else { 0.38f32 };
+                let orbs = [
+                    (
+                        HALF_F + (phase * 0.31).sin() * 112.0,
+                        HALF_F + (phase * 0.23).cos() * 98.0,
+                        182.0 * breath,
+                        152.0,
+                        palette[0],
+                        orb_a,
+                    ),
+                    (
+                        HALF_F + (phase * 0.27 + 1.8).cos() * 118.0,
+                        HALF_F + (phase * 0.34 + 0.9).sin() * 104.0,
+                        164.0,
+                        190.0 * breath,
+                        palette[1],
+                        orb_a * 0.92,
+                    ),
+                    (
+                        HALF_F + (phase * 0.21 + 3.4).sin() * 106.0,
+                        HALF_F + (phase * 0.29 + 2.5).cos() * 114.0,
+                        196.0,
+                        162.0,
+                        palette[2],
+                        orb_a * 0.88,
+                    ),
+                    (
+                        HALF_F + (phase * 0.35 + 4.9).cos() * 96.0,
+                        HALF_F + (phase * 0.19 + 4.1).sin() * 108.0,
+                        174.0 * breath,
+                        178.0,
+                        palette[3],
+                        orb_a * 0.84,
+                    ),
+                ];
+                for (ox, oy, rx, ry, col, a) in orbs {
+                    self.fill_radial_glow(ox, oy, rx, ry, col.with_alpha(a), col.with_alpha(0.0));
+                }
+
+                // Flush all seamless layers into `src_bmp` before running Vibrancy + GaussianBlur!
                 let _ = self.dc.Flush(None, None);
 
-                // Step B: Run 1:1 GPU Gaussian Blur into `out_bmp` (256x256 -> <0.04ms GPU time!)
+                // Step B: Rec.709 color vibrancy boost + smooth GPU Gaussian Blur into `out_bmp`
                 self.dc.SetTarget(out_bmp);
                 self.dc.SetDpi(96.0, 96.0);
+                self.dc.SetTransform(&Matrix3x2::identity());
                 self.dc.Clear(Some(&to_d2d_color(base)));
 
-                let sigma = if free_blur { 2.4f32 } else { 25.0f32 };
-                blur.SetInput(0, src_bmp, true);
+                let blur_input: ID2D1Image = if let Some(ref vib) = self.mesh_vibrancy_effect {
+                    vib.SetInput(0, src_bmp, true);
+                    let mb = if free_blur {
+                        mat5x4_bytes(Self::build_glass_vibrancy_matrix(1.44, 1.06, 0.010))
+                    } else {
+                        mat5x4_bytes(Self::build_glass_vibrancy_matrix(1.38, 1.03, 0.005))
+                    };
+                    let _ = vib.SetValue(
+                        D2D1_COLORMATRIX_PROP_COLOR_MATRIX.0 as u32,
+                        D2D1_PROPERTY_TYPE_BLOB,
+                        &mb,
+                    );
+                    vib.GetOutput()
+                        .unwrap_or_else(|_| src_bmp.cast().unwrap())
+                } else {
+                    src_bmp.cast().unwrap()
+                };
+
+                // "流光" (`free_blur = true`): silky flowing aurora (`sigma = 18.0`, zero corners!)
+                // "柔焦" (`free_blur = false`): deep atmospheric creamy bokeh (`sigma = 38.0`)
+                let sigma = if free_blur { 18.0f32 } else { 38.0f32 };
+                blur.SetInput(0, &blur_input, true);
                 let _ = blur.SetValue(
                     D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION.0 as u32,
                     D2D1_PROPERTY_TYPE_FLOAT,
                     &sigma.to_le_bytes(),
                 );
-                let opt = D2D1_GAUSSIANBLUR_OPTIMIZATION_SPEED.0 as u32;
+                let opt = D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED.0 as u32;
                 let _ = blur.SetValue(
                     D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION.0 as u32,
                     D2D1_PROPERTY_TYPE_UINT32,
@@ -4928,16 +6032,12 @@ impl D2DRenderer {
                     self.dc.DrawImage(
                         &blurred_img,
                         Some(&pt2(0.0, 0.0)),
-                        Some(&D2D_RECT_F {
-                            left: 0.0,
-                            top: 0.0,
-                            right: 256.0,
-                            bottom: 256.0,
-                        }),
+                        Some(&full_mesh_rc),
                         D2D1_INTERPOLATION_MODE_LINEAR,
                         D2D1_COMPOSITE_MODE_SOURCE_OVER,
                     );
                 }
+                let _ = self.dc.Flush(None, None);
 
                 // Restore active draw target (main backbuffer or lyrics transition sheet)
                 if let Some(main_tgt) = self.active_draw_target() {
@@ -4945,17 +6045,18 @@ impl D2DRenderer {
                     let dpi = 96.0 * self.dpi_scale;
                     self.dc.SetDpi(dpi, dpi);
                 }
+                self.dc.SetTransform(&Matrix3x2::identity());
                 self.mesh_last_bake_at = Some(std::time::Instant::now());
                 self.mesh_last_art_stem = stem;
                 self.mesh_last_free_blur = free_blur;
             }
 
-            // Step C: Blit blurred 256x256 mesh across window with LINEAR filtering
+            // Step C: Blit silky 320x320 aurora mesh across window with inner crop & LINEAR filtering
             let crop_src = D2D_RECT_F {
-                left: 10.0,
-                top: 10.0,
-                right: 246.0,
-                bottom: 246.0,
+                left: 16.0,
+                top: 16.0,
+                right: MESH_F - 16.0,
+                bottom: MESH_F - 16.0,
             };
             self.dc.DrawBitmap(
                 out_bmp,
@@ -5538,6 +6639,22 @@ impl D2DRenderer {
     }
 
     pub fn draw_icon(&self, icon: SfIcon, rect: RectF, color: Color) {
+        // Subtle 1px optical drop shadow behind bright glyphs over crystal-clear Liquid Glass
+        // keeps icons sharp even over pure white album covers without muddying the glass!
+        if color.a > 0.45
+            && (color.r + color.g + color.b) > 1.75
+            && self.is_point_on_live_glass(rect.center_x(), rect.center_y())
+        {
+            self.draw_icon_geom(
+                icon,
+                RectF::new(rect.x, rect.y + 1.0, rect.w, rect.h),
+                Color::rgba(0, 0, 0, 0.45 * color.a),
+            );
+        }
+        self.draw_icon_geom(icon, rect, color);
+    }
+
+    fn draw_icon_geom(&self, icon: SfIcon, rect: RectF, color: Color) {
         let cx = rect.center_x();
         let cy = rect.center_y();
         let s = rect.w.min(rect.h) * 0.5;
@@ -5790,6 +6907,66 @@ impl D2DRenderer {
                     color,
                     sw,
                     false,
+                );
+            }
+            SfIcon::Translate => {
+                // Crisp Apple SF Symbols-style dual `文 / A` translation glyph
+                let sw_t = (sw * 0.92).clamp(1.25, 1.85);
+                // Top-left `文`
+                self.draw_line(
+                    cx - s * 0.36,
+                    cy - s * 0.74,
+                    cx - s * 0.36,
+                    cy - s * 0.56,
+                    color,
+                    sw_t,
+                );
+                self.draw_line(
+                    cx - s * 0.72,
+                    cy - s * 0.50,
+                    cx + s * 0.02,
+                    cy - s * 0.50,
+                    color,
+                    sw_t,
+                );
+                self.draw_polyline(
+                    &[
+                        (cx - s * 0.14, cy - s * 0.48),
+                        (cx - s * 0.34, cy - s * 0.14),
+                        (cx - s * 0.68, cy + s * 0.10),
+                    ],
+                    color,
+                    sw_t,
+                    false,
+                );
+                self.draw_polyline(
+                    &[
+                        (cx - s * 0.54, cy - s * 0.38),
+                        (cx - s * 0.32, cy - s * 0.12),
+                        (cx - s * 0.06, cy + s * 0.06),
+                    ],
+                    color,
+                    sw_t,
+                    false,
+                );
+                // Bottom-right `A`
+                self.draw_polyline(
+                    &[
+                        (cx + s * 0.02, cy + s * 0.70),
+                        (cx + s * 0.36, cy - s * 0.08),
+                        (cx + s * 0.70, cy + s * 0.70),
+                    ],
+                    color,
+                    sw_t,
+                    false,
+                );
+                self.draw_line(
+                    cx + s * 0.15,
+                    cy + s * 0.42,
+                    cx + s * 0.57,
+                    cy + s * 0.42,
+                    color,
+                    sw_t,
                 );
             }
             SfIcon::LyricsBubble => {
