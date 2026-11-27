@@ -5,6 +5,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -15,6 +16,7 @@ const OFFICIAL_AM_PFN: &str = "AppleInc.AppleMusicWin_nzyj5cx40ttqa";
 
 static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
     reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(6))
         .timeout(Duration::from_secs(15))
         .pool_max_idle_per_host(24)
         .tcp_nodelay(true)
@@ -29,21 +31,157 @@ static HERO_ART_SEM: Lazy<tokio::sync::Semaphore> =
 static ARTWORK_SEM: Lazy<tokio::sync::Semaphore> =
     Lazy::new(|| tokio::sync::Semaphore::new(6));
 
+/// Bounded concurrency semaphore for `art_cache` NVMe/SATA reads so fast scrolling never
+/// floods Tokio's blocking thread pool with 50-140 simultaneous NTFS `fs::read` calls.
+static ART_DISK_READ_SEM: Lazy<tokio::sync::Semaphore> =
+    Lazy::new(|| tokio::sync::Semaphore::new(8));
+
+pub const ART_CACHE_MAX_FILES: usize = 640;
+pub const ART_CACHE_TARGET_FILES: usize = 440;
+pub const ART_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+pub const ART_CACHE_TARGET_BYTES: u64 = 48 * 1024 * 1024;
+const ART_CACHE_PRUNE_WRITE_INTERVAL: u64 = 100;
+
+static ART_CACHE_WRITE_COUNT: AtomicU64 = AtomicU64::new(0);
+static ART_CACHE_PRUNE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static ART_TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Atomically writes artwork bytes into `target` via a unique sibling `.tmp` file + `rename`
+/// so readers never observe truncated/half-written covers.
+pub fn write_artwork_cache_file_atomic(
+    target: &std::path::Path,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    let seq = ART_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = target.with_extension(format!("img.{seq}.tmp"));
+    if let Err(e) = std::fs::write(&tmp, bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    match std::fs::rename(&tmp, target) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            let _ = std::fs::remove_file(target);
+            match std::fs::rename(&tmp, target) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tmp);
+                    Err(e)
+                }
+            }
+        }
+    }
+}
+
+/// Single-pass mtime-LRU pruner for `art_cache` enforcing BOTH file-count and total-byte caps
+/// (`max_files` -> `target_files`, `max_bytes` -> `target_bytes`) while cleaning stale `.tmp` files.
+/// Returns the number of deleted files.
+pub fn prune_art_cache_dir(
+    dir: &std::path::Path,
+    max_files: usize,
+    target_files: usize,
+    max_bytes: u64,
+    target_bytes: u64,
+) -> usize {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let now = SystemTime::now();
+    let mut entries: Vec<(std::path::PathBuf, SystemTime, u64)> = Vec::new();
+    let mut total_bytes: u64 = 0;
+    let mut removed = 0usize;
+
+    for e in rd.flatten() {
+        let Ok(meta) = e.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let path = e.path();
+        let mt = meta.modified().unwrap_or(UNIX_EPOCH);
+        if path.extension().and_then(|x| x.to_str()) == Some("tmp") {
+            let age_ok = now
+                .duration_since(mt)
+                .map(|d| d >= Duration::from_secs(60))
+                .unwrap_or(false);
+            if age_ok && std::fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+            continue;
+        }
+        let len = meta.len();
+        total_bytes = total_bytes.saturating_add(len);
+        entries.push((path, mt, len));
+    }
+
+    if entries.len() > max_files || total_bytes > max_bytes {
+        entries.sort_by_key(|(_, mt, _)| *mt);
+        let mut remaining_files = entries.len();
+        let mut remaining_bytes = total_bytes;
+        for (p, _, len) in entries {
+            if remaining_files <= target_files && remaining_bytes <= target_bytes {
+                break;
+            }
+            if std::fs::remove_file(&p).is_ok() {
+                removed += 1;
+            }
+            remaining_files = remaining_files.saturating_sub(1);
+            remaining_bytes = remaining_bytes.saturating_sub(len);
+        }
+    }
+
+    removed
+}
+
+fn maybe_trigger_runtime_art_cache_prune(dir: std::path::PathBuf) {
+    let writes = ART_CACHE_WRITE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if writes % ART_CACHE_PRUNE_WRITE_INTERVAL != 0 {
+        return;
+    }
+    if ART_CACHE_PRUNE_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    tokio::task::spawn_blocking(move || {
+        struct PruneGuard;
+        impl Drop for PruneGuard {
+            fn drop(&mut self) {
+                ART_CACHE_PRUNE_IN_FLIGHT.store(false, Ordering::Release);
+            }
+        }
+        let _guard = PruneGuard;
+        let _ = prune_art_cache_dir(
+            &dir,
+            ART_CACHE_MAX_FILES,
+            ART_CACHE_TARGET_FILES,
+            ART_CACHE_MAX_BYTES,
+            ART_CACHE_TARGET_BYTES,
+        );
+    });
+}
+
 static ART_DISK_DIR: Lazy<Option<std::path::PathBuf>> = Lazy::new(|| {
     let base = std::env::var_os("LOCALAPPDATA")
         .or_else(|| std::env::var_os("APPDATA"))
         .map(std::path::PathBuf::from)?;
     let dir = base.join("AM-Light").join("art_cache");
     let _ = std::fs::create_dir_all(&dir);
-    // Keep disk cache bounded (< ~600 files) on startup without blocking UI
-    if let Ok(rd) = std::fs::read_dir(&dir) {
-        let entries: Vec<_> = rd.flatten().collect();
-        if entries.len() > 640 {
-            for e in entries.into_iter().take(240) {
-                let _ = std::fs::remove_file(e.path());
-            }
-        }
-    }
+    // Prune disk cache asynchronously off the Tokio worker thread using true mtime LRU!
+    let prune_dir = dir.clone();
+    let _ = std::thread::Builder::new()
+        .name("am-art-cache-prune".to_string())
+        .spawn(move || {
+            let _ = prune_art_cache_dir(
+                &prune_dir,
+                ART_CACHE_MAX_FILES,
+                ART_CACHE_TARGET_FILES,
+                ART_CACHE_MAX_BYTES,
+                ART_CACHE_TARGET_BYTES,
+            );
+        });
     Some(dir)
 });
 
@@ -56,27 +194,111 @@ fn fnv1a_64(s: &str) -> u64 {
     h
 }
 
-/// Normalizes an Apple Music / mzstatic artwork URL across sizes (`120x120`, `240x240`, `360x360`, `600x600`)
-/// to a single canonical identity stem so cached thumbnails seamlessly stand in for hero/lyrics covers
-/// with zero black-frame flicker while higher-res textures decode!
-pub fn artwork_canonical_stem(url: &str) -> String {
-    let t = url.trim();
-    if let Some(slash) = t.rfind('/') {
-        let tail = &t[slash + 1..];
-        let has_dim = tail
-            .chars()
-            .take_while(|c| c.is_ascii_digit() || *c == 'x')
-            .count();
-        if has_dim >= 5 && tail.contains('x') {
-            return t[..slash].to_string();
-        }
+/// Default maximum number of pages to fetch for Apple Music playlists (100 pages * 100/page = 10,000 tracks).
+pub const DEFAULT_PLAYLIST_MAX_PAGES: usize = 100;
+/// Safe batch size for Apple Music library playlist write endpoints (`POST /v1/me/library/playlists` and `/tracks`).
+pub const DEFAULT_LIBRARY_WRITE_BATCH: usize = 50;
+
+fn is_mzstatic_size_tail(tail: &str) -> bool {
+    let Some((w_str, rest)) = tail.split_once('x') else {
+        return false;
+    };
+    if w_str.is_empty() || w_str.len() > 4 || !w_str.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
     }
-    t.to_string()
+    let h_len = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if h_len == 0 || h_len > 4 {
+        return false;
+    }
+    let h_str = &rest[..h_len];
+    let suffix = &rest[h_len..];
+    if suffix.is_empty() || !suffix.contains('.') {
+        return false;
+    }
+    let (Ok(w), Ok(h)) = (w_str.parse::<u32>(), h_str.parse::<u32>()) else {
+        return false;
+    };
+    (16..=8192).contains(&w) && (16..=8192).contains(&h)
 }
 
-/// Fetches album/playlist artwork bytes using zero-RAM local NVMe disk cache + keep-alive TLS connection pool,
-/// with a dedicated priority lane for hero/now-playing artwork so route switches never starve behind grid thumbnails.
-pub async fn fetch_artwork_bytes(url: &str, high_priority: bool) -> Result<Vec<u8>, String> {
+/// Zero-allocation `&str` variant of [`artwork_canonical_stem`]: normalizes an Apple Music / mzstatic
+/// artwork URL across sizes (`120x120`, `240x240`, `360x360`, `600x600`) to a single canonical
+/// identity stem with ZERO heap allocation.
+/// Strictly preserves `smtc://` keys, signed/generated query URLs (e.g. `.../gen/1200x1200AM.*.jpg?...`),
+/// and non-dimension CDN filenames (e.g. NetEase/QQ numeric IDs) so distinct covers NEVER collide.
+pub fn artwork_canonical_stem_ref(url: &str) -> &str {
+    let t = url.trim();
+    if t.starts_with("smtc://") || (!t.starts_with("http://") && !t.starts_with("https://")) {
+        return t;
+    }
+    // Query-bearing URLs (including Apple's `/gen/1200x1200AM.*.jpg?c1=...&t=...` generated playlist art
+    // and signed blobstore URLs) distinguish artwork by query params and must NEVER be collapsed.
+    if t.contains('?') {
+        return t;
+    }
+    if let Some(slash) = t.rfind('/') {
+        let tail = &t[slash + 1..];
+        if is_mzstatic_size_tail(tail) {
+            return &t[..slash];
+        }
+    }
+    t
+}
+
+/// Owned `String` wrapper over [`artwork_canonical_stem_ref`] for backwards compatibility.
+pub fn artwork_canonical_stem(url: &str) -> String {
+    artwork_canonical_stem_ref(url).to_string()
+}
+
+/// Fetches album/playlist artwork bytes with bounded disk-read concurrency (`ART_DISK_READ_SEM(8)`),
+/// atomic `.tmp -> rename` disk caching, periodic runtime LRU pruning (`640 files / 64 MiB`),
+/// and immediate post-semaphore `art_epoch` cancellation checks to eliminate HOL blocking and
+/// stale off-route downloads after page navigation.
+/// When `epoch_guard` is `Some((epoch_atomic, expected_epoch))` and the atomic has moved past
+/// `expected_epoch`, aborts immediately with `Err("CANCELLED".to_string())`.
+pub async fn fetch_artwork_bytes_if_current(
+    url: &str,
+    high_priority: bool,
+    epoch_guard: Option<(&AtomicU64, u64)>,
+) -> Result<Vec<u8>, String> {
+    let is_stale = || {
+        epoch_guard.is_some_and(|(ep, want)| ep.load(Ordering::Acquire) != want)
+    };
+    if is_stale() {
+        return Err("CANCELLED".to_string());
+    }
+
+    let disk_path = ART_DISK_DIR
+        .as_ref()
+        .map(|d| d.join(format!("{:016x}.img", fnv1a_64(url))));
+
+    // Check local NVMe disk cache FIRST behind bounded disk-read semaphore — NEVER block cache hits
+    // behind slow network semaphore slots, and NEVER flood blocking pool with 100+ concurrent NTFS reads!
+    if let Some(ref p) = disk_path {
+        let disk_permit = ART_DISK_READ_SEM
+            .acquire()
+            .await
+            .map_err(|e| format!("disk semaphore closed: {e}"))?;
+        if is_stale() {
+            return Err("CANCELLED".to_string());
+        }
+        let p_read = p.clone();
+        let read_res = tokio::task::spawn_blocking(move || std::fs::read(p_read)).await;
+        drop(disk_permit);
+        if let Ok(Ok(cached)) = read_res {
+            if cached.len() >= 16 {
+                if is_stale() {
+                    return Err("CANCELLED".to_string());
+                }
+                return Ok(cached);
+            }
+        }
+    }
+
+    if is_stale() {
+        return Err("CANCELLED".to_string());
+    }
+
     let sem = if high_priority {
         &*HERO_ART_SEM
     } else {
@@ -87,17 +309,10 @@ pub async fn fetch_artwork_bytes(url: &str, high_priority: bool) -> Result<Vec<u
         .await
         .map_err(|e| format!("semaphore closed: {e}"))?;
 
-    let disk_path = ART_DISK_DIR
-        .as_ref()
-        .map(|d| d.join(format!("{:016x}.img", fnv1a_64(url))));
-
-    if let Some(ref p) = disk_path {
-        let p_read = p.clone();
-        if let Ok(Ok(cached)) = tokio::task::spawn_blocking(move || std::fs::read(p_read)).await {
-            if cached.len() >= 16 {
-                return Ok(cached);
-            }
-        }
+    // CRITICAL (P1-2): Re-check `art_epoch` IMMEDIATELY AFTER acquiring `ARTWORK_SEM(6)`!
+    // Tasks queued before a page navigation drop their permit in <1us with ZERO HTTP traffic!
+    if is_stale() {
+        return Err("CANCELLED".to_string());
     }
 
     let referer = if url.contains("126.net") || url.contains("163.com") {
@@ -109,6 +324,9 @@ pub async fn fetch_artwork_bytes(url: &str, high_priority: bool) -> Result<Vec<u
     };
 
     for attempt in 0..2 {
+        if is_stale() {
+            return Err("CANCELLED".to_string());
+        }
         let res = HTTP_CLIENT
             .get(url)
             .timeout(Duration::from_secs(8))
@@ -122,12 +340,20 @@ pub async fn fetch_artwork_bytes(url: &str, high_priority: bool) -> Result<Vec<u
                     .await
                     .map_err(|e| format!("读取封面字节失败: {e}"))?;
                 if bytes.len() >= 16 {
-                    let vec_b = bytes.to_vec();
                     if let Some(p) = disk_path.clone() {
-                        let wb = vec_b.clone();
-                        let _ = tokio::task::spawn_blocking(move || std::fs::write(p, wb)).await;
+                        let wb = bytes.clone();
+                        let dir_opt = ART_DISK_DIR.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let _ = write_artwork_cache_file_atomic(&p, &wb);
+                        });
+                        if let Some(d) = dir_opt {
+                            maybe_trigger_runtime_art_cache_prune(d);
+                        }
                     }
-                    return Ok(vec_b);
+                    if is_stale() {
+                        return Err("CANCELLED".to_string());
+                    }
+                    return Ok(bytes.to_vec());
                 }
             }
             Ok(resp) if resp.status().as_u16() == 404 => {
@@ -143,7 +369,94 @@ pub async fn fetch_artwork_bytes(url: &str, high_priority: bool) -> Result<Vec<u
     Err("获取封面超时或失败".to_string())
 }
 
-static DEV_TOKEN_CACHE: Lazy<Mutex<Option<CachedDevToken>>> = Lazy::new(|| Mutex::new(None));
+/// Fetches album/playlist artwork bytes using zero-RAM local NVMe disk cache + keep-alive TLS connection pool,
+/// with a dedicated priority lane for hero/now-playing artwork so route switches never starve behind grid thumbnails.
+pub async fn fetch_artwork_bytes(url: &str, high_priority: bool) -> Result<Vec<u8>, String> {
+    fetch_artwork_bytes_if_current(url, high_priority, None).await
+}
+
+/// Async singleflight coordinator for Apple Music Developer Token fetches so concurrent cold-start
+/// or 401-refresh callers share ONE JS bundle download instead of a 3-5x thundering herd.
+pub struct DevTokenSingleflight {
+    cache: Mutex<Option<CachedDevToken>>,
+    fetch_lock: tokio::sync::Mutex<()>,
+    refresh_gen: AtomicU64,
+}
+
+impl Default for DevTokenSingleflight {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DevTokenSingleflight {
+    pub fn new() -> Self {
+        Self {
+            cache: Mutex::new(None),
+            fetch_lock: tokio::sync::Mutex::new(()),
+            refresh_gen: AtomicU64::new(0),
+        }
+    }
+
+    fn token_is_valid(tok: &CachedDevToken, now_secs: u64) -> bool {
+        !tok.token.is_empty()
+            && tok
+                .exp
+                .map(|exp| exp > now_secs.saturating_add(120))
+                .unwrap_or(true)
+    }
+
+    pub fn invalidate(&self) {
+        if let Ok(mut guard) = self.cache.lock() {
+            *guard = None;
+        }
+    }
+
+    pub fn get_cached(&self, now_secs: u64) -> Option<CachedDevToken> {
+        self.cache
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().filter(|t| Self::token_is_valid(t, now_secs)).cloned())
+    }
+
+    pub fn put_cached(&self, tok: CachedDevToken) {
+        if let Ok(mut guard) = self.cache.lock() {
+            *guard = Some(tok);
+        }
+        self.refresh_gen.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Returns a valid cached token immediately, or serializes behind `fetch_lock` so only one
+    /// concurrent caller executes `fetcher`; waiters reuse the freshly fetched token.
+    pub async fn get_or_fetch<F, Fut>(
+        &self,
+        force_refresh: bool,
+        now_secs: u64,
+        fetcher: F,
+    ) -> Result<CachedDevToken, String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<CachedDevToken, String>>,
+    {
+        if !force_refresh {
+            if let Some(tok) = self.get_cached(now_secs) {
+                return Ok(tok);
+            }
+        }
+        let gen_before = self.refresh_gen.load(Ordering::Acquire);
+        let _sf_guard = self.fetch_lock.lock().await;
+        if !force_refresh || self.refresh_gen.load(Ordering::Acquire) != gen_before {
+            if let Some(tok) = self.get_cached(now_secs) {
+                return Ok(tok);
+            }
+        }
+        let tok = fetcher().await?;
+        self.put_cached(tok.clone());
+        Ok(tok)
+    }
+}
+
+static DEV_TOKEN_SF: Lazy<DevTokenSingleflight> = Lazy::new(DevTokenSingleflight::new);
 
 static JWT_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")
@@ -325,9 +638,7 @@ pub fn normalize_user_token(raw: &str) -> String {
 }
 
 pub fn invalidate_dev_token_cache() {
-    if let Ok(mut guard) = DEV_TOKEN_CACHE.lock() {
-        *guard = None;
-    }
+    DEV_TOKEN_SF.invalidate();
     if let Some(p) = dev_token_disk_path() {
         let _ = std::fs::remove_file(p);
     }
@@ -338,119 +649,113 @@ pub async fn get_public_dev_token(
     storefront_hint: Option<&str>,
 ) -> Result<CachedDevToken, String> {
     let now = now_unix_secs();
-    if !force_refresh {
-        if let Ok(mut guard) = DEV_TOKEN_CACHE.lock() {
-            if let Some(cached) = guard.as_ref() {
-                let valid = cached
-                    .exp
-                    .map(|exp| exp > now.saturating_add(120))
-                    .unwrap_or(true);
-                if valid {
-                    return Ok(cached.clone());
-                }
-            } else if let Some(p) = dev_token_disk_path() {
-                if let Ok(txt) = std::fs::read_to_string(p) {
-                    if let Ok(disk_tok) = serde_json::from_str::<CachedDevToken>(&txt) {
-                        let valid = disk_tok
-                            .exp
-                            .map(|exp| exp > now.saturating_add(120))
-                            .unwrap_or(true);
-                        if valid && !disk_tok.token.is_empty() {
-                            *guard = Some(disk_tok.clone());
+    let sf_hint_owned = storefront_hint.map(str::to_string);
+    DEV_TOKEN_SF
+        .get_or_fetch(force_refresh, now, move || async move {
+            if !force_refresh {
+                if let Some(p) = dev_token_disk_path() {
+                    let disk_opt = tokio::task::spawn_blocking(move || {
+                        let txt = std::fs::read_to_string(p).ok()?;
+                        serde_json::from_str::<CachedDevToken>(&txt).ok()
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                    if let Some(disk_tok) = disk_opt {
+                        if DevTokenSingleflight::token_is_valid(&disk_tok, now_unix_secs()) {
                             return Ok(disk_tok);
                         }
                     }
                 }
             }
-        }
-    }
 
-    let mut storefronts = Vec::new();
-    if let Some(sf) = storefront_hint {
-        let sf_clean = sf.trim().to_ascii_lowercase();
-        if !sf_clean.is_empty() && sf_clean.chars().all(|c| c.is_ascii_alphanumeric()) {
-            storefronts.push(sf_clean);
-        }
-    }
-    for fallback in ["cn", "us"] {
-        if !storefronts.iter().any(|s| s == fallback) {
-            storefronts.push(fallback.to_string());
-        }
-    }
-
-    let mut errors = Vec::new();
-    for sf in storefronts {
-        let page_url = format!("{WEB_ORIGIN}/{sf}/browse");
-        let html = match HTTP_CLIENT.get(&page_url).send().await {
-            Ok(resp) if resp.status().is_success() => match resp.text().await {
-                Ok(t) => t,
-                Err(e) => {
-                    errors.push(format!("{page_url}: 读取 HTML 失败 ({e})"));
-                    continue;
+            let mut storefronts = Vec::new();
+            if let Some(ref sf) = sf_hint_owned {
+                let sf_clean = sf.trim().to_ascii_lowercase();
+                if !sf_clean.is_empty() && sf_clean.chars().all(|c| c.is_ascii_alphanumeric()) {
+                    storefronts.push(sf_clean);
                 }
-            },
-            Ok(resp) => {
-                errors.push(format!("{page_url}: HTTP {}", resp.status()));
-                continue;
             }
-            Err(e) => {
-                errors.push(format!("{page_url}: 网络请求失败 ({e})"));
-                continue;
+            for fallback in ["cn", "us"] {
+                if !storefronts.iter().any(|s| s == fallback) {
+                    storefronts.push(fallback.to_string());
+                }
             }
-        };
 
-        let mut bundle_paths = Vec::new();
-        for cap in SCRIPT_SRC_RE.captures_iter(&html) {
-            let p = cap[1].to_string();
-            if !bundle_paths.contains(&p) {
-                bundle_paths.push(p);
-            }
-        }
-
-        if bundle_paths.is_empty() {
-            errors.push(format!("{page_url}: 未找到 index-*.js bundle"));
-            continue;
-        }
-
-        for bundle_path in bundle_paths {
-            let bundle_url = format!("{WEB_ORIGIN}{bundle_path}");
-            let js_text = match HTTP_CLIENT.get(&bundle_url).send().await {
-                Ok(resp) if resp.status().is_success() => match resp.text().await {
-                    Ok(t) => t,
-                    Err(e) => {
-                        errors.push(format!("{bundle_url}: 读取 JS 失败 ({e})"));
+            let mut errors = Vec::new();
+            for sf in storefronts {
+                let page_url = format!("{WEB_ORIGIN}/{sf}/browse");
+                let html = match HTTP_CLIENT.get(&page_url).send().await {
+                    Ok(resp) if resp.status().is_success() => match resp.text().await {
+                        Ok(t) => t,
+                        Err(e) => {
+                            errors.push(format!("{page_url}: 读取 HTML 失败 ({e})"));
+                            continue;
+                        }
+                    },
+                    Ok(resp) => {
+                        errors.push(format!("{page_url}: HTTP {}", resp.status()));
                         continue;
                     }
-                },
-                Ok(resp) => {
-                    errors.push(format!("{bundle_url}: HTTP {}", resp.status()));
-                    continue;
-                }
-                Err(e) => {
-                    errors.push(format!("{bundle_url}: 网络失败 ({e})"));
-                    continue;
-                }
-            };
+                    Err(e) => {
+                        errors.push(format!("{page_url}: 网络请求失败 ({e})"));
+                        continue;
+                    }
+                };
 
-            if let Some(tok) = extract_best_dev_token(&js_text, now_unix_secs()) {
-                if let Ok(mut guard) = DEV_TOKEN_CACHE.lock() {
-                    *guard = Some(tok.clone());
-                }
-                if let Some(p) = dev_token_disk_path() {
-                    if let Ok(json_str) = serde_json::to_string(&tok) {
-                        let _ = std::fs::write(p, json_str);
+                let mut bundle_paths = Vec::new();
+                for cap in SCRIPT_SRC_RE.captures_iter(&html) {
+                    let p = cap[1].to_string();
+                    if !bundle_paths.contains(&p) {
+                        bundle_paths.push(p);
                     }
                 }
-                return Ok(tok);
-            }
-            errors.push(format!("{bundle_url}: bundle 中未匹配到有效 Developer JWT"));
-        }
-    }
 
-    Err(format!(
-        "获取 Apple Music Developer Token 失败: {}",
-        errors.join(" | ")
-    ))
+                if bundle_paths.is_empty() {
+                    errors.push(format!("{page_url}: 未找到 index-*.js bundle"));
+                    continue;
+                }
+
+                for bundle_path in bundle_paths {
+                    let bundle_url = format!("{WEB_ORIGIN}{bundle_path}");
+                    let js_text = match HTTP_CLIENT.get(&bundle_url).send().await {
+                        Ok(resp) if resp.status().is_success() => match resp.text().await {
+                            Ok(t) => t,
+                            Err(e) => {
+                                errors.push(format!("{bundle_url}: 读取 JS 失败 ({e})"));
+                                continue;
+                            }
+                        },
+                        Ok(resp) => {
+                            errors.push(format!("{bundle_url}: HTTP {}", resp.status()));
+                            continue;
+                        }
+                        Err(e) => {
+                            errors.push(format!("{bundle_url}: 网络失败 ({e})"));
+                            continue;
+                        }
+                    };
+
+                    if let Some(tok) = extract_best_dev_token(&js_text, now_unix_secs()) {
+                        if let Some(p) = dev_token_disk_path() {
+                            if let Ok(json_str) = serde_json::to_string(&tok) {
+                                tokio::task::spawn_blocking(move || {
+                                    let _ = std::fs::write(p, json_str);
+                                });
+                            }
+                        }
+                        return Ok(tok);
+                    }
+                    errors.push(format!("{bundle_url}: bundle 中未匹配到有效 Developer JWT"));
+                }
+            }
+
+            Err(format!(
+                "获取 Apple Music Developer Token 失败: {}",
+                errors.join(" | ")
+            ))
+        })
+        .await
 }
 
 fn build_amp_url(path: &str) -> Result<String, String> {
@@ -519,6 +824,10 @@ async fn send_amp_get(
     Ok((status, body))
 }
 
+fn is_retryable_amp_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504)
+}
+
 pub async fn fetch_am_api(
     path: String,
     user_token: Option<String>,
@@ -539,7 +848,7 @@ pub async fn fetch_am_api(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
-    let effective_dev = match &custom_dev {
+    let mut effective_dev = match &custom_dev {
         Some(t) => t.clone(),
         None => {
             get_public_dev_token(false, storefront_hint.as_deref())
@@ -548,25 +857,826 @@ pub async fn fetch_am_api(
         }
     };
 
-    let (mut status, mut body) =
-        send_amp_get(&url, &effective_dev, normalized_user.as_deref()).await?;
+    let mut last_err: Option<String> = None;
+    let mut refreshed_dev = false;
+    let backoffs_ms = [250u64, 650];
 
-    // Retry once with refreshed public Developer Token on 401
-    if status == reqwest::StatusCode::UNAUTHORIZED && custom_dev.is_none() {
-        invalidate_dev_token_cache();
-        if let Ok(fresh) = get_public_dev_token(true, storefront_hint.as_deref()).await {
-            let retry = send_amp_get(&url, &fresh.token, normalized_user.as_deref()).await?;
-            status = retry.0;
-            body = retry.1;
+    for attempt in 0..=backoffs_ms.len() {
+        match send_amp_get(&url, &effective_dev, normalized_user.as_deref()).await {
+            Ok((mut status, mut body)) => {
+                // Retry once with refreshed public Developer Token on 401
+                if status == reqwest::StatusCode::UNAUTHORIZED
+                    && custom_dev.is_none()
+                    && !refreshed_dev
+                {
+                    refreshed_dev = true;
+                    invalidate_dev_token_cache();
+                    if let Ok(fresh) = get_public_dev_token(true, storefront_hint.as_deref()).await
+                    {
+                        effective_dev = fresh.token;
+                        if let Ok(retry) =
+                            send_amp_get(&url, &effective_dev, normalized_user.as_deref()).await
+                        {
+                            status = retry.0;
+                            body = retry.1;
+                        }
+                    }
+                }
+
+                if status.is_success() {
+                    return serde_json::from_str::<Value>(&body)
+                        .map_err(|e| format!("解析 Apple Music JSON 失败: {e}"));
+                }
+
+                let err_msg = format_apple_api_error(status, &body);
+                if is_retryable_amp_status(status) && attempt < backoffs_ms.len() {
+                    last_err = Some(err_msg);
+                    tokio::time::sleep(Duration::from_millis(backoffs_ms[attempt])).await;
+                    continue;
+                }
+                return Err(err_msg);
+            }
+            Err(e) => {
+                if attempt < backoffs_ms.len() {
+                    last_err = Some(e);
+                    tokio::time::sleep(Duration::from_millis(backoffs_ms[attempt])).await;
+                    continue;
+                }
+                return Err(e);
+            }
         }
     }
 
-    if !status.is_success() {
-        return Err(format_apple_api_error(status, &body));
+    Err(last_err.unwrap_or_else(|| "请求 amp-api 失败".to_string()))
+}
+
+/// Splits an AMP relative or absolute path into `(base_path_without_leading_slash, query_pairs)`.
+fn split_amp_path_query(path: &str) -> (String, Vec<(String, String)>) {
+    let trimmed = path.trim();
+    let stripped = trimmed
+        .strip_prefix(AMP_API_BASE)
+        .unwrap_or(trimmed)
+        .trim_start_matches('/');
+    let Some((base, query)) = stripped.split_once('?') else {
+        return (stripped.to_string(), Vec::new());
+    };
+    let pairs: Vec<(String, String)> = query
+        .split('&')
+        .filter(|s| !s.is_empty())
+        .map(|seg| match seg.split_once('=') {
+            Some((k, v)) => (k.to_string(), v.to_string()),
+            None => (seg.to_string(), String::new()),
+        })
+        .collect();
+    (base.to_string(), pairs)
+}
+
+fn join_amp_path_query(base: &str, pairs: &[(String, String)]) -> String {
+    if pairs.is_empty() {
+        return base.to_string();
+    }
+    let q = pairs
+        .iter()
+        .map(|(k, v)| {
+            if v.is_empty() {
+                k.clone()
+            } else {
+                format!("{k}={v}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{base}?{q}")
+}
+
+/// Extracts numeric `limit=...` from an AMP path if present and > 0.
+pub fn parse_amp_limit(path: &str) -> Option<usize> {
+    let (_, pairs) = split_amp_path_query(path);
+    pairs
+        .into_iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("limit"))
+        .and_then(|(_, v)| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+}
+
+/// Builds the next AMP API page path from Apple Music's `"next"` link while preserving important
+/// query parameters (`limit`, `include`, `extend`, `l`, etc.) from `initial_path` that Apple's
+/// pagination cursor frequently drops on page 2+, and guarding against Apple's library API quirk
+/// where `"next"` omits the `/tracks` suffix.
+pub fn build_next_amp_path(initial_path: &str, next_href: &str) -> String {
+    let (init_base, init_pairs) = split_amp_path_query(initial_path);
+    let (mut next_base, mut next_pairs) = split_amp_path_query(next_href);
+
+    // Guard against known Apple Music library API bug where `next` drops `/tracks`
+    // (e.g. `/v1/me/library/playlists/{id}?offset=100` instead of `.../tracks?offset=100`).
+    if init_base.ends_with("/tracks") && !next_base.ends_with("/tracks") {
+        let stripped_init = init_base.trim_end_matches("/tracks");
+        if next_base.is_empty() || next_base == stripped_init {
+            next_base = init_base.clone();
+        }
+    } else if next_base.is_empty() {
+        next_base = init_base.clone();
     }
 
-    serde_json::from_str::<Value>(&body)
-        .map_err(|e| format!("解析 Apple Music JSON 失败: {e}"))
+    for (k, v) in init_pairs {
+        if k.eq_ignore_ascii_case("offset") {
+            continue;
+        }
+        let already = next_pairs
+            .iter()
+            .any(|(nk, _)| nk.eq_ignore_ascii_case(&k));
+        if !already {
+            next_pairs.push((k, v));
+        }
+    }
+
+    // Ensure `/tracks` endpoints always retain `limit=100` on page 2+ rather than dropping to Apple's default 25.
+    if next_base.ends_with("/tracks")
+        && !next_pairs
+            .iter()
+            .any(|(nk, _)| nk.eq_ignore_ascii_case("limit"))
+    {
+        next_pairs.push(("limit".to_string(), "100".to_string()));
+    }
+
+    join_amp_path_query(&next_base, &next_pairs)
+}
+
+/// Builds a stripped fallback path from Apple's raw `"next"` link keeping only `limit` and `l`
+/// (dropping `include`/`extend`) in case an endpoint rejects extra query params with HTTP 400 on page 2+.
+fn build_minimal_next_amp_path(initial_path: &str, next_href: &str) -> String {
+    let (init_base, init_pairs) = split_amp_path_query(initial_path);
+    let (mut next_base, mut next_pairs) = split_amp_path_query(next_href);
+    if init_base.ends_with("/tracks") && !next_base.ends_with("/tracks") {
+        let stripped_init = init_base.trim_end_matches("/tracks");
+        if next_base.is_empty() || next_base == stripped_init {
+            next_base = init_base;
+        }
+    } else if next_base.is_empty() {
+        next_base = init_base;
+    }
+    for (k, v) in init_pairs {
+        if k.eq_ignore_ascii_case("limit") || k.eq_ignore_ascii_case("l") {
+            if !next_pairs.iter().any(|(nk, _)| nk.eq_ignore_ascii_case(&k)) {
+                next_pairs.push((k, v));
+            }
+        }
+    }
+    join_amp_path_query(&next_base, &next_pairs)
+}
+
+/// Replaces or appends `offset={offset}` on an AMP path while preserving all other query params.
+pub fn build_offset_amp_path(initial_path: &str, offset: usize) -> String {
+    let (base, init_pairs) = split_amp_path_query(initial_path);
+    let mut pairs: Vec<(String, String)> = init_pairs
+        .into_iter()
+        .filter(|(k, _)| !k.eq_ignore_ascii_case("offset"))
+        .collect();
+    pairs.push(("offset".to_string(), offset.to_string()));
+    join_amp_path_query(&base, &pairs)
+}
+
+/// Builds an offset-paginated path combining `initial_path` and Apple's `"next"` link (when present)
+/// so both `initial_path`'s query params and any extra base/params from `next_href` are preserved.
+pub fn build_offset_from_next_amp_path(
+    initial_path: &str,
+    next_href: Option<&str>,
+    offset: usize,
+) -> String {
+    match next_href {
+        Some(nh) if !nh.trim().is_empty() => {
+            let merged = build_next_amp_path(initial_path, nh);
+            build_offset_amp_path(&merged, offset)
+        }
+        _ => build_offset_amp_path(initial_path, offset),
+    }
+}
+
+/// Extracts numeric `offset=...` from an Apple Music `"next"` link if present.
+pub fn parse_next_offset(next_href: &str) -> Option<usize> {
+    let (_, pairs) = split_amp_path_query(next_href);
+    pairs
+        .into_iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("offset"))
+        .and_then(|(_, v)| v.parse::<usize>().ok())
+}
+
+fn page_fingerprint(items: &[Value]) -> Option<(usize, String, String)> {
+    if items.is_empty() {
+        return None;
+    }
+    let item_sig = |v: &Value| -> String {
+        if let Some(id) = v.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+            return id.to_string();
+        }
+        let nm = v
+            .pointer("/attributes/name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let ar = v
+            .pointer("/attributes/artistName")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        format!("{nm}\x1f{ar}")
+    };
+    Some((
+        items.len(),
+        item_sig(items.first().unwrap()),
+        item_sig(items.last().unwrap()),
+    ))
+}
+
+fn push_amp_items(
+    out: &mut Vec<Value>,
+    seen_ids: &mut HashSet<String>,
+    items: Vec<Value>,
+    dedupe_by_id: bool,
+) {
+    for item in items {
+        if dedupe_by_id {
+            if let Some(id) = item.get("id").and_then(Value::as_str) {
+                if !id.is_empty() && !seen_ids.insert(id.to_string()) {
+                    continue;
+                }
+            }
+        }
+        out.push(item);
+    }
+}
+
+async fn fetch_amp_page_with_400_fallback<F, Fut>(
+    fetcher: &F,
+    initial_path: &str,
+    primary_path: &str,
+    raw_next_href: Option<&str>,
+) -> Result<Value, String>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Result<Value, String>>,
+{
+    match fetcher(primary_path.to_string()).await {
+        Ok(json) => Ok(json),
+        Err(err) => {
+            if err.contains("HTTP 400") {
+                if let Some(nh) = raw_next_href {
+                    let minimal = build_minimal_next_amp_path(initial_path, nh);
+                    if minimal != primary_path {
+                        if let Ok(json) = fetcher(minimal).await {
+                            return Ok(json);
+                        }
+                    }
+                    let raw_clean = nh.trim().trim_start_matches('/').to_string();
+                    if !raw_clean.is_empty() && raw_clean != primary_path {
+                        if let Ok(json) = fetcher(raw_clean).await {
+                            return Ok(json);
+                        }
+                    }
+                }
+            }
+            Err(err)
+        }
+    }
+}
+
+async fn join_batch_up_to_4<F, Fut>(
+    fetcher: &F,
+    chunk: &[(usize, String)],
+) -> Vec<(usize, String, Result<Value, String>)>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Result<Value, String>>,
+{
+    match chunk {
+        [] => Vec::new(),
+        [(o0, p0)] => {
+            let r0 = fetcher(p0.clone()).await;
+            vec![(*o0, p0.clone(), r0)]
+        }
+        [(o0, p0), (o1, p1)] => {
+            let (r0, r1) = tokio::join!(fetcher(p0.clone()), fetcher(p1.clone()));
+            vec![(*o0, p0.clone(), r0), (*o1, p1.clone(), r1)]
+        }
+        [(o0, p0), (o1, p1), (o2, p2)] => {
+            let (r0, r1, r2) =
+                tokio::join!(fetcher(p0.clone()), fetcher(p1.clone()), fetcher(p2.clone()));
+            vec![
+                (*o0, p0.clone(), r0),
+                (*o1, p1.clone(), r1),
+                (*o2, p2.clone(), r2),
+            ]
+        }
+        [(o0, p0), (o1, p1), (o2, p2), (o3, p3), ..] => {
+            let (r0, r1, r2, r3) = tokio::join!(
+                fetcher(p0.clone()),
+                fetcher(p1.clone()),
+                fetcher(p2.clone()),
+                fetcher(p3.clone()),
+            );
+            vec![
+                (*o0, p0.clone(), r0),
+                (*o1, p1.clone(), r1),
+                (*o2, p2.clone(), r2),
+                (*o3, p3.clone(), r3),
+            ]
+        }
+    }
+}
+
+/// Core Apple Music pagination engine decoupled from the network transport so both production
+/// HTTP calls and offline unit tests exercise the exact same pagination, parallel fast-path,
+/// partial-failure sequential recovery, implicit offset probing, and duplicate-page protection.
+pub async fn paginate_am_pages_with_fetcher<F, Fut>(
+    initial_path: &str,
+    first_items: Vec<Value>,
+    mut next_href: Option<String>,
+    total_hint: Option<usize>,
+    max_pages: usize,
+    dedupe_by_id: bool,
+    fetcher: F,
+) -> Vec<Value>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Result<Value, String>>,
+{
+    let first_len = first_items.len();
+    let mut out = Vec::with_capacity(
+        total_hint
+            .map(|t| t.min(first_len.max(100).saturating_mul(max_pages.max(1))))
+            .unwrap_or(first_len),
+    );
+    let mut seen_ids: HashSet<String> = HashSet::new();
+    let mut seen_page_fps: HashSet<(usize, String, String)> = HashSet::new();
+    if let Some(fp) = page_fingerprint(&first_items) {
+        seen_page_fps.insert(fp);
+    }
+    push_amp_items(&mut out, &mut seen_ids, first_items, dedupe_by_id);
+
+    let max_extra_pages = max_pages.saturating_sub(1);
+    if max_extra_pages == 0 {
+        return out;
+    }
+
+    let (init_base, _) = split_amp_path_query(initial_path);
+    let requested_limit = parse_amp_limit(initial_path).unwrap_or(100);
+    let mut effective_total = total_hint;
+    let mut probing_implicit_offset = false;
+
+    // Synthesize offset continuation when Apple omits `"next"` despite `meta.total > first_len`,
+    // or when a `/tracks` page hits the full `limit` ceiling (e.g. 100 tracks) with no `meta.total`
+    // (guards against Apple Music's known omitted-`next` bug on large playlists).
+    if next_href.is_none() && first_len > 0 {
+        if effective_total.is_some_and(|t| t > first_len) {
+            next_href = Some(build_offset_amp_path(initial_path, first_len));
+            probing_implicit_offset = true;
+        } else if effective_total.is_none()
+            && init_base.ends_with("/tracks")
+            && first_len >= requested_limit
+        {
+            next_href = Some(build_offset_amp_path(initial_path, first_len));
+            probing_implicit_offset = true;
+        }
+    }
+
+    if next_href.is_none() {
+        return out;
+    }
+
+    let mut pages_fetched = 0usize;
+    let mut visited: HashSet<String> = HashSet::new();
+
+    // Fast path: when Apple returns `meta.total` AND numeric `offset == first_len`, fetch pages 2..N
+    // concurrently in ordered chunks of 4 over HTTP/2 keep-alive. On any partial batch failure,
+    // NEVER discard `next_href` — seamlessly hand off the failed offset to the sequential recovery loop!
+    if let (Some(total), Some(orig_nh)) = (effective_total, next_href.clone()) {
+        if first_len > 0 && total > first_len {
+            if let Some(next_off) = parse_next_offset(&orig_nh) {
+                if next_off == first_len {
+                    let mut offsets: Vec<(usize, String)> = Vec::new();
+                    let mut off = first_len;
+                    while off < total && offsets.len() < max_extra_pages {
+                        let p = build_offset_from_next_amp_path(initial_path, Some(&orig_nh), off);
+                        offsets.push((off, p));
+                        off = off.saturating_add(first_len);
+                    }
+                    let mut last_page_next: Option<String> = None;
+                    let mut recovery_next: Option<String> = None;
+                    let mut stopped_early = false;
+                    let mut batch_cache: HashMap<usize, Value> = HashMap::new();
+
+                    for chunk in offsets.chunks(4) {
+                        let results = join_batch_up_to_4(&fetcher, chunk).await;
+                        for (idx_in_chunk, (o, p, res)) in results.into_iter().enumerate() {
+                            if stopped_early {
+                                if let Ok(ok_json) = res {
+                                    batch_cache.insert(o, ok_json);
+                                }
+                                continue;
+                            }
+                            match res {
+                                Ok(json) => {
+                                    visited.insert(p);
+                                    pages_fetched += 1;
+                                    let items = json
+                                        .get("data")
+                                        .and_then(Value::as_array)
+                                        .cloned()
+                                        .unwrap_or_default();
+                                    let got_empty = items.is_empty();
+                                    let dup_page = page_fingerprint(&items)
+                                        .is_some_and(|fp| !seen_page_fps.insert(fp));
+                                    if got_empty || dup_page {
+                                        last_page_next = None;
+                                        recovery_next = None;
+                                        stopped_early = true;
+                                        continue;
+                                    }
+                                    push_amp_items(&mut out, &mut seen_ids, items, dedupe_by_id);
+                                    last_page_next = json
+                                        .get("next")
+                                        .and_then(Value::as_str)
+                                        .map(|s| s.to_string())
+                                        .filter(|s| !s.trim().is_empty());
+                                }
+                                Err(err) => {
+                                    // If a trailing page past actual playlist length returns 404 after
+                                    // the prior page already had no `"next"`, treat as clean EOF.
+                                    let clean_eof = err.contains("HTTP 404")
+                                        && idx_in_chunk > 0
+                                        && last_page_next.is_none();
+                                    if clean_eof {
+                                        last_page_next = None;
+                                        recovery_next = None;
+                                    } else {
+                                        // Hand off the exact failed offset to sequential recovery loop
+                                        // (which also handles HTTP 400 stripped-param fallback)!
+                                        recovery_next = Some(
+                                            last_page_next.take().unwrap_or_else(|| {
+                                                build_offset_from_next_amp_path(
+                                                    initial_path,
+                                                    Some(&orig_nh),
+                                                    o,
+                                                )
+                                            }),
+                                        );
+                                    }
+                                    stopped_early = true;
+                                }
+                            }
+                        }
+                        if stopped_early {
+                            break;
+                        }
+                    }
+
+                    // If recovery_next is set and we already cached later pages from the same chunk,
+                    // keep them ready for instant consumption once the single failed offset succeeds!
+                    if recovery_next.is_some() {
+                        next_href = recovery_next;
+                    } else if stopped_early {
+                        next_href = None;
+                    } else {
+                        next_href = last_page_next;
+                    }
+
+                    // Drain sequential loop with `batch_cache` reuse below
+                    while pages_fetched < max_extra_pages {
+                        let Some(nh) = next_href.take() else {
+                            break;
+                        };
+                        let next_path = build_next_amp_path(initial_path, &nh);
+                        if !visited.insert(next_path.clone()) {
+                            break;
+                        }
+                        let cur_off = parse_next_offset(&next_path);
+                        let res = if let Some(cached_json) =
+                            cur_off.and_then(|co| batch_cache.remove(&co))
+                        {
+                            Ok(cached_json)
+                        } else {
+                            fetch_amp_page_with_400_fallback(
+                                &fetcher,
+                                initial_path,
+                                &next_path,
+                                Some(&nh),
+                            )
+                            .await
+                        };
+                        match res {
+                            Ok(json) => {
+                                pages_fetched += 1;
+                                let items = json
+                                    .get("data")
+                                    .and_then(Value::as_array)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                if items.is_empty() {
+                                    break;
+                                }
+                                if page_fingerprint(&items)
+                                    .is_some_and(|fp| !seen_page_fps.insert(fp))
+                                {
+                                    break;
+                                }
+                                let page_len = items.len();
+                                push_amp_items(&mut out, &mut seen_ids, items, dedupe_by_id);
+                                if let Some(t) = json
+                                    .pointer("/meta/total")
+                                    .and_then(Value::as_u64)
+                                    .map(|n| n as usize)
+                                {
+                                    effective_total = Some(effective_total.map_or(t, |e| e.max(t)));
+                                }
+                                let json_next = json
+                                    .get("next")
+                                    .and_then(Value::as_str)
+                                    .map(|s| s.to_string())
+                                    .filter(|s| !s.trim().is_empty());
+                                if json_next.is_some() {
+                                    next_href = json_next;
+                                } else if let Some(co) = cur_off {
+                                    let advance = co.saturating_add(page_len);
+                                    if effective_total.is_some_and(|t| advance < t) {
+                                        next_href = Some(build_offset_from_next_amp_path(
+                                            initial_path,
+                                            Some(&nh),
+                                            advance,
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    return out;
+                }
+            }
+        }
+    }
+
+    // Sequential `"next"` cursor & implicit-offset traversal (handles opaque cursors,
+    // missing `meta.total`, omitted `"next"` at full-page ceiling, or overflow past `meta.total`)
+    while pages_fetched < max_extra_pages {
+        let Some(nh) = next_href.take() else {
+            break;
+        };
+        let next_path = build_next_amp_path(initial_path, &nh);
+        if !visited.insert(next_path.clone()) {
+            break;
+        }
+        let cur_off = parse_next_offset(&next_path);
+        match fetch_amp_page_with_400_fallback(&fetcher, initial_path, &next_path, Some(&nh)).await
+        {
+            Ok(json) => {
+                pages_fetched += 1;
+                let items = json
+                    .get("data")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                if items.is_empty() {
+                    break;
+                }
+                if page_fingerprint(&items).is_some_and(|fp| !seen_page_fps.insert(fp)) {
+                    break;
+                }
+                let page_len = items.len();
+                push_amp_items(&mut out, &mut seen_ids, items, dedupe_by_id);
+                if let Some(t) = json
+                    .pointer("/meta/total")
+                    .and_then(Value::as_u64)
+                    .map(|n| n as usize)
+                {
+                    effective_total = Some(effective_total.map_or(t, |e| e.max(t)));
+                }
+                let json_next = json
+                    .get("next")
+                    .and_then(Value::as_str)
+                    .map(|s| s.to_string())
+                    .filter(|s| !s.trim().is_empty());
+                if json_next.is_some() {
+                    next_href = json_next;
+                } else if let Some(co) = cur_off {
+                    let advance = co.saturating_add(page_len);
+                    let more_by_total = effective_total.is_some_and(|t| advance < t);
+                    let more_by_full_page = effective_total.is_none()
+                        && (probing_implicit_offset || init_base.ends_with("/tracks"))
+                        && page_len >= requested_limit;
+                    if more_by_total || more_by_full_page {
+                        probing_implicit_offset = true;
+                        next_href = Some(build_offset_from_next_amp_path(
+                            initial_path,
+                            Some(&nh),
+                            advance,
+                        ));
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    out
+}
+
+/// Follows remaining Apple Music API pages given page 1's `data`, optional `"next"` href,
+/// and optional `meta.total` hint. Uses bounded 4-way parallel offset fetching when `meta.total`
+/// and numeric `offset=` align, and safely falls back to sequential `"next"` traversal otherwise.
+pub async fn fetch_am_remaining_pages(
+    initial_path: &str,
+    first_items: Vec<Value>,
+    next_href: Option<String>,
+    total_hint: Option<usize>,
+    user_token: Option<String>,
+    storefront_hint: Option<String>,
+    max_pages: usize,
+    dedupe_by_id: bool,
+) -> Vec<Value> {
+    paginate_am_pages_with_fetcher(
+        initial_path,
+        first_items,
+        next_href,
+        total_hint,
+        max_pages,
+        dedupe_by_id,
+        move |p| {
+            let ut = user_token.clone();
+            let sf = storefront_hint.clone();
+            async move { fetch_am_api(p, ut, None, sf).await }
+        },
+    )
+    .await
+}
+
+/// Fetches all pages of an Apple Music API collection endpoint (`data` + `"next"` cursor),
+/// preserving query parameters (`include`, `extend`, `limit`, `l`) across every page.
+pub async fn fetch_am_paginated_data(
+    initial_path: &str,
+    user_token: Option<String>,
+    storefront_hint: Option<String>,
+    max_pages: usize,
+    dedupe_by_id: bool,
+) -> Result<Vec<Value>, String> {
+    let first_json = fetch_am_api(
+        initial_path.to_string(),
+        user_token.clone(),
+        None,
+        storefront_hint.clone(),
+    )
+    .await?;
+    let first_items = first_json
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let first_next = first_json
+        .get("next")
+        .and_then(Value::as_str)
+        .map(|s| s.to_string())
+        .filter(|s| !s.trim().is_empty());
+    let total_hint = first_json
+        .pointer("/meta/total")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize);
+    Ok(fetch_am_remaining_pages(
+        initial_path,
+        first_items,
+        first_next,
+        total_hint,
+        user_token,
+        storefront_hint,
+        max_pages,
+        dedupe_by_id,
+    )
+    .await)
+}
+
+/// Fetches all tracks of an Apple Music catalog playlist or album given the container root JSON
+/// (`data[0]` from `v1/catalog/{sf}/{kind}/{id}?include=tracks...`), transparently paginating
+/// beyond Apple's 100-item inline relationship cap even when `relationships.tracks.next` is omitted.
+pub async fn fetch_catalog_container_remaining_tracks(
+    sf: &str,
+    kind: &str,
+    id: &str,
+    root: &Value,
+    user_token: Option<String>,
+    max_pages: usize,
+) -> Vec<Value> {
+    let first_items = root
+        .pointer("/relationships/tracks/data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let tracks_next = root
+        .pointer("/relationships/tracks/next")
+        .and_then(Value::as_str)
+        .map(|s| s.to_string())
+        .filter(|s| !s.trim().is_empty());
+    let tracks_total = root
+        .pointer("/relationships/tracks/meta/total")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize);
+
+    let needs_more = tracks_next.is_some()
+        || tracks_total.is_some_and(|t| t > first_items.len())
+        || (kind == "playlists" && first_items.len() >= 100);
+    if !needs_more {
+        return first_items;
+    }
+
+    let base_tracks_path =
+        format!("v1/catalog/{sf}/{kind}/{id}/tracks?extend=audioTraits&limit=100&l=zh-Hans-CN");
+    fetch_am_remaining_pages(
+        &base_tracks_path,
+        first_items,
+        tracks_next,
+        tracks_total,
+        user_token,
+        Some(sf.to_string()),
+        max_pages.max(1),
+        false,
+    )
+    .await
+}
+
+/// Fetches all tracks of an Apple Music library playlist or library album across all pages
+/// (`v1/me/library/{sub}/{id}/tracks?include=catalog&extend=audioTraits&limit=100&l=zh-Hans-CN`),
+/// transparently falling back to `v1/catalog/{sf}/{sub}/{catalog_id}/tracks` when the library
+/// endpoint returns 404/empty (subscribed catalog playlists) or truncates a subscribed playlist at 100.
+pub async fn fetch_library_container_tracks(
+    sub: &str,
+    id: &str,
+    catalog_id_hint: Option<&str>,
+    user_token: Option<String>,
+    storefront: &str,
+    max_pages: usize,
+) -> Result<Vec<Value>, String> {
+    let sf = if storefront.trim().is_empty() {
+        "cn"
+    } else {
+        storefront.trim()
+    };
+    let tracks_path = format!(
+        "v1/me/library/{sub}/{id}/tracks?include=catalog&extend=audioTraits&limit=100&l=zh-Hans-CN"
+    );
+    let tr_res = fetch_am_paginated_data(
+        &tracks_path,
+        user_token.clone(),
+        Some(sf.to_string()),
+        max_pages.max(1),
+        false,
+    )
+    .await;
+
+    let mut items = match tr_res {
+        Ok(v) => v,
+        Err(err) => {
+            if let Some(cid) = catalog_id_hint.map(str::trim).filter(|s| !s.is_empty()) {
+                let cat_path = format!(
+                    "v1/catalog/{sf}/{sub}/{cid}/tracks?extend=audioTraits&limit=100&l=zh-Hans-CN"
+                );
+                match fetch_am_paginated_data(
+                    &cat_path,
+                    user_token.clone(),
+                    Some(sf.to_string()),
+                    max_pages.max(1),
+                    false,
+                )
+                .await
+                {
+                    Ok(cat_items) => return Ok(cat_items),
+                    Err(_) => return Err(err),
+                }
+            }
+            return Err(err);
+        }
+    };
+
+    // Subscribed catalog playlists occasionally return empty or truncate at 100 on the library endpoint;
+    // cross-check the catalog endpoint when `catalog_id_hint` is known!
+    if (items.is_empty() || (sub == "playlists" && items.len() == 100))
+        && catalog_id_hint.is_some_and(|s| !s.trim().is_empty())
+    {
+        if let Some(cid) = catalog_id_hint.map(str::trim).filter(|s| !s.is_empty()) {
+            let cat_path = format!(
+                "v1/catalog/{sf}/{sub}/{cid}/tracks?extend=audioTraits&limit=100&l=zh-Hans-CN"
+            );
+            if let Ok(cat_items) = fetch_am_paginated_data(
+                &cat_path,
+                user_token,
+                Some(sf.to_string()),
+                max_pages.max(1),
+                false,
+            )
+            .await
+            {
+                if cat_items.len() > items.len() {
+                    items = cat_items;
+                }
+            }
+        }
+    }
+
+    Ok(items)
 }
 
 async fn send_amp_post(
@@ -627,8 +1737,23 @@ async fn send_amp_post_json(
     Ok((status, body))
 }
 
+/// Sanitizes and partitions song IDs into ordered Apple Music library playlist write batches.
+pub fn chunk_library_playlist_song_ids(song_ids: &[String], batch_size: usize) -> Vec<Vec<String>> {
+    let step = batch_size.max(1);
+    let clean: Vec<String> = song_ids
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| {
+            !s.is_empty()
+                && s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+        })
+        .collect();
+    clean.chunks(step).map(|c| c.to_vec()).collect()
+}
+
 /// Creates a new cloud library playlist on Apple Music (`POST /v1/me/library/playlists`)
-/// and optionally seeds it with matched catalog song IDs (chunked cleanly for large playlists).
+/// and optionally seeds it with matched catalog song IDs (chunked cleanly for arbitrarily large playlists).
 pub async fn create_library_playlist(
     name: &str,
     description: &str,
@@ -645,20 +1770,22 @@ pub async fn create_library_playlist(
                 .to_string()
         })?;
 
-    let clean_ids: Vec<String> = catalog_song_ids
-        .iter()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_'))
-        .collect();
-
-    let first_batch: Vec<Value> = clean_ids
-        .iter()
-        .take(50)
-        .map(|id| {
-            let ty = if id.starts_with("i.") { "library-songs" } else { "songs" };
-            serde_json::json!({ "id": id, "type": ty })
+    let batches = chunk_library_playlist_song_ids(catalog_song_ids, DEFAULT_LIBRARY_WRITE_BATCH);
+    let first_batch: Vec<Value> = batches
+        .first()
+        .map(|ids| {
+            ids.iter()
+                .map(|id| {
+                    let ty = if id.starts_with("i.") {
+                        "library-songs"
+                    } else {
+                        "songs"
+                    };
+                    serde_json::json!({ "id": id, "type": ty })
+                })
+                .collect()
         })
-        .collect();
+        .unwrap_or_default();
 
     let payload = if first_batch.is_empty() {
         serde_json::json!({
@@ -699,28 +1826,27 @@ pub async fn create_library_playlist(
         .and_then(|j| j.pointer("/data/0/id").and_then(Value::as_str).map(|s| s.to_string()))
         .unwrap_or_default();
 
-    if !playlist_id.is_empty() && clean_ids.len() > 50 {
-        for chunk in clean_ids[50..].chunks(50) {
-            let _ = add_tracks_to_library_playlist(
-                &playlist_id,
-                chunk,
-                Some(normalized_user.clone()),
-                storefront_hint.clone(),
-            )
-            .await;
-        }
+    if !playlist_id.is_empty() && batches.len() > 1 {
+        let remaining: Vec<String> = batches[1..].iter().flatten().cloned().collect();
+        add_tracks_to_library_playlist_internal(
+            &playlist_id,
+            &remaining,
+            Some(normalized_user),
+            storefront_hint,
+            true,
+        )
+        .await?;
     }
 
     Ok(playlist_id)
 }
 
-/// Appends catalog/library tracks to an existing Apple Music cloud library playlist
-/// (`POST /v1/me/library/playlists/{playlist_id}/tracks`).
-pub async fn add_tracks_to_library_playlist(
+async fn add_tracks_to_library_playlist_internal(
     playlist_id: &str,
     song_ids: &[String],
     user_token: Option<String>,
     storefront_hint: Option<String>,
+    retry_404_after_create: bool,
 ) -> Result<(), String> {
     let normalized_user = user_token
         .as_deref()
@@ -734,34 +1860,86 @@ pub async fn add_tracks_to_library_playlist(
     if pid.is_empty() {
         return Err("无效的目标歌单 ID".to_string());
     }
-    let items: Vec<Value> = song_ids
-        .iter()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|id| {
-            let ty = if id.starts_with("i.") { "library-songs" } else { "songs" };
-            serde_json::json!({ "id": id, "type": ty })
-        })
-        .collect();
-    if items.is_empty() {
+    let batches = chunk_library_playlist_song_ids(song_ids, DEFAULT_LIBRARY_WRITE_BATCH);
+    if batches.is_empty() {
         return Err("没有可添加的有效歌曲 ID".to_string());
     }
-    let payload = serde_json::json!({ "data": items });
     let url = format!("{AMP_API_BASE}v1/me/library/playlists/{pid}/tracks");
-    let dev = get_public_dev_token(false, storefront_hint.as_deref()).await?;
-    let (mut status, mut body) = send_amp_post_json(&url, &dev.token, &normalized_user, &payload).await?;
-    if status == reqwest::StatusCode::UNAUTHORIZED {
-        invalidate_dev_token_cache();
-        if let Ok(fresh) = get_public_dev_token(true, storefront_hint.as_deref()).await {
-            let retry = send_amp_post_json(&url, &fresh.token, &normalized_user, &payload).await?;
-            status = retry.0;
-            body = retry.1;
+    let mut dev_tok = get_public_dev_token(false, storefront_hint.as_deref())
+        .await?
+        .token;
+    let backoffs_ms = [350u64, 800, 1500];
+
+    for (batch_idx, chunk) in batches.iter().enumerate() {
+        if batch_idx > 0 {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+        }
+        let items: Vec<Value> = chunk
+            .iter()
+            .map(|id| {
+                let ty = if id.starts_with("i.") {
+                    "library-songs"
+                } else {
+                    "songs"
+                };
+                serde_json::json!({ "id": id, "type": ty })
+            })
+            .collect();
+        let payload = serde_json::json!({ "data": items });
+        let mut refreshed_dev = false;
+
+        for attempt in 0..=backoffs_ms.len() {
+            match send_amp_post_json(&url, &dev_tok, &normalized_user, &payload).await {
+                Ok((mut status, mut body)) => {
+                    if status == reqwest::StatusCode::UNAUTHORIZED && !refreshed_dev {
+                        refreshed_dev = true;
+                        invalidate_dev_token_cache();
+                        if let Ok(fresh) =
+                            get_public_dev_token(true, storefront_hint.as_deref()).await
+                        {
+                            dev_tok = fresh.token;
+                            if let Ok(retry) =
+                                send_amp_post_json(&url, &dev_tok, &normalized_user, &payload).await
+                            {
+                                status = retry.0;
+                                body = retry.1;
+                            }
+                        }
+                    }
+                    if status.is_success() {
+                        break;
+                    }
+                    let should_retry = is_retryable_amp_status(status)
+                        || (retry_404_after_create && status == reqwest::StatusCode::NOT_FOUND);
+                    if should_retry && attempt < backoffs_ms.len() {
+                        tokio::time::sleep(Duration::from_millis(backoffs_ms[attempt])).await;
+                        continue;
+                    }
+                    return Err(format_apple_api_error(status, &body));
+                }
+                Err(e) => {
+                    if attempt < backoffs_ms.len() {
+                        tokio::time::sleep(Duration::from_millis(backoffs_ms[attempt])).await;
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
         }
     }
-    if !status.is_success() {
-        return Err(format_apple_api_error(status, &body));
-    }
     Ok(())
+}
+
+/// Appends catalog/library tracks to an existing Apple Music cloud library playlist
+/// (`POST /v1/me/library/playlists/{playlist_id}/tracks`), automatically chunking large lists.
+pub async fn add_tracks_to_library_playlist(
+    playlist_id: &str,
+    song_ids: &[String],
+    user_token: Option<String>,
+    storefront_hint: Option<String>,
+) -> Result<(), String> {
+    add_tracks_to_library_playlist_internal(playlist_id, song_ids, user_token, storefront_hint, false)
+        .await
 }
 
 /// Resolves an Apple Music artist ID & canonical name from an artist display string.
@@ -1175,17 +2353,29 @@ pub fn launch_official_apple_music_uri(uri: &str) -> Result<(), String> {
     use windows::core::{HSTRING, PCWSTR};
     use windows::Foundation::Uri;
     use windows::System::{Launcher, LauncherOptions};
-    use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
     let musics_uri = convert_to_musics_uri(uri)?;
 
-    let winrt_attempt = (|| -> Result<bool, String> {
-        unsafe {
-            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-            let _ = crate::am_agent::init_process_com_security();
+    struct WinrtComGuard(bool);
+    impl Drop for WinrtComGuard {
+        fn drop(&mut self) {
+            if self.0 {
+                unsafe {
+                    CoUninitialize();
+                }
+            }
         }
+    }
+
+    let winrt_attempt = (|| -> Result<bool, String> {
+        let _com_guard = unsafe {
+            let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
+            let _ = crate::am_agent::init_process_com_security();
+            WinrtComGuard(hr.0 == 0 || hr.0 == 1)
+        };
         let target = Uri::CreateUri(&HSTRING::from(&musics_uri))
             .map_err(|e| format!("构造 URI 失败: {e}"))?;
         let options = LauncherOptions::new().map_err(|e| format!("创建 LauncherOptions 失败: {e}"))?;
@@ -2720,13 +3910,85 @@ where
     out
 }
 
+#[inline]
+pub fn is_apple_catalog_numeric_id(raw: &str) -> bool {
+    let t = raw.trim();
+    !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn strip_album_edition_suffix(raw: &str) -> &str {
+    let t = raw.trim();
+    for sep in [" - Single", " - EP", " - single", " - ep", " – Single", " – EP"] {
+        if let Some(prefix) = t.strip_suffix(sep) {
+            return prefix.trim();
+        }
+    }
+    t
+}
+
+fn artist_tokens_match(want_artist: &str, cand_artist: &str) -> bool {
+    let wa = crate::backends::normalize_match_text(want_artist);
+    let ca = crate::backends::normalize_match_text(cand_artist);
+    if wa.is_empty() || ca.is_empty() {
+        return false;
+    }
+    if wa == ca {
+        return true;
+    }
+    let split_tokens = |s: &str| -> Vec<String> {
+        s.split(&['/', ',', '&', '、', '，', ';'][..])
+            .map(crate::backends::normalize_match_text)
+            .filter(|p| !p.is_empty())
+            .collect()
+    };
+    let w_parts = split_tokens(want_artist);
+    let c_parts = split_tokens(cand_artist);
+    w_parts.iter().any(|wp| {
+        c_parts.iter().any(|cp| {
+            cp == wp
+                || (wp.chars().count() >= 2
+                    && cp.chars().count() >= 2
+                    && (cp.contains(wp) || wp.contains(cp)))
+        })
+    })
+}
+
+/// Strictly validates whether an Apple Music album search candidate matches the playing track's
+/// artist AND album (or single title when album is absent) before adopting its editorial motion video.
+/// Prevents unrelated albums' motion covers from overwriting the playing song's real cover artwork.
+pub fn motion_album_candidate_matches(
+    want_title: &str,
+    want_artist: &str,
+    want_album: &str,
+    cand_album_name: &str,
+    cand_artist_name: &str,
+) -> bool {
+    if !artist_tokens_match(want_artist, cand_artist_name) {
+        return false;
+    }
+    let cand_norm = crate::backends::normalize_match_text(strip_album_edition_suffix(cand_album_name));
+    if cand_norm.is_empty() {
+        return false;
+    }
+    let alb_norm = crate::backends::normalize_match_text(strip_album_edition_suffix(want_album));
+    if !alb_norm.is_empty() {
+        if cand_norm == alb_norm {
+            return true;
+        }
+        let min_chars = cand_norm.chars().count().min(alb_norm.chars().count());
+        return min_chars >= 3 && (cand_norm.contains(&alb_norm) || alb_norm.contains(&cand_norm));
+    }
+    let title_norm = crate::backends::normalize_match_text(strip_album_edition_suffix(want_title));
+    !title_norm.is_empty() && cand_norm == title_norm
+}
+
 pub async fn fetch_album_motion_video_url(
     storefront: &str,
     album_or_song_id: &str,
     is_song: bool,
 ) -> Option<String> {
     let clean_id = album_or_song_id.trim();
-    if clean_id.is_empty() || clean_id.starts_with("i.") {
+    if !is_apple_catalog_numeric_id(clean_id) {
         return None;
     }
     let sf = if storefront.trim().is_empty() {
@@ -2769,7 +4031,7 @@ pub async fn fetch_album_motion_video_url(
             .pointer("/data/0/relationships/albums/data/0/id")
             .and_then(Value::as_str)
             .map(str::trim)
-            .filter(|s| !s.is_empty())
+            .filter(|s| is_apple_catalog_numeric_id(s))
         {
             let alb_path =
                 format!("v1/catalog/{sf}/albums/{alb_id}?extend=editorialVideo&l=zh-Hans-CN");
@@ -2785,6 +4047,22 @@ pub async fn fetch_album_motion_video_url(
     None
 }
 
+/// Returns the ordered list of Apple Music storefronts to probe sequentially for motion artwork:
+/// always queries the active storefront FIRST and only falls back to `"us"` when active != `"us"`.
+pub fn ordered_motion_probe_storefronts(storefront: &str) -> Vec<String> {
+    let sf = storefront.trim().to_ascii_lowercase();
+    let active = if sf.is_empty() {
+        "cn".to_string()
+    } else {
+        sf
+    };
+    if active == "us" {
+        vec![active]
+    } else {
+        vec![active, "us".to_string()]
+    }
+}
+
 pub async fn fetch_track_motion_video_url(
     storefront: &str,
     adam_id: Option<&str>,
@@ -2792,30 +4070,17 @@ pub async fn fetch_track_motion_video_url(
     artist: &str,
     album: &str,
 ) -> Option<String> {
-    let sf = if storefront.trim().is_empty() {
-        "cn"
-    } else {
-        storefront.trim()
-    };
-    let storefronts: Vec<&str> = if sf.eq_ignore_ascii_case("us") {
-        vec![sf]
-    } else {
-        vec![sf, "us"]
-    };
+    // P1-5: Query the active storefront FIRST and only fall back to `"us"` on miss,
+    // halving per-track-switch motion probe API requests on non-US accounts!
+    let storefronts = ordered_motion_probe_storefronts(storefront);
     if let Some(id) = adam_id
         .map(str::trim)
-        .filter(|s| !s.is_empty() && !s.starts_with("i."))
+        .filter(|s| is_apple_catalog_numeric_id(s))
     {
-        if storefronts.len() == 2 {
-            let (r1, r2) = tokio::join!(
-                fetch_album_motion_video_url(storefronts[0], id, true),
-                fetch_album_motion_video_url(storefronts[1], id, true),
-            );
-            if let Some(url) = r1.or(r2) {
+        for try_sf in &storefronts {
+            if let Some(url) = fetch_album_motion_video_url(try_sf, id, true).await {
                 return Some(url);
             }
-        } else if let Some(url) = fetch_album_motion_video_url(storefronts[0], id, true).await {
-            return Some(url);
         }
     }
     let query_raw = if !album.trim().is_empty() && !artist.trim().is_empty() {
@@ -2826,48 +4091,42 @@ pub async fn fetch_track_motion_video_url(
         return None;
     };
     let encoded: String = url::form_urlencoded::byte_serialize(query_raw.as_bytes()).collect();
-    let alb_low = album.trim().to_ascii_lowercase();
-    let search_in_sf = |try_sf: String| {
-        let enc_s = encoded.clone();
-        let alb_l = alb_low.clone();
-        async move {
-            let search_path = format!(
-                "v1/catalog/{try_sf}/search?types=albums&term={enc_s}&limit=5&extend=editorialVideo&l=zh-Hans-CN"
-            );
-            let json = fetch_am_api(search_path, None, None, Some(try_sf))
-                .await
-                .ok()?;
-            let albums = json.pointer("/results/albums/data").and_then(Value::as_array)?;
-            let mut fallback_vid: Option<String> = None;
-            for alb in albums {
-                if let Some(attrs) = alb.get("attributes") {
-                    if let Some(v) = extract_editorial_motion_video_from_attrs(attrs) {
-                        let name_low = attrs
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_ascii_lowercase();
-                        if alb_l.is_empty()
-                            || name_low.contains(&alb_l)
-                            || alb_l.contains(&name_low)
-                        {
-                            return Some(v);
-                        }
-                        if fallback_vid.is_none() {
-                            fallback_vid = Some(v);
-                        }
+    let title_s = title.trim().to_string();
+    let artist_s = artist.trim().to_string();
+    let album_s = album.trim().to_string();
+    for try_sf in storefronts {
+        let search_path = format!(
+            "v1/catalog/{try_sf}/search?types=albums&term={encoded}&limit=5&extend=editorialVideo&l=zh-Hans-CN"
+        );
+        let Ok(json) = fetch_am_api(search_path, None, None, Some(try_sf)).await else {
+            continue;
+        };
+        let Some(albums) = json.pointer("/results/albums/data").and_then(Value::as_array) else {
+            continue;
+        };
+        for alb in albums {
+            if let Some(attrs) = alb.get("attributes") {
+                if let Some(v) = extract_editorial_motion_video_from_attrs(attrs) {
+                    let cand_name = attrs
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let cand_artist = attrs
+                        .get("artistName")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if motion_album_candidate_matches(
+                        &title_s,
+                        &artist_s,
+                        &album_s,
+                        cand_name,
+                        cand_artist,
+                    ) {
+                        return Some(v);
                     }
                 }
             }
-            fallback_vid
         }
-    };
-    if storefronts.len() == 2 {
-        let (r1, r2) = tokio::join!(
-            search_in_sf(storefronts[0].to_string()),
-            search_in_sf(storefronts[1].to_string()),
-        );
-        return r1.or(r2);
     }
-    search_in_sf(storefronts[0].to_string()).await
+    None
 }

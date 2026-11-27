@@ -3,6 +3,40 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const DRM_FIX_REPO_URL: &str = "https://github.com/N20xDuli/apple-music-windows-drm-fix";
+pub const MAX_DRM_BACKUPS: usize = 3;
+
+/// Retains only the newest `keep_latest` `amfix-backup-*` directories under `backup_root_parent`
+/// and deletes older backup folders to prevent unbounded disk growth. Returns pruned count.
+pub fn prune_old_drm_backups(backup_root_parent: &Path, keep_latest: usize) -> usize {
+    let Ok(rd) = fs::read_dir(backup_root_parent) else {
+        return 0;
+    };
+    let mut dirs: Vec<(u64, SystemTime, String, PathBuf)> = rd
+        .flatten()
+        .filter_map(|ent| {
+            let meta = ent.metadata().ok()?;
+            if !meta.is_dir() {
+                return None;
+            }
+            let name = ent.file_name().to_str()?.to_string();
+            let ts_suffix = name.strip_prefix("amfix-backup-")?.parse::<u64>().unwrap_or(0);
+            let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
+            Some((ts_suffix, mtime, name, ent.path()))
+        })
+        .collect();
+    if dirs.len() <= keep_latest {
+        return 0;
+    }
+    // Sort newest first by parsed timestamp suffix, then mtime, then directory name.
+    dirs.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)).then_with(|| b.2.cmp(&a.2)));
+    let mut removed = 0usize;
+    for (_, _, _, path) in dirs.into_iter().skip(keep_latest) {
+        if fs::remove_dir_all(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DrmDiagReport {
@@ -431,6 +465,8 @@ pub fn run_elevated_drm_repair_blocking() -> Result<String, String> {
             ));
         }
     }
+
+    let _ = prune_old_drm_backups(&backup_root_parent, MAX_DRM_BACKUPS);
 
     Ok(format!(
         "DRM 修复已完成（已自动备份至 {}），请先打开原版 Apple Music 播放任意歌曲完成授权重建",

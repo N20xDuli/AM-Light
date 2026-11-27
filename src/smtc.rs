@@ -56,31 +56,225 @@ impl PartialEq for SmtcState {
 
 static SMTC_EVENT_SEQ: AtomicU64 = AtomicU64::new(0);
 static SMTC_MEDIA_DIRTY: AtomicBool = AtomicBool::new(true);
+static SMTC_PUB_ENABLED: AtomicBool = AtomicBool::new(false);
 
 #[inline]
 pub fn smtc_event_seq() -> u64 {
     SMTC_EVENT_SEQ.load(Ordering::Acquire)
 }
 
+#[inline]
+pub fn is_publisher_enabled() -> bool {
+    SMTC_PUB_ENABLED.load(Ordering::Acquire)
+}
+
+/// Incoming playback control command received from Windows System Media Transport Controls
+/// (`Win + A` media card, Lock Screen, keyboard media keys, Bluetooth headsets, or Lyricify).
+#[derive(Clone, Debug, PartialEq)]
+pub enum SmtcPublishedCommand {
+    Play,
+    Pause,
+    Stop,
+    Next,
+    Previous,
+    SeekSec(f64),
+}
+
+/// Snapshot of AM-Light's built-in playback state published out to Windows SMTC.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SmtcPublishPayload {
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub status: String,
+    pub position_sec: f64,
+    pub duration_sec: f64,
+    pub track_key: String,
+}
+
+/// Defense-in-depth AUMID check so AM-Light's SMTC consumer never binds to its own published session.
+#[inline]
+pub fn is_self_aumid(app_id_lower: &str) -> bool {
+    app_id_lower.contains("am-light") || app_id_lower.contains("amlight")
+}
+
+const SMTC_STALE_THUMB_WINDOW_MS: u64 = 2_500;
+
+#[inline]
+fn smtc_thumb_fnv1a_64(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in s.as_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+/// Computes the album-level artwork identity for SMTC cross-track stale-thumbnail detection.
+/// Tracks sharing the same non-empty album legitimately share cover art (0ms instant display);
+/// tracks on different albums (or lacking album metadata) must not inherit the outgoing track's
+/// delayed SMTC thumbnail during the ~2.5s async flush window.
+pub fn smtc_album_identity_key(title: &str, artist: &str, album: &str) -> String {
+    let al = album.trim().to_lowercase();
+    let ar = artist.trim().to_lowercase();
+    if !al.is_empty() {
+        format!("alb:{ar}\x1f{al}")
+    } else {
+        format!("trk:{}\x1f{ar}", title.trim().to_lowercase())
+    }
+}
+
+/// Deterministic SMTC thumbnail cache + cross-track stale-bleed guard.
+/// Prevents Apple Music / external SMTC's async two-phase `MediaPropertiesChanged`
+/// (title/artist updates before `Thumbnail` finishes flushing) from permanently locking
+/// the previous song's cover art onto the new song.
+#[derive(Clone, Debug, Default)]
+pub struct SmtcThumbCacheState {
+    pub current_track_key: String,
+    pub current_album_key: String,
+    pub current_thumb_b64: Option<String>,
+    pub current_thumb_hash: Option<u64>,
+    pub prev_album_key: String,
+    pub prev_thumb_hash: Option<u64>,
+    pub track_switched_at_ms: u64,
+    pub awaiting_fresh_thumb: bool,
+}
+
+impl SmtcThumbCacheState {
+    pub fn should_read_thumbnail(&self, track_key: &str, media_dirty: bool) -> bool {
+        media_dirty
+            || self.current_track_key != track_key
+            || self.current_thumb_b64.is_none()
+            || self.awaiting_fresh_thumb
+    }
+
+    pub fn is_awaiting_fresh_thumb(&self) -> bool {
+        self.awaiting_fresh_thumb
+    }
+
+    pub fn cached_thumbnail(&self, track_key: &str) -> Option<String> {
+        if self.current_track_key == track_key {
+            self.current_thumb_b64.clone()
+        } else {
+            None
+        }
+    }
+
+    pub fn commit_read_thumbnail(
+        &mut self,
+        track_key: &str,
+        title: &str,
+        artist: &str,
+        album: &str,
+        fresh_b64: Option<String>,
+        now_ms: u64,
+    ) -> Option<String> {
+        let new_album_key = smtc_album_identity_key(title, artist, album);
+        if self.current_track_key != track_key {
+            if self.current_thumb_hash.is_some() && !self.current_album_key.is_empty() {
+                self.prev_album_key = self.current_album_key.clone();
+                self.prev_thumb_hash = self.current_thumb_hash;
+            }
+            self.current_track_key = track_key.to_string();
+            self.current_album_key = new_album_key.clone();
+            self.track_switched_at_ms = now_ms;
+            self.current_thumb_b64 = None;
+            self.current_thumb_hash = None;
+            self.awaiting_fresh_thumb = false;
+        }
+
+        let fresh_hash = fresh_b64
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(smtc_thumb_fnv1a_64);
+        let different_album = !self.prev_album_key.is_empty()
+            && !new_album_key.is_empty()
+            && self.prev_album_key != new_album_key;
+        let same_as_prev_bytes = fresh_hash.is_some() && fresh_hash == self.prev_thumb_hash;
+        let within_bleed_window =
+            now_ms.saturating_sub(self.track_switched_at_ms) < SMTC_STALE_THUMB_WINDOW_MS;
+
+        if different_album && same_as_prev_bytes && within_bleed_window {
+            self.current_thumb_b64 = None;
+            self.current_thumb_hash = None;
+            self.awaiting_fresh_thumb = true;
+            return None;
+        }
+
+        if let Some(b64) = fresh_b64.filter(|s| !s.is_empty()) {
+            self.current_thumb_b64 = Some(b64.clone());
+            self.current_thumb_hash = fresh_hash;
+            self.awaiting_fresh_thumb = false;
+            Some(b64)
+        } else {
+            self.current_thumb_b64 = None;
+            self.current_thumb_hash = None;
+            self.awaiting_fresh_thumb = true;
+            None
+        }
+    }
+
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// Pure deterministic timeline update policy for SMTC publishing:
+/// immediately updates on track switch, play/pause toggle, seek, duration change,
+/// playback drift >0.35s, paused seek >0.20s, or gentle 5s heartbeat while playing.
+#[inline]
+pub fn compute_timeline_should_update(
+    force: bool,
+    track_changed: bool,
+    status_changed: bool,
+    is_playing: bool,
+    cur_pos: f64,
+    cur_dur: f64,
+    last_pos: f64,
+    last_dur: f64,
+    elapsed_sec: f64,
+) -> bool {
+    if force || track_changed || status_changed || (cur_dur - last_dur).abs() > 0.25 {
+        return true;
+    }
+    if is_playing {
+        let predicted = last_pos + elapsed_sec.max(0.0);
+        (cur_pos - predicted).abs() > 0.35 || elapsed_sec >= 5.0
+    } else {
+        (cur_pos - last_pos).abs() > 0.20
+    }
+}
+
 #[cfg(target_os = "windows")]
 mod win {
     use super::*;
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
     use std::sync::{Mutex, OnceLock};
-    use windows::core::{Interface, BOOL, PWSTR};
-    use windows::Foundation::TypedEventHandler;
+    use windows::core::{Interface, BOOL, HSTRING, PWSTR};
+    use windows::Foundation::{TimeSpan, TypedEventHandler};
     use windows::Media::Control::{
         GlobalSystemMediaTransportControlsSession,
         GlobalSystemMediaTransportControlsSessionManager,
         GlobalSystemMediaTransportControlsSessionPlaybackStatus, MediaPropertiesChangedEventArgs,
         PlaybackInfoChangedEventArgs, SessionsChangedEventArgs, TimelinePropertiesChangedEventArgs,
     };
-    use windows::Storage::Streams::DataReader;
+    use windows::Media::{
+        MediaPlaybackStatus, MediaPlaybackType, PlaybackPositionChangeRequestedEventArgs,
+        SystemMediaTransportControls, SystemMediaTransportControlsButton,
+        SystemMediaTransportControlsButtonPressedEventArgs,
+        SystemMediaTransportControlsTimelineProperties,
+    };
+    use windows::Storage::Streams::{
+        DataReader, DataWriter, InMemoryRandomAccessStream, RandomAccessStreamReference,
+    };
     use windows::Win32::Foundation::{HWND, LPARAM};
-    use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
     use windows::Win32::System::Threading::{
         OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
         PROCESS_QUERY_LIMITED_INFORMATION,
     };
+    use windows::Win32::System::WinRT::ISystemMediaTransportControlsInterop;
     use windows::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GetWindowThreadProcessId, IsIconic, IsWindowVisible, ShowWindow, SW_MINIMIZE,
     };
@@ -89,15 +283,46 @@ mod win {
     /// Sub-second WinRT/SMTC event IPC lag compensation (`LyricsBlossom` `0x40210c`: `now - 295ms`).
     const ROLLOVER_IPC_COMP_SEC: f64 = 0.295;
 
-    fn ensure_com() {
-        unsafe {
-            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-            let _ = crate::am_agent::init_process_com_security();
+    struct SmtcComGuard {
+        should_uninit: bool,
+    }
+
+    impl Drop for SmtcComGuard {
+        fn drop(&mut self) {
+            if self.should_uninit {
+                unsafe {
+                    CoUninitialize();
+                }
+            }
         }
+    }
+
+    thread_local! {
+        static SMTC_COM_GUARD: RefCell<Option<SmtcComGuard>> = const { RefCell::new(None) };
+    }
+
+    fn ensure_com() {
+        SMTC_COM_GUARD.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            if slot.is_none() {
+                unsafe {
+                    // Initialize MTA COM once per thread and pair it with CoUninitialize on thread exit.
+                    // Only call CoUninitialize if CoInitializeEx succeeded (S_OK / S_FALSE); never on RPC_E_CHANGED_MODE.
+                    let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
+                    *slot = Some(SmtcComGuard {
+                        should_uninit: hr.is_ok(),
+                    });
+                    let _ = crate::am_agent::init_process_com_security();
+                }
+            }
+        });
     }
 
     #[inline]
     fn is_apple_music_aumid(app_id_lower: &str) -> bool {
+        if is_self_aumid(app_id_lower) {
+            return false;
+        }
         app_id_lower.contains("applemusic")
             || app_id_lower.contains("apple.music")
             || app_id_lower.contains("music.ui")
@@ -163,7 +388,20 @@ mod win {
     }
 
     static SMTC_TRACKER: OnceLock<Mutex<SmtcTracker>> = OnceLock::new();
-    static SMTC_THUMB_CACHE: OnceLock<Mutex<(String, Option<String>)>> = OnceLock::new();
+    static SMTC_THUMB_CACHE: OnceLock<Mutex<SmtcThumbCacheState>> = OnceLock::new();
+    static SMTC_EPOCH_START: OnceLock<Instant> = OnceLock::new();
+
+    #[inline]
+    fn smtc_now_ms() -> u64 {
+        SMTC_EPOCH_START
+            .get_or_init(Instant::now)
+            .elapsed()
+            .as_millis() as u64
+    }
+
+    fn thumb_cache_mtx() -> &'static Mutex<SmtcThumbCacheState> {
+        SMTC_THUMB_CACHE.get_or_init(|| Mutex::new(SmtcThumbCacheState::default()))
+    }
 
     fn tracker_mtx() -> &'static Mutex<SmtcTracker> {
         SMTC_TRACKER.get_or_init(|| Mutex::new(SmtcTracker::default()))
@@ -366,6 +604,11 @@ mod win {
                 tr.bound_raw_ptr = 0;
                 tr.has_cal = false;
                 tr.cal_trusted = false;
+                tr.cached_title.clear();
+                tr.cached_artist.clear();
+                tr.cached_album.clear();
+                tr.cached_thumb = None;
+                tr.last_media_fetch = None;
                 let old_s = tr.bound_session.take()?;
                 Some((
                     old_s,
@@ -374,6 +617,9 @@ mod win {
                     tr.mp_token.take(),
                 ))
             });
+            if let Ok(mut tc) = thumb_cache_mtx().lock() {
+                tc.clear();
+            }
             if let Some((old_s, tl_t, pb_t, mp_t)) = prev_unbind {
                 if let Some(t) = tl_t {
                     let _ = old_s.RemoveTimelinePropertiesChanged(t);
@@ -458,11 +704,19 @@ mod win {
                 tr.tl_token = tl_tok;
                 tr.pb_token = pb_tok;
                 tr.mp_token = mp_tok;
+                tr.cached_title.clear();
+                tr.cached_artist.clear();
+                tr.cached_album.clear();
+                tr.cached_thumb = None;
+                tr.last_media_fetch = None;
                 tr.prev_raw_ticks = -1;
                 tr.has_cal = false;
                 tr.cal_trusted = false;
                 tr.cal_anchor_inst = None;
                 tr.paused_pos_sec = None;
+            }
+            if let Ok(mut tc) = thumb_cache_mtx().lock() {
+                tc.clear();
             }
         }
 
@@ -514,15 +768,22 @@ mod win {
         }
         .to_string();
 
-        // Refresh MediaProperties immediately on `MediaPropertiesChanged`, empty cache, or 2.0s watchdog (`#7` `0x404ca5`)
-        let need_media_fetch = SMTC_MEDIA_DIRTY.swap(false, Ordering::AcqRel)
+        // Refresh MediaProperties immediately on `MediaPropertiesChanged`, empty cache,
+        // 250ms retry while awaiting a delayed fresh thumbnail, or 2.0s watchdog (`#7` `0x404ca5`).
+        let media_dirty = SMTC_MEDIA_DIRTY.swap(false, Ordering::AcqRel);
+        let awaiting_thumb = thumb_cache_mtx()
+            .lock()
+            .map(|g| g.is_awaiting_fresh_thumb())
+            .unwrap_or(false);
+        let watchdog_ms = if awaiting_thumb { 250u64 } else { 2000u64 };
+        let need_media_fetch = media_dirty
             || tracker_mtx()
                 .lock()
                 .map(|tr| {
                     tr.cached_title.is_empty()
                         || tr
                             .last_media_fetch
-                            .is_none_or(|t0| t0.elapsed() >= Duration::from_millis(2000))
+                            .is_none_or(|t0| t0.elapsed() >= Duration::from_millis(watchdog_ms))
                 })
                 .unwrap_or(true);
 
@@ -540,25 +801,25 @@ mod win {
                         .map(|h| h.to_string_lossy())
                         .unwrap_or_default();
                     let thumb_key = format!("{t}\x1f{ar}\x1f{al}");
-                    let cache_mtx = SMTC_THUMB_CACHE
-                        .get_or_init(|| Mutex::new((String::new(), None)));
                     let thumb = if !t.is_empty() {
-                        let cached_hit = cache_mtx.lock().ok().and_then(|g| {
-                            if g.0 == thumb_key {
-                                Some(g.1.clone())
-                            } else {
-                                None
-                            }
-                        });
-                        match cached_hit {
-                            Some(existing) => existing,
-                            None => {
-                                let fresh = read_thumbnail_b64(&props);
-                                if let Ok(mut g) = cache_mtx.lock() {
-                                    *g = (thumb_key, fresh.clone());
-                                }
-                                fresh
-                            }
+                        let should_read = thumb_cache_mtx()
+                            .lock()
+                            .map(|g| g.should_read_thumbnail(&thumb_key, media_dirty))
+                            .unwrap_or(true);
+                        if should_read {
+                            let fresh = read_thumbnail_b64(&props);
+                            let now_ms = smtc_now_ms();
+                            thumb_cache_mtx()
+                                .lock()
+                                .map(|mut g| {
+                                    g.commit_read_thumbnail(&thumb_key, &t, &ar, &al, fresh, now_ms)
+                                })
+                                .unwrap_or(None)
+                        } else {
+                            thumb_cache_mtx()
+                                .lock()
+                                .ok()
+                                .and_then(|g| g.cached_thumbnail(&thumb_key))
                         }
                     } else {
                         None
@@ -865,6 +1126,356 @@ mod win {
             .map_err(|e| format!("枚举窗口失败: {e}"))?;
         Ok(count)
     }
+
+    // ========================================================================
+    // Windows SMTC Publisher (Provider) for Built-in Playback Backends
+    // Publishes metadata, album art, sub-ms timeline & handles media keys/seek
+    // via `ISystemMediaTransportControlsInterop::GetForWindow(hwnd)`.
+    // ========================================================================
+
+    struct SmtcPublisher {
+        controls: SystemMediaTransportControls,
+        btn_token: Option<i64>,
+        pos_token: Option<i64>,
+        enabled: bool,
+        last_status: String,
+        last_meta_key: String,
+        last_track_key: String,
+        last_thumb_key: String,
+        last_tl_pos: f64,
+        last_tl_dur: f64,
+        last_tl_at: Option<Instant>,
+    }
+
+    // Strictly thread-local on the STA UI thread that owns `hwnd` and `SystemMediaTransportControls`!
+    // Never touch `SystemMediaTransportControls` or `DisplayUpdater` from Tokio MTA worker threads,
+    // preventing cross-apartment WinRT crashes (`RPC_E_WRONG_THREAD` / AV) and lock deadlocks!
+    thread_local! {
+        static SMTC_PUBLISHER: RefCell<Option<SmtcPublisher>> = const { RefCell::new(None) };
+    }
+    static PUBLISHED_CMD_QUEUE: OnceLock<Mutex<VecDeque<SmtcPublishedCommand>>> = OnceLock::new();
+
+    fn cmd_queue_mtx() -> &'static Mutex<VecDeque<SmtcPublishedCommand>> {
+        PUBLISHED_CMD_QUEUE.get_or_init(|| Mutex::new(VecDeque::with_capacity(16)))
+    }
+
+    pub fn enqueue_published_command(cmd: SmtcPublishedCommand) {
+        if let Ok(mut q) = cmd_queue_mtx().lock() {
+            if q.len() >= 32 {
+                q.pop_front();
+            }
+            q.push_back(cmd);
+        }
+        crate::audio_viz::wake_registered_ui_window();
+    }
+
+    pub fn drain_published_commands() -> Vec<SmtcPublishedCommand> {
+        let Ok(mut q) = cmd_queue_mtx().lock() else {
+            return Vec::new();
+        };
+        q.drain(..).collect()
+    }
+
+    /// Initializes the WinRT SMTC provider bound to AM-Light's main `HWND`.
+    /// Must be called on the STA UI thread immediately after window creation.
+    pub fn init_publisher(hwnd_usize: usize) -> bool {
+        if hwnd_usize == 0 {
+            return false;
+        }
+        let already = SMTC_PUBLISHER.with(|cell| cell.borrow().is_some());
+        if already {
+            return true;
+        }
+        let interop = match windows::core::factory::<
+            SystemMediaTransportControls,
+            ISystemMediaTransportControlsInterop,
+        >() {
+            Ok(i) => i,
+            Err(e) => {
+                crate::logger::warn("smtc", &format!("ISystemMediaTransportControlsInterop factory failed: {e}"));
+                return false;
+            }
+        };
+        let hwnd = HWND(hwnd_usize as *mut std::ffi::c_void);
+        let controls = match unsafe { interop.GetForWindow::<SystemMediaTransportControls>(hwnd) } {
+            Ok(c) => c,
+            Err(e) => {
+                crate::logger::warn("smtc", &format!("GetForWindow failed: {e}"));
+                return false;
+            }
+        };
+
+        let _ = controls.SetIsPlayEnabled(true);
+        let _ = controls.SetIsPauseEnabled(true);
+        let _ = controls.SetIsStopEnabled(true);
+        let _ = controls.SetIsNextEnabled(true);
+        let _ = controls.SetIsPreviousEnabled(true);
+        let _ = controls.SetIsFastForwardEnabled(false);
+        let _ = controls.SetIsRewindEnabled(false);
+        let _ = controls.SetIsEnabled(false);
+        SMTC_PUB_ENABLED.store(false, Ordering::Release);
+
+        let btn_token = controls
+            .ButtonPressed(&TypedEventHandler::<
+                SystemMediaTransportControls,
+                SystemMediaTransportControlsButtonPressedEventArgs,
+            >::new(|_sender, args| {
+                if let Some(a) = args.as_ref() {
+                    if let Ok(btn) = a.Button() {
+                        let cmd = match btn {
+                            SystemMediaTransportControlsButton::Play => {
+                                Some(SmtcPublishedCommand::Play)
+                            }
+                            SystemMediaTransportControlsButton::Pause => {
+                                Some(SmtcPublishedCommand::Pause)
+                            }
+                            SystemMediaTransportControlsButton::Stop => {
+                                Some(SmtcPublishedCommand::Stop)
+                            }
+                            SystemMediaTransportControlsButton::Next => {
+                                Some(SmtcPublishedCommand::Next)
+                            }
+                            SystemMediaTransportControlsButton::Previous => {
+                                Some(SmtcPublishedCommand::Previous)
+                            }
+                            _ => None,
+                        };
+                        if let Some(c) = cmd {
+                            enqueue_published_command(c);
+                        }
+                    }
+                }
+                Ok(())
+            }))
+            .ok();
+
+        let pos_token = controls
+            .PlaybackPositionChangeRequested(&TypedEventHandler::<
+                SystemMediaTransportControls,
+                PlaybackPositionChangeRequestedEventArgs,
+            >::new(|_sender, args| {
+                if let Some(a) = args.as_ref() {
+                    if let Ok(ts) = a.RequestedPlaybackPosition() {
+                        let secs = (ts.Duration.max(0) as f64) / (TICKS_PER_SEC as f64);
+                        enqueue_published_command(SmtcPublishedCommand::SeekSec(secs));
+                    }
+                }
+                Ok(())
+            }))
+            .ok();
+
+        SMTC_PUBLISHER.with(|cell| {
+            if let Ok(mut guard) = cell.try_borrow_mut() {
+                *guard = Some(SmtcPublisher {
+                    controls,
+                    btn_token,
+                    pos_token,
+                    enabled: false,
+                    last_status: String::new(),
+                    last_meta_key: String::new(),
+                    last_track_key: String::new(),
+                    last_thumb_key: String::new(),
+                    last_tl_pos: 0.0,
+                    last_tl_dur: 0.0,
+                    last_tl_at: None,
+                });
+            }
+        });
+        crate::logger::info("smtc", "Windows SMTC publisher initialized on UI STA thread");
+        true
+    }
+
+    /// Publishes built-in playback status, music metadata, and sub-millisecond timeline to Windows SMTC.
+    /// Must run on the STA UI thread. Returns `true` when the thumbnail for `payload.track_key` still needs upload.
+    pub fn sync_publisher_state(payload: &SmtcPublishPayload, force_timeline: bool) -> bool {
+        SMTC_PUBLISHER.with(|cell| {
+            let Ok(mut guard) = cell.try_borrow_mut() else {
+                return false;
+            };
+            let Some(p) = guard.as_mut() else {
+                return false;
+            };
+
+            let just_enabled = !p.enabled;
+            if just_enabled {
+                let _ = p.controls.SetIsEnabled(true);
+                p.enabled = true;
+                SMTC_PUB_ENABLED.store(true, Ordering::Release);
+            }
+
+            let status_changed = just_enabled || p.last_status != payload.status;
+            if status_changed {
+                let pb = match payload.status.as_str() {
+                    "Playing" => MediaPlaybackStatus::Playing,
+                    "Paused" => MediaPlaybackStatus::Paused,
+                    "Stopped" => MediaPlaybackStatus::Stopped,
+                    _ => MediaPlaybackStatus::Closed,
+                };
+                let _ = p.controls.SetPlaybackStatus(pb);
+                p.last_status = payload.status.clone();
+            }
+
+            let meta_key = format!("{}\x1f{}\x1f{}", payload.title, payload.artist, payload.album);
+            let track_changed =
+                just_enabled || p.last_meta_key != meta_key || p.last_track_key != payload.track_key;
+            if track_changed {
+                if let Ok(updater) = p.controls.DisplayUpdater() {
+                    let _ = updater.ClearAll();
+                    let _ = updater.SetType(MediaPlaybackType::Music);
+                    if let Ok(mp) = updater.MusicProperties() {
+                        let _ = mp.SetTitle(&HSTRING::from(&payload.title));
+                        let _ = mp.SetArtist(&HSTRING::from(&payload.artist));
+                        let _ = mp.SetAlbumTitle(&HSTRING::from(&payload.album));
+                    }
+                    let _ = updater.Update();
+                }
+                p.last_meta_key = meta_key;
+                p.last_thumb_key.clear();
+            }
+            p.last_track_key = payload.track_key.clone();
+
+            let dur_s = payload.duration_sec.max(0.0);
+            let pos_s = if dur_s > 0.0 {
+                payload.position_sec.clamp(0.0, dur_s)
+            } else {
+                payload.position_sec.max(0.0)
+            };
+            let is_playing = payload.status == "Playing";
+            let elapsed_sec = p
+                .last_tl_at
+                .map(|t| t.elapsed().as_secs_f64())
+                .unwrap_or(999.0);
+
+            if compute_timeline_should_update(
+                force_timeline || just_enabled,
+                track_changed,
+                status_changed,
+                is_playing,
+                pos_s,
+                dur_s,
+                p.last_tl_pos,
+                p.last_tl_dur,
+                elapsed_sec,
+            ) {
+                if let Ok(tl) = SystemMediaTransportControlsTimelineProperties::new() {
+                    let zero = TimeSpan { Duration: 0 };
+                    let end_ts = TimeSpan {
+                        Duration: (dur_s * (TICKS_PER_SEC as f64)).round() as i64,
+                    };
+                    let pos_ts = TimeSpan {
+                        Duration: (pos_s * (TICKS_PER_SEC as f64)).round() as i64,
+                    };
+                    let _ = tl.SetStartTime(zero);
+                    let _ = tl.SetMinSeekTime(zero);
+                    let _ = tl.SetEndTime(end_ts);
+                    let _ = tl.SetMaxSeekTime(end_ts);
+                    let _ = tl.SetPosition(pos_ts);
+                    let _ = p.controls.UpdateTimelineProperties(&tl);
+                    p.last_tl_pos = pos_s;
+                    p.last_tl_dur = dur_s;
+                    p.last_tl_at = Some(Instant::now());
+                }
+            }
+
+            p.last_thumb_key != payload.track_key
+        })
+    }
+
+    /// Uploads album artwork bytes into Windows SMTC strictly on the STA UI thread via an
+    /// in-memory WinRT stream (sub-millisecond RAM copy; zero cross-apartment COM marshaling!).
+    pub fn set_publisher_thumbnail_bytes(track_key: &str, bytes: &[u8]) -> bool {
+        if bytes.len() < 16 || bytes.len() > 8 * 1024 * 1024 {
+            return false;
+        }
+        SMTC_PUBLISHER.with(|cell| {
+            let Ok(mut guard) = cell.try_borrow_mut() else {
+                return false;
+            };
+            let Some(p) = guard.as_mut() else {
+                return false;
+            };
+            if !p.enabled || p.last_track_key != track_key || p.last_thumb_key == track_key {
+                return false;
+            }
+            let Ok(stream) = InMemoryRandomAccessStream::new() else {
+                return false;
+            };
+            let Ok(writer) = DataWriter::CreateDataWriter(&stream) else {
+                return false;
+            };
+            if writer.WriteBytes(bytes).is_err() {
+                let _ = writer.DetachStream();
+                return false;
+            }
+            let store_ok = writer
+                .StoreAsync()
+                .ok()
+                .and_then(|op| op.join().ok())
+                .is_some();
+            let flush_ok = writer
+                .FlushAsync()
+                .ok()
+                .and_then(|op| op.join().ok())
+                .is_some();
+            // Detach before dropping `DataWriter` so `InMemoryRandomAccessStream` stays open for SMTC!
+            let _ = writer.DetachStream();
+            if !store_ok || !flush_ok || stream.Seek(0).is_err() {
+                return false;
+            }
+            let Ok(stream_ref) = RandomAccessStreamReference::CreateFromStream(&stream) else {
+                return false;
+            };
+            if let Ok(updater) = p.controls.DisplayUpdater() {
+                let _ = updater.SetThumbnail(&stream_ref);
+                let _ = updater.Update();
+                p.last_thumb_key = track_key.to_string();
+                return true;
+            }
+            false
+        })
+    }
+
+    /// Disables AM-Light's SMTC provider and clears the Windows media card (e.g. ExternalSmtc or toggle OFF).
+    pub fn disable_publisher() {
+        SMTC_PUB_ENABLED.store(false, Ordering::Release);
+        SMTC_PUBLISHER.with(|cell| {
+            if let Ok(mut guard) = cell.try_borrow_mut() {
+                if let Some(p) = guard.as_mut() {
+                    if p.enabled {
+                        let _ = p.controls.SetPlaybackStatus(MediaPlaybackStatus::Stopped);
+                        if let Ok(updater) = p.controls.DisplayUpdater() {
+                            let _ = updater.ClearAll();
+                            let _ = updater.Update();
+                        }
+                        let _ = p.controls.SetIsEnabled(false);
+                    }
+                    p.enabled = false;
+                    p.last_status.clear();
+                    p.last_meta_key.clear();
+                    p.last_track_key.clear();
+                    p.last_thumb_key.clear();
+                    p.last_tl_at = None;
+                }
+            }
+        });
+        if let Ok(mut q) = cmd_queue_mtx().lock() {
+            q.clear();
+        }
+    }
+
+    /// Tears down the SMTC provider and unregisters WinRT event handlers cleanly on app exit.
+    pub fn shutdown_publisher() {
+        disable_publisher();
+        let taken = SMTC_PUBLISHER.with(|cell| cell.try_borrow_mut().ok().and_then(|mut g| g.take()));
+        if let Some(p) = taken {
+            if let Some(tok) = p.btn_token {
+                let _ = p.controls.RemoveButtonPressed(tok);
+            }
+            if let Some(tok) = p.pos_token {
+                let _ = p.controls.RemovePlaybackPositionChangeRequested(tok);
+            }
+        }
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -886,6 +1497,30 @@ mod win {
     pub fn minimize_official_am() -> Result<u32, String> {
         Ok(0)
     }
+
+    pub fn enqueue_published_command(_cmd: SmtcPublishedCommand) {}
+    pub fn drain_published_commands() -> Vec<SmtcPublishedCommand> {
+        Vec::new()
+    }
+    pub fn init_publisher(_hwnd_usize: usize) -> bool {
+        false
+    }
+    pub fn sync_publisher_state(_payload: &SmtcPublishPayload, _force_timeline: bool) -> bool {
+        false
+    }
+    pub fn set_publisher_thumbnail_bytes(_track_key: &str, _bytes: &[u8]) -> bool {
+        false
+    }
+    pub fn disable_publisher() {
+        SMTC_PUB_ENABLED.store(false, Ordering::Release);
+    }
+    pub fn shutdown_publisher() {
+        SMTC_PUB_ENABLED.store(false, Ordering::Release);
+    }
 }
 
-pub use win::{control_playback, get_smtc_state, minimize_official_am};
+pub use win::{
+    control_playback, disable_publisher, drain_published_commands, enqueue_published_command,
+    get_smtc_state, init_publisher, minimize_official_am, set_publisher_thumbnail_bytes,
+    shutdown_publisher, sync_publisher_state,
+};

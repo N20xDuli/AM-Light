@@ -70,6 +70,13 @@
 
 ## 核心特性
 
+### v0.2.12 完整歌单同步、系统媒体控制与全链路性能重构
+
+- **突破百首/两百首限制的完整云端歌单同步 & 封面精准匹配**：Apple Music 个人资料库/目录歌单全量分页拉取并分批写入（彻底解除 100 首截断）；网易云歌单基于完整 `trackIds` 批量拉取并严格保序（彻底解除 200 首截断）；全面修复播放中 / 歌单 / SMTC 封面串图与过期异步回写。
+- **原生 Windows SMTC 媒体发布器 & 结构化运行/崩溃日志**：内置系统级 SMTC 媒体卡片与全局快捷键/时间轴双向同步（带自环防护），并新增按日滚动的轻量级运行与异常日志（`%APPDATA%\AMLight\logs`）。
+- **DXVA 硬件解码动态封面 & 液态玻璃 7.5× 显存削减**：主页经典卡片比例保持不变，支持最多 20 路视口动态封面平滑窗口与 2-slot DXVA 零拷贝乒乓缓冲；液态玻璃重构为单通道条带缩放与目标屏障（显存由 ~20.4 MB 降至 ~2.7 MB），新增 O(1) 真 LRU 纹理/字形缓存。
+- **全链路 P0/P1/P2 低耗性能重构**：O(1) 数据版本号指纹哈希、零克隆弹窗与 `Arc` 共享歌单磁盘缓存、可即时取消的 HLS/FLAC 流下载与 100% 缓存命中复用、暂停 0 Hz WASAPI 静默休眠、非主页自适应低帧率调度以及零堆分配本地即时搜索。
+
 ### 多播放后端与跨平台歌单复制
 
 在 **「设置 -> 播放后端与音乐源」** 一键切换音源，主页、新发现、电台、搜索与曲库视图自动适配对应平台；支持不同平台间歌单**逐首智能匹配与一键复制**。
@@ -133,8 +140,8 @@
 
 ### 第二步：下载与安装
 
-1. 前往 [**GitHub Releases**](https://github.com/N20xDuli/AM-Light/releases) 下载最新的 Windows x64 安装包（如 `AM-Light-Setup-v0.2.11-x64.exe`）并运行安装。
-   - 静默安装：`AM-Light-Setup-v0.2.11-x64.exe --silent [--dir="C:\Path\To\AM-Light"]`
+1. 前往 [**GitHub Releases**](https://github.com/N20xDuli/AM-Light/releases) 下载最新的 Windows x64 安装包（如 `AM-Light-Setup-v0.2.12-x64.exe`）并运行安装。
+   - 静默安装：`AM-Light-Setup-v0.2.12-x64.exe --silent [--dir="C:\Path\To\AM-Light"]`
    - 卸载方式：通过 Windows「已安装的应用」或安装目录下的 `Uninstall-AM-Light.exe` 卸载。
 2. 启动 AM Light，在 **「设置」** 中可随时切换播放后端与界面语言。
 
@@ -166,7 +173,7 @@ cargo test --release --bin AM-Light -- --test-threads=1
 # 构建主程序（Release）
 cargo build --release --bin AM-Light
 
-# 打包 Windows 安装器（输出至 dist\AM-Light-Setup-v0.2.11-x64.exe）
+# 打包 Windows 安装器（输出至 dist\AM-Light-Setup-v0.2.12-x64.exe）
 $env:AM_LIGHT_BIN_PATH = "target\release\AM-Light.exe"
 cargo build --release --manifest-path installer\Cargo.toml
 ```

@@ -8,6 +8,7 @@ pub mod downloads;
 pub mod drm_fix;
 pub mod i18n;
 pub mod listen_together;
+pub mod logger;
 pub mod lyrics;
 pub mod motion_art;
 pub mod netease_api;
@@ -70,6 +71,7 @@ mod win_app {
         GetForegroundWindow, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, IsIconic,
         IsZoomed, KillTimer, LoadCursorW, LoadIconW, MsgWaitForMultipleObjectsEx, MINMAXINFO, MSG,
         MWMO_INPUTAVAILABLE, NCCALCSIZE_PARAMS, PeekMessageW, PostQuitMessage, QS_INPUT,
+        QS_POSTMESSAGE,
         RegisterClassExW, SetCursor, SetTimer, SetWindowLongPtrW,
         SetWindowPos, ShowWindow, TranslateMessage, GWL_EXSTYLE, HTBOTTOM, HTBOTTOMLEFT,
         HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT,
@@ -691,22 +693,28 @@ mod win_app {
 
             WM_IME_STARTCOMPOSITION => {
                 let scale = dpi_scale_for_hwnd(hwnd);
-                let mut sb_rect = None;
+                let mut ime_pt = None;
                 WIN_CTX.with(|cell| {
                     if let Ok(borrow) = cell.try_borrow() {
                         if let Some(ctx) = borrow.as_ref() {
-                            sb_rect = Some(ctx.ui.search_box_rect);
+                            let sr = ctx.ui.search_box_rect;
+                            let cx = if ctx.ui.search_caret_screen_x > sr.x + 12.0 {
+                                ctx.ui.search_caret_screen_x.min(sr.right() - 12.0)
+                            } else {
+                                sr.x + 36.0
+                            };
+                            ime_pt = Some((cx, sr.bottom() + 2.0));
                         }
                     }
                 });
-                if let Some(sr) = sb_rect {
+                if let Some((ix, iy)) = ime_pt {
                     let himc = ImmGetContext(hwnd);
                     if !himc.is_invalid() {
                         let cf = COMPOSITIONFORM {
                             dwStyle: CFS_POINT,
                             ptCurrentPos: windows::Win32::Foundation::POINT {
-                                x: ((sr.x + 36.0) * scale) as i32,
-                                y: ((sr.bottom() + 2.0) * scale) as i32,
+                                x: (ix * scale) as i32,
+                                y: (iy * scale) as i32,
                             },
                             rcArea: RECT::default(),
                         };
@@ -857,6 +865,15 @@ mod win_app {
             }
 
             WM_DESTROY => {
+                crate::logger::info("window", "WM_DESTROY received, shutting down");
+                WIN_CTX.with(|cell| {
+                    if let Ok(mut borrow) = cell.try_borrow_mut() {
+                        if let Some(ctx) = borrow.as_mut() {
+                            ctx.ui.flush_pending_disk_writes_sync();
+                        }
+                    }
+                });
+                crate::smtc::shutdown_publisher();
                 crate::native_player::stop_and_clear();
                 crate::web_am_player::shutdown();
                 PostQuitMessage(0);
@@ -959,7 +976,9 @@ mod win_app {
     }
 
     pub fn run_native_app() {
+        crate::logger::init();
         if !am_agent::ensure_single_ui_instance_or_focus() {
+            crate::logger::info("boot", "Another AM-Light instance is active; focused existing window");
             return;
         }
 
@@ -1099,7 +1118,19 @@ mod win_app {
 
             let hwnd_usize = hwnd.0 as usize;
             audio_viz::register_wake_hwnd(hwnd_usize);
+            let smtc_ok = crate::smtc::init_publisher(hwnd_usize);
             let mut ui = AppUi::new(hwnd_usize);
+            ui.attach_dxgi_device_manager(
+                renderer.mf_dxgi_device_manager(),
+                renderer.d3d_device(),
+            );
+            crate::logger::info(
+                "boot",
+                &format!(
+                    "Window ready ({}x{} @ {:.2}x DPI, smtc_pub={}, backend={:?})",
+                    w_px, h_px, scale, smtc_ok, ui.settings.playback_backend
+                ),
+            );
             let mut init_mon_hz = 60u32;
             let mut init_hmon = 0isize;
             let mut init_mon_poll = Instant::now();
@@ -1149,25 +1180,29 @@ mod win_app {
                 let mut animating = false;
 
                 WIN_CTX.with(|cell| {
-                    if let Some(ctx) = cell.borrow_mut().as_mut() {
-                        if !is_minimized {
-                            let _ = sync_window_geometry_if_needed(hwnd, ctx);
+                    if let Ok(mut borrow) = cell.try_borrow_mut() {
+                        if let Some(ctx) = borrow.as_mut() {
+                            if !is_minimized {
+                                let _ = sync_window_geometry_if_needed(hwnd, ctx);
+                            }
+                            let force_mon = ctx.force_mon_refresh;
+                            ctx.force_mon_refresh = false;
+                            query_window_monitor_hz(
+                                hwnd,
+                                &mut ctx.cached_hmon,
+                                &mut ctx.last_mon_poll,
+                                &mut ctx.monitor_hz,
+                                force_mon,
+                            );
+                            ctx.ui.current_monitor_hz = ctx.monitor_hz;
+                            ctx.ui.is_window_focused = GetForegroundWindow() == hwnd;
+                            if ctx.ui.drain_messages(&mut ctx.renderer) {
+                                ctx.dirty = true;
+                            }
+                            animating = !is_minimized && ctx.ui.needs_continuous_animation();
                         }
-                        let force_mon = ctx.force_mon_refresh;
-                        ctx.force_mon_refresh = false;
-                        query_window_monitor_hz(
-                            hwnd,
-                            &mut ctx.cached_hmon,
-                            &mut ctx.last_mon_poll,
-                            &mut ctx.monitor_hz,
-                            force_mon,
-                        );
-                        ctx.ui.current_monitor_hz = ctx.monitor_hz;
-                        ctx.ui.is_window_focused = GetForegroundWindow() == hwnd;
-                        if ctx.ui.drain_messages(&mut ctx.renderer) {
-                            ctx.dirty = true;
-                        }
-                        animating = !is_minimized && ctx.ui.needs_continuous_animation();
+                    } else {
+                        crate::logger::warn("ui", "Skipped re-entrant WIN_CTX borrow in main loop tick");
                     }
                 });
 
@@ -1190,16 +1225,20 @@ mod win_app {
 
                     let mut pacing = (1u32, 60u32, None::<u64>);
                     WIN_CTX.with(|cell| {
-                        if let Some(ctx) = cell.borrow_mut().as_mut() {
-                            if !IsIconic(hwnd).as_bool() {
-                                let _ = sync_window_geometry_if_needed(hwnd, ctx);
+                        if let Ok(mut borrow) = cell.try_borrow_mut() {
+                            if let Some(ctx) = borrow.as_mut() {
+                                if !IsIconic(hwnd).as_bool() {
+                                    let _ = sync_window_geometry_if_needed(hwnd, ctx);
+                                }
+                                ctx.ui.current_monitor_hz = ctx.monitor_hz;
+                                ctx.ui.is_window_focused = GetForegroundWindow() == hwnd;
+                                let _ = ctx.ui.drain_messages(&mut ctx.renderer);
+                                ctx.ui.step_and_render_ex(&mut ctx.renderer, dt, false);
+                                ctx.dirty = false;
+                                pacing = ctx.ui.effective_frame_pacing();
                             }
-                            ctx.ui.current_monitor_hz = ctx.monitor_hz;
-                            ctx.ui.is_window_focused = GetForegroundWindow() == hwnd;
-                            let _ = ctx.ui.drain_messages(&mut ctx.renderer);
-                            ctx.ui.step_and_render_ex(&mut ctx.renderer, dt, false);
-                            ctx.dirty = false;
-                            pacing = ctx.ui.effective_frame_pacing();
+                        } else {
+                            crate::logger::warn("ui", "Skipped re-entrant WIN_CTX borrow in animating render");
                         }
                     });
 
@@ -1227,12 +1266,15 @@ mod win_app {
                             let due_100ns = -((wait_ns / 100) as i64);
                             if SetWaitableTimer(th, &due_100ns, 0, None, None, false).is_ok() {
                                 if resolved_hz <= 35 {
-                                    // Wake immediately (<0.1ms) on mouse/wheel/key input during calm 30Hz playback!
+                                    // Wake immediately (<0.1ms) on mouse/wheel/key input or WM_APP_AUDIO_WAKE (new motion frame)!
                                     let handles = [th];
+                                    let wait_ms = ((wait_ns / 1_000_000) as u32)
+                                        .saturating_add(12)
+                                        .clamp(40, 500);
                                     let _ = MsgWaitForMultipleObjectsEx(
                                         Some(&handles),
-                                        40,
-                                        QS_INPUT,
+                                        wait_ms,
+                                        QS_INPUT | QS_POSTMESSAGE,
                                         MWMO_INPUTAVAILABLE,
                                     );
                                 } else {
@@ -1244,31 +1286,64 @@ mod win_app {
                         }
                     }
                 } else {
-                    // === IDLE / SILENT STATE: Non-blocking present (`Present(0, 0)`) if dirty so clicks/hovers NEVER stall `GetMessageW`,
-                    //     then block in kernel `GetMessageW` (0.00% CPU & 0.00% GPU!) ===
-                    let should_draw = !is_minimized
-                        && WIN_CTX.with(|cell| {
-                            cell.borrow().as_ref().map(|c| c.dirty).unwrap_or(false)
-                        });
+                    // === IDLE / SILENT STATE: Monitor-paced non-blocking present if dirty (prevents 300-1000Hz
+                    //     paused mouse-move Present(0, 0) GPU storms!), then block in kernel `GetMessageW` (0.00% CPU/GPU!) ===
+                    let (should_draw, idle_mon_hz) = if is_minimized {
+                        (false, 60u32)
+                    } else {
+                        WIN_CTX.with(|cell| {
+                            cell.borrow()
+                                .as_ref()
+                                .map(|c| (c.dirty, c.monitor_hz.clamp(30, 240)))
+                                .unwrap_or((false, 60))
+                        })
+                    };
 
                     if should_draw {
+                        let min_idle_ns = 1_000_000_000u64 / (idle_mon_hz as u64);
+                        let elapsed_ns = last_frame.elapsed().as_nanos() as u64;
+                        if elapsed_ns < min_idle_ns {
+                            let wait_ns = min_idle_ns - elapsed_ns;
+                            if let Some(th) = hr_timer {
+                                let due_100ns = -((wait_ns / 100).max(1) as i64);
+                                if SetWaitableTimer(th, &due_100ns, 0, None, None, false).is_ok() {
+                                    let _ = WaitForSingleObject(th, 25);
+                                }
+                            }
+                            // Drain any extra mouse/input messages that coalesced during the brief pacing wait
+                            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                                if msg.message == windows::Win32::UI::WindowsAndMessaging::WM_QUIT {
+                                    running = false;
+                                    break;
+                                }
+                                let _ = TranslateMessage(&msg);
+                                DispatchMessageW(&msg);
+                            }
+                            if !running {
+                                break;
+                            }
+                        }
                         let dt = last_frame.elapsed().as_secs_f32().clamp(0.004, 0.05);
                         last_frame = Instant::now();
                         WIN_CTX.with(|cell| {
-                            if let Some(ctx) = cell.borrow_mut().as_mut() {
-                                let _ = sync_window_geometry_if_needed(hwnd, ctx);
-                                ctx.ui.current_monitor_hz = ctx.monitor_hz;
-                                ctx.ui.is_window_focused = GetForegroundWindow() == hwnd;
-                                let _ = ctx.ui.drain_messages(&mut ctx.renderer);
-                                ctx.ui.step_and_render_ex(&mut ctx.renderer, dt, true);
-                                ctx.dirty = false;
+                            if let Ok(mut borrow) = cell.try_borrow_mut() {
+                                if let Some(ctx) = borrow.as_mut() {
+                                    let _ = sync_window_geometry_if_needed(hwnd, ctx);
+                                    ctx.ui.current_monitor_hz = ctx.monitor_hz;
+                                    ctx.ui.is_window_focused = GetForegroundWindow() == hwnd;
+                                    let _ = ctx.ui.drain_messages(&mut ctx.renderer);
+                                    ctx.ui.step_and_render_ex(&mut ctx.renderer, dt, true);
+                                    ctx.dirty = false;
+                                }
+                            } else {
+                                crate::logger::warn("ui", "Skipped re-entrant WIN_CTX borrow in idle draw");
                             }
                         });
                         // Re-check if that state change started an animation before sleeping!
                         let started_anim = WIN_CTX.with(|cell| {
-                            cell.borrow()
-                                .as_ref()
-                                .map(|c| c.ui.needs_continuous_animation())
+                            cell.try_borrow()
+                                .ok()
+                                .and_then(|b| b.as_ref().map(|c| c.ui.needs_continuous_animation()))
                                 .unwrap_or(false)
                         });
                         if started_anim && !is_minimized {
@@ -1277,12 +1352,14 @@ mod win_app {
                     }
 
                     WIN_CTX.with(|cell| {
-                        if let Some(ctx) = cell.borrow_mut().as_mut() {
-                            if is_minimized {
-                                ctx.ui.pause_motion_art_for_minimize();
-                                ctx.ui.lyrics_view.release_gpu_caches(&mut ctx.renderer);
-                                ctx.renderer.release_row_fx_surfaces();
-                                ctx.renderer.trim_gpu_staging_if_dirty();
+                        if let Ok(mut borrow) = cell.try_borrow_mut() {
+                            if let Some(ctx) = borrow.as_mut() {
+                                if is_minimized {
+                                    ctx.ui.pause_motion_art_for_minimize();
+                                    ctx.ui.lyrics_view.release_gpu_caches(&mut ctx.renderer);
+                                    ctx.renderer.release_row_fx_surfaces();
+                                    ctx.renderer.trim_gpu_staging_if_dirty();
+                                }
                             }
                         }
                     });
@@ -1313,12 +1390,16 @@ mod win_app {
             }
 
             // Drop UI & Direct2D resources cleanly before disconnecting audio/COM sessions
+            crate::logger::info("exit", "Main loop exited; releasing UI and audio resources");
             WIN_CTX.with(|cell| {
-                *cell.borrow_mut() = None;
+                if let Ok(mut borrow) = cell.try_borrow_mut() {
+                    *borrow = None;
+                }
             });
             audio_viz::set_viz_subscribed(false);
             binaural_dsp::shutdown_binaural_cleanly();
             let _ = am_agent::disconnect_agent();
+            crate::logger::info("exit", "AM Light clean shutdown complete");
         }
     }
 }

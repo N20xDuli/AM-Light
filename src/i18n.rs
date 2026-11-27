@@ -917,6 +917,21 @@ static EXACT_TABLE: Lazy<HashMap<&'static str, [&'static str; 4]>> = Lazy::new(|
         ("Hi-Res 24/192", ["Hi-Res 24/192", "Hi-Res 24/192", "Hi-Res 24/192", "Hi-Res 24/192"]),
         ("无损 24/48", ["無損 24/48", "Lossless 24/48", "ロスレス 24/48", "무손실 24/48"]),
         ("已展开", ["已展開", "Expanded", "展開中", "펼쳐짐"]),
+        ("打开日志目录", ["開啟日誌目錄", "Open Logs Folder", "ログフォルダを開く", "로그 폴더 열기"]),
+        ("存在崩溃记录", ["存在當機記錄", "Crash Log Found", "クラッシュ記録あり", "충돌 기록 있음"]),
+        ("运行与崩溃日志", ["執行與當機日誌", "Runtime & Crash Logs", "実行・クラッシュログ", "실행 및 충돌 로그"]),
+        ("系统媒体控制发布 (SMTC)", [
+            "系統媒體控制發佈 (SMTC)",
+            "System Media Controls (SMTC) Publishing",
+            "システムメディア制御 (SMTC) 公開",
+            "시스템 미디어 제어 (SMTC) 게시"
+        ]),
+        ("更改音频质量后将在下一首播放或重新缓冲时生效；开启 SMTC 发布可联动系统媒体卡片、耳机播控与 Lyricify 等外部歌词工具。", [
+            "更改音訊品質後將在下一首播放或重新緩衝時生效；開啟 SMTC 發佈可連動系統媒體卡片、耳機播控與 Lyricify 等外部歌詞工具。",
+            "Audio quality changes apply on next track or rebuffer; SMTC publishing enables Windows media controls, headset keys, and Lyricify.",
+            "音質設定は次曲から適用。SMTC公開をオンにするとシステムメディア制御・イヤホン操作・Lyricify等と連携します。",
+            "음질 변경은 다음 곡부터 적용됩니다. SMTC 게시를 켜면 시스템 미디어 카드·헤드셋 제어·Lyricify 등과 연동됩니다."
+        ]),
         ("更改音频质量后将在下一首播放或重新缓冲时生效。", [
             "更改音訊品質後將在下一首播放或重新緩衝時生效。",
             "Audio quality changes apply on the next track or when rebuffering.",
@@ -995,6 +1010,21 @@ pub fn translate_ui_text_for<'a>(input: &'a str, lang: ResolvedLang) -> Cow<'a, 
         if let Some(&vals) = EXACT_TABLE.get(stem) {
             return Cow::Owned(format!("{} ›", pick(lang, vals)));
         }
+    }
+
+    // O(1) first-char fast reject for media metadata (CJK song titles, artists, albums, lyrics)
+    // before scanning parameterized UI prefixes (~10x faster on En/Ja/Ko/ZhTw locales!).
+    let has_mid_dot = input.contains(" · ");
+    let may_match_prefix = matches!(
+        input.chars().next(),
+        Some(
+            '待' | '偏' | '一' | '房' | '主' | '邀' | '私' | '黑' | '实' | '播' | '前'
+                | '声' | 'F' | '自' | '垂' | '当' | '源' | '正' | 'A' | '个' | '“'
+                | '词' | '静' | '已' | '界' | '歌' | '背' | '艺' | 'D' | '检'
+        )
+    );
+    if !may_match_prefix && !has_mid_dot {
+        return Cow::Borrowed(input);
     }
 
     // Parameterized AM Light UI format templates (strictly preserving track/artist/playlist names!)

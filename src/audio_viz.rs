@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::f32::consts::PI;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -1503,6 +1503,13 @@ pub struct TempoTracker {
     pub beat_phase: f32,
     pub beat_seq: u64,
     refractory_hops: usize,
+    acf_fft_re: Vec<f32>,
+    acf_fft_im: Vec<f32>,
+    raw_scratch: Vec<f32>,
+    raw_taper_scratch: Vec<f32>,
+    x_scratch: Vec<f32>,
+    prefix_sq_scratch: Vec<f32>,
+    acf_scratch: Vec<f32>,
 }
 
 impl TempoTracker {
@@ -1581,6 +1588,13 @@ impl TempoTracker {
             beat_phase: 0.0,
             beat_seq: 0,
             refractory_hops: 0,
+            acf_fft_re: Vec::with_capacity(2048),
+            acf_fft_im: Vec::with_capacity(2048),
+            raw_scratch: Vec::with_capacity(Self::HIST_CAP + 4),
+            raw_taper_scratch: Vec::with_capacity(Self::HIST_CAP + 4),
+            x_scratch: Vec::with_capacity(Self::HIST_CAP + 4),
+            prefix_sq_scratch: Vec::with_capacity(Self::HIST_CAP + 8),
+            acf_scratch: Vec::with_capacity(600),
         }
     }
 
@@ -1771,10 +1785,34 @@ impl TempoTracker {
         if m < 180 {
             return;
         }
+        let mut raw = std::mem::take(&mut self.raw_scratch);
+        let mut raw_taper = std::mem::take(&mut self.raw_taper_scratch);
+        let mut x = std::mem::take(&mut self.x_scratch);
+        let mut acf = std::mem::take(&mut self.acf_scratch);
+        self.evaluate_hybrid_tempogram_with_scratch(&mut raw, &mut raw_taper, &mut x, &mut acf);
+        self.raw_scratch = raw;
+        self.raw_taper_scratch = raw_taper;
+        self.x_scratch = x;
+        self.acf_scratch = acf;
+    }
+
+    fn evaluate_hybrid_tempogram_with_scratch(
+        &mut self,
+        raw: &mut Vec<f32>,
+        raw_taper: &mut Vec<f32>,
+        x: &mut Vec<f32>,
+        acf: &mut Vec<f32>,
+    ) {
+        let m = self.onset_hist.len();
+        if m < 180 {
+            return;
+        }
 
         // Recency-tapered onset signal: recent bars count more while preserving full 8.2s stability
-        let mut raw = vec![0.0f32; m];
-        let mut raw_taper = vec![0.0f32; m];
+        raw.clear();
+        raw.resize(m, 0.0);
+        raw_taper.clear();
+        raw_taper.resize(m, 0.0);
         let mut raw_sum = 0.0f32;
         let mut w_mean_num = 0.0f32;
         let mut w_den = 0.0f32;
@@ -1792,7 +1830,8 @@ impl TempoTracker {
         }
 
         let mean = w_mean_num / w_den.max(1e-6);
-        let mut x = vec![0.0f32; m];
+        x.clear();
+        x.resize(m, 0.0);
         let mut energy_0 = 0.0f32;
         for i in 0..m {
             let w = 0.58 + 0.42 * ((i as f32) * inv_m);
@@ -1804,32 +1843,18 @@ impl TempoTracker {
             return;
         }
 
-        // 1. Unbiased normalized autocorrelation with >= m/3 overlap guard (eliminates noisy long-lag spikes)
+        // 1. Exact O(M log M) FFT Wiener-Khinchin unbiased normalized autocorrelation with >= m/3 overlap guard
         let max_lag = ((m * 2) / 3).min(((self.hop_hz * 60.0 / 14.5).ceil() as usize).max(120));
         let min_lag = ((self.hop_hz * 60.0 / 220.0).floor() as usize).clamp(12, max_lag - 4);
-        let mut acf = vec![0.0f32; max_lag + 2];
-        for lag in (min_lag / 2).max(10)..=max_lag {
-            let cnt = m - lag;
-            if cnt < (m / 3).max(48) {
-                break;
-            }
-            let mut acc = 0.0f32;
-            let mut e_a = 0.0f32;
-            let mut e_b = 0.0f32;
-            for i in 0..cnt {
-                let a = x[i];
-                let b = x[i + lag];
-                acc += a * b;
-                e_a += a * a;
-                e_b += b * b;
-            }
-            let denom = (e_a * e_b).sqrt();
-            acf[lag] = if denom > 1e-6 {
-                (acc / denom).clamp(-1.0, 1.0)
-            } else {
-                0.0
-            };
-        }
+        compute_unbiased_autocorr_fft_into(
+            x,
+            min_lag,
+            max_lag,
+            &mut self.acf_fft_re,
+            &mut self.acf_fft_im,
+            &mut self.prefix_sq_scratch,
+            acf,
+        );
 
         let sample_acf = |lag_f: f32| -> f32 {
             let l0 = lag_f.floor() as isize;
@@ -1878,7 +1903,7 @@ impl TempoTracker {
             let mut im1 = 0.0f32;
             let mut re2 = 0.0f32;
             let mut im2 = 0.0f32;
-            for &v in &raw_taper {
+            for &v in raw_taper.iter() {
                 re1 += v * cos_n1;
                 im1 -= v * sin_n1;
                 re2 += v * cos_n2;
@@ -2070,7 +2095,7 @@ impl TempoTracker {
             let mut im1 = 0.0f32;
             let mut re2 = 0.0f32;
             let mut im2 = 0.0f32;
-            for &v in &raw_taper {
+            for &v in raw_taper.iter() {
                 re1 += v * cos_n1;
                 im1 -= v * sin_n1;
                 re2 += v * cos_n2;
@@ -2142,6 +2167,86 @@ impl TempoTracker {
     }
 }
 
+fn compute_unbiased_autocorr_fft_into(
+    x: &[f32],
+    min_lag: usize,
+    max_lag: usize,
+    fft_re: &mut Vec<f32>,
+    fft_im: &mut Vec<f32>,
+    prefix_sq: &mut Vec<f32>,
+    acf: &mut Vec<f32>,
+) {
+    let m = x.len();
+    acf.clear();
+    acf.resize(max_lag + 2, 0.0);
+    if m < 48 || max_lag < 10 {
+        return;
+    }
+    let fft_len = (m * 2).next_power_of_two().max(64);
+    fft_re.clear();
+    fft_re.resize(fft_len, 0.0);
+    fft_im.clear();
+    fft_im.resize(fft_len, 0.0);
+    fft_re[..m].copy_from_slice(x);
+
+    prefix_sq.clear();
+    prefix_sq.reserve(m + 1);
+    prefix_sq.push(0.0);
+    let mut run_sq = 0.0f32;
+    for &v in x {
+        run_sq += v * v;
+        prefix_sq.push(run_sq);
+    }
+
+    // Wiener-Khinchin theorem: exact linear autocorrelation via zero-padded power spectrum IFFT
+    fft_radix2_in_place(fft_re, fft_im);
+    for k in 0..fft_len {
+        let r = fft_re[k];
+        let im = fft_im[k];
+        fft_re[k] = r * r + im * im;
+        fft_im[k] = 0.0;
+    }
+    fft_radix2_in_place(fft_re, fft_im);
+
+    let inv_n = 1.0 / (fft_len as f32);
+    let total_sq = prefix_sq[m];
+    let start_lag = (min_lag / 2).max(10);
+    let min_cnt = (m / 3).max(48);
+    for lag in start_lag..=max_lag {
+        let cnt = m.saturating_sub(lag);
+        if cnt < min_cnt {
+            break;
+        }
+        let acc = fft_re[lag] * inv_n;
+        let e_a = prefix_sq[cnt];
+        let e_b = (total_sq - prefix_sq[lag]).max(0.0);
+        let denom = (e_a * e_b).sqrt();
+        acf[lag] = if denom > 1e-6 {
+            (acc / denom).clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+    }
+}
+
+/// Public `O(M log M)` FFT-accelerated unbiased normalized autocorrelation matching direct `O(M^2)` lag correlation.
+pub fn compute_unbiased_autocorr_fft(x: &[f32], min_lag: usize, max_lag: usize) -> Vec<f32> {
+    let mut fft_re = Vec::new();
+    let mut fft_im = Vec::new();
+    let mut prefix_sq = Vec::new();
+    let mut acf = Vec::new();
+    compute_unbiased_autocorr_fft_into(
+        x,
+        min_lag,
+        max_lag,
+        &mut fft_re,
+        &mut fft_im,
+        &mut prefix_sq,
+        &mut acf,
+    );
+    acf
+}
+
 #[derive(Clone, Copy, Default)]
 struct SharedTempoSnapshot {
     bpm: f32,
@@ -2157,30 +2262,27 @@ static SHARED_TEMPO: Lazy<RwLock<SharedTempoSnapshot>> = Lazy::new(|| {
     })
 });
 
-struct RenderTimeSmoother {
-    fft_window_2048: Vec<f32>,
-    fft_window_512: [f32; 512],
-    mono_2048: Vec<f32>,
+/// Shared 2048-pt / 512-pt FFT spectrum analyzer owned by the WASAPI loopback thread (runs at
+/// fixed ~60 Hz in FullVisualizer / ~30 Hz in MiniBars5 so the UI thread runs ZERO 2048-pt FFTs at 144 Hz!).
+pub struct SharedSpectrumAnalyzer {
+    hann_2048: Vec<f32>,
+    hann_512: [f32; 512],
     fft_re: Vec<f32>,
     fft_im: Vec<f32>,
     fft_mag: Vec<f32>,
     bands_sr: u32,
     bands_64: [(usize, usize); 64],
     bands_120: [(usize, usize); 120],
-    spec_32: [f32; 32],
-    peaks_32: [f32; 32],
-    spec_64: [f32; 64],
-    peaks_64: [f32; 64],
-    radial_120: [f32; 120],
-    beat_pulse: f32,
-    last_seen_beat_seq: u64,
-    estimated_bpm: f32,
-    beat_phase: f32,
-    frozen_snapshot: Option<LiveVisualizerSnapshot>,
 }
 
-impl Default for RenderTimeSmoother {
+impl Default for SharedSpectrumAnalyzer {
     fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SharedSpectrumAnalyzer {
+    pub fn new() -> Self {
         let n = 2048;
         let mut win = vec![0.0f32; n];
         for i in 0..n {
@@ -2191,30 +2293,17 @@ impl Default for RenderTimeSmoother {
             *w = 0.5 * (1.0 - (2.0 * PI * (i as f32) / 511.0).cos());
         }
         Self {
-            fft_window_2048: win,
-            fft_window_512: win512,
-            mono_2048: vec![0.0; n],
+            hann_2048: win,
+            hann_512: win512,
             fft_re: vec![0.0; n],
             fft_im: vec![0.0; n],
             fft_mag: vec![0.0; n / 2],
             bands_sr: 0,
             bands_64: [(1, 2); 64],
             bands_120: [(1, 2); 120],
-            spec_32: [0.0; 32],
-            peaks_32: [0.0; 32],
-            spec_64: [0.0; 64],
-            peaks_64: [0.0; 64],
-            radial_120: [0.0; 120],
-            beat_pulse: 0.0,
-            last_seen_beat_seq: 0,
-            estimated_bpm: 120.0,
-            beat_phase: 0.0,
-            frozen_snapshot: None,
         }
     }
-}
 
-impl RenderTimeSmoother {
     fn ensure_band_tables(&mut self, sr: u32) {
         if self.bands_sr == sr {
             return;
@@ -2240,10 +2329,166 @@ impl RenderTimeSmoother {
             self.bands_120[i] = (b0, b1);
         }
     }
+
+    pub fn compute_raw_bands(
+        &mut self,
+        mono_2048: &[f32],
+        sr: u32,
+    ) -> ([f32; 32], [f32; 64], [f32; 120]) {
+        let mut raw_32 = [0.0f32; 32];
+        let mut raw_64 = [0.0f32; 64];
+        let mut raw_120 = [0.0f32; 120];
+        if mono_2048.len() < 2048 {
+            return (raw_32, raw_64, raw_120);
+        }
+        self.ensure_band_tables(sr);
+        for i in 0..2048 {
+            self.fft_re[i] = mono_2048[i] * self.hann_2048[i];
+            self.fft_im[i] = 0.0;
+        }
+        fft_radix2_in_place(&mut self.fft_re, &mut self.fft_im);
+
+        let sr_f = sr.max(8_000) as f32;
+        let nyq = sr_f * 0.5;
+        let bin_hz = sr_f / 2048.0;
+        let norm = 2.0 / 1024.0;
+        self.fft_mag[0] = 0.0;
+        for k in 1..1024 {
+            self.fft_mag[k] =
+                (self.fft_re[k] * self.fft_re[k] + self.fft_im[k] * self.fft_im[k]).sqrt() * norm;
+        }
+
+        let peak_in_bins = |mag: &[f32], b0: usize, b1: usize, tilt: f32| -> f32 {
+            let mut pk = 0.0f32;
+            for &m in &mag[b0..b1] {
+                if m > pk {
+                    pk = m;
+                }
+            }
+            let db = 20.0 * ((pk * tilt).max(1e-5)).log10();
+            ((db + 58.0) / 52.0).clamp(0.0, 1.0)
+        };
+
+        for i in 0..32 {
+            let fc = SPECTRUM_FREQS[i];
+            if fc < nyq * 0.98 {
+                let b0 = (((fc * 0.86) / bin_hz).floor() as usize).clamp(1, 1022);
+                let b1 = (((fc * 1.16) / bin_hz).ceil() as usize).clamp(b0 + 1, 1023);
+                raw_32[i] = peak_in_bins(&self.fft_mag, b0, b1, 1.0 + (i as f32) * 0.055);
+            }
+        }
+        for i in 0..64 {
+            let (b0, b1) = self.bands_64[i];
+            if (b0 as f32) * bin_hz < nyq * 0.98 {
+                raw_64[i] = peak_in_bins(&self.fft_mag, b0, b1, 1.0 + (i as f32) * 0.032);
+            }
+        }
+        for i in 0..120 {
+            let (b0, b1) = self.bands_120[i];
+            raw_120[i] = peak_in_bins(&self.fft_mag, b0, b1, 1.0 + (i as f32) * 0.022);
+        }
+        (raw_32, raw_64, raw_120)
+    }
+
+    pub fn compute_raw_32_fast(&mut self, mono_512: &[f32], sr: u32) -> [f32; 32] {
+        let mut out = [0.0f32; 32];
+        if mono_512.len() < 512 {
+            return out;
+        }
+        let mut re = [0.0f32; 512];
+        let mut im = [0.0f32; 512];
+        for i in 0..512 {
+            re[i] = mono_512[i] * self.hann_512[i];
+        }
+        fft_radix2_in_place(&mut re, &mut im);
+        let sr_f = sr.max(8_000) as f32;
+        let nyq = sr_f * 0.5;
+        let bin_hz = sr_f / 512.0;
+        let norm = 2.0 / 256.0;
+        let mut mag = [0.0f32; 256];
+        for k in 1..256 {
+            mag[k] = (re[k] * re[k] + im[k] * im[k]).sqrt() * norm;
+        }
+        for i in 0..32 {
+            let fc = SPECTRUM_FREQS[i];
+            if fc < nyq * 0.98 {
+                let b0 = (((fc * 0.86) / bin_hz).floor() as usize).clamp(1, 254);
+                let b1 = (((fc * 1.16) / bin_hz).ceil() as usize).clamp(b0 + 1, 255);
+                let mut pk = 0.0f32;
+                for &m in &mag[b0..b1] {
+                    if m > pk {
+                        pk = m;
+                    }
+                }
+                let db = 20.0 * ((pk * (1.0 + (i as f32) * 0.055)).max(1e-5)).log10();
+                out[i] = ((db + 58.0) / 52.0).clamp(0.0, 1.0);
+            }
+        }
+        out
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SharedSpectrumState {
+    seq: u64,
+    raw_32: [f32; 32],
+    raw_64: [f32; 64],
+    raw_120: [f32; 120],
+}
+
+impl Default for SharedSpectrumState {
+    fn default() -> Self {
+        Self {
+            seq: 0,
+            raw_32: [0.0; 32],
+            raw_64: [0.0; 64],
+            raw_120: [0.0; 120],
+        }
+    }
+}
+
+struct RenderTimeSmoother {
+    fallback_analyzer: SharedSpectrumAnalyzer,
+    mono_2048: Vec<f32>,
+    spec_32: [f32; 32],
+    peaks_32: [f32; 32],
+    spec_64: [f32; 64],
+    peaks_64: [f32; 64],
+    radial_120: [f32; 120],
+    beat_pulse: f32,
+    last_seen_beat_seq: u64,
+    estimated_bpm: f32,
+    beat_phase: f32,
+    last_soundstage_wp: usize,
+    cached_soundstage_pts: Vec<[f32; 3]>,
+    frozen_snapshot: Option<LiveVisualizerSnapshot>,
+}
+
+impl Default for RenderTimeSmoother {
+    fn default() -> Self {
+        Self {
+            fallback_analyzer: SharedSpectrumAnalyzer::new(),
+            mono_2048: vec![0.0; 2048],
+            spec_32: [0.0; 32],
+            peaks_32: [0.0; 32],
+            spec_64: [0.0; 64],
+            peaks_64: [0.0; 64],
+            radial_120: [0.0; 120],
+            beat_pulse: 0.0,
+            last_seen_beat_seq: 0,
+            estimated_bpm: 120.0,
+            beat_phase: 0.0,
+            last_soundstage_wp: usize::MAX,
+            cached_soundstage_pts: Vec::new(),
+            frozen_snapshot: None,
+        }
+    }
 }
 
 static RING_STATE: Lazy<RwLock<SharedRingState>> =
     Lazy::new(|| RwLock::new(SharedRingState::default()));
+static SHARED_SPECTRUM: Lazy<RwLock<SharedSpectrumState>> =
+    Lazy::new(|| RwLock::new(SharedSpectrumState::default()));
 static FORENSIC_SUMMARY: Lazy<RwLock<SharedForensicSummary>> =
     Lazy::new(|| RwLock::new(SharedForensicSummary::default()));
 static RENDER_SMOOTHER: Lazy<Mutex<RenderTimeSmoother>> =
@@ -2251,8 +2496,44 @@ static RENDER_SMOOTHER: Lazy<Mutex<RenderTimeSmoother>> =
 static LATEST_VIZ: Lazy<RwLock<AudioVizFrame>> =
     Lazy::new(|| RwLock::new(AudioVizFrame::default()));
 
-static VIZ_SUBSCRIBED: AtomicBool = AtomicBool::new(false);
+static VIZ_SUB_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static INSPECTOR_STYLE_ACTIVE: AtomicBool = AtomicBool::new(true);
 static INSPECTOR_RESET: AtomicBool = AtomicBool::new(false);
+
+/// Gates heavy `AudioInspector`-only DSP (`split_stereo_5band_soundstage` + 4096/8192-pt forensic FFT)
+/// strictly to when the Audio Quality Inspector tab is visible.
+pub fn set_active_viz_style_inspector(active: bool) {
+    INSPECTOR_STYLE_ACTIVE.store(active, Ordering::Release);
+}
+
+#[inline]
+pub fn is_active_viz_style_inspector() -> bool {
+    INSPECTOR_STYLE_ACTIVE.load(Ordering::Acquire)
+}
+
+/// 3-tier WASAPI loopback subscription level:
+/// - `Off (0)`: Zero capture, Condvar deep sleep (0.00% CPU).
+/// - `MiniBars5 (1)`: Lightweight ring-buffer capture only (~16ms cadence) for sidebar/row 5-bar EQ;
+///   skips 4096/8192-pt `ForensicAccumulator`, `TempoTracker`, and audio session enumeration (90x-135x lighter!).
+/// - `FullVisualizer (2)`: Full forensic FFT, BPM/beat PLL, and per-app session inspection for the Visualizer page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum VizSubMode {
+    Off = 0,
+    MiniBars5 = 1,
+    FullVisualizer = 2,
+}
+
+impl VizSubMode {
+    #[inline]
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::MiniBars5,
+            2 => Self::FullVisualizer,
+            _ => Self::Off,
+        }
+    }
+}
 static TEMPO_RESET: AtomicBool = AtomicBool::new(false);
 static INSPECTOR_PAUSED: AtomicBool = AtomicBool::new(false);
 static AUTO_RESET_SILENCE: AtomicBool = AtomicBool::new(true);
@@ -2325,18 +2606,31 @@ pub fn is_auto_reset_silence() -> bool {
     AUTO_RESET_SILENCE.load(Ordering::Acquire)
 }
 
-pub fn set_viz_subscribed(enabled: bool) {
-    let prev = VIZ_SUBSCRIBED.swap(enabled, Ordering::AcqRel);
-    if enabled {
+pub fn set_viz_sub_mode(mode: VizSubMode) {
+    let prev = VIZ_SUB_MODE.swap(mode as u8, Ordering::AcqRel);
+    if mode != VizSubMode::Off {
         ensure_loopback_worker();
-        if !prev {
+        if prev == VizSubMode::Off as u8 || (prev != mode as u8) {
             notify_worker_wake();
         }
     }
 }
 
+#[inline]
+pub fn viz_sub_mode() -> VizSubMode {
+    VizSubMode::from_u8(VIZ_SUB_MODE.load(Ordering::Acquire))
+}
+
+pub fn set_viz_subscribed(enabled: bool) {
+    set_viz_sub_mode(if enabled {
+        VizSubMode::FullVisualizer
+    } else {
+        VizSubMode::Off
+    });
+}
+
 pub fn is_viz_subscribed() -> bool {
-    VIZ_SUBSCRIBED.load(Ordering::Acquire)
+    viz_sub_mode() != VizSubMode::Off
 }
 
 static AMP_AGENT_SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -2375,7 +2669,7 @@ pub fn is_amp_agent_audio_active() -> bool {
     if !AMP_AGENT_SESSION_ACTIVE.load(Ordering::Acquire) {
         return false;
     }
-    if VIZ_SUBSCRIBED.load(Ordering::Acquire) {
+    if is_viz_subscribed() {
         is_audio_currently_active()
     } else {
         true
@@ -2387,8 +2681,9 @@ pub fn get_latest_viz_frame() -> AudioVizFrame {
     LATEST_VIZ.read().map(|f| f.clone()).unwrap_or_default()
 }
 
-/// Ultra-lightweight zero-heap-allocation rhythm sampler (<0.015ms CPU) for non-Visualizer pages
+/// Ultra-lightweight zero-FFT UI rhythm sampler (<0.005ms CPU) for non-Visualizer pages
 /// (drives sidebar `可视化` rhythm icon, track-row equalizer bars, and Lyrics bass breathing).
+/// Reads precomputed spectrum bins produced on the loopback DSP thread (~30–60 Hz) and smooths per frame!
 pub fn sample_rhythm_levels_fast(dt_sec: f32) -> (bool, f32, f32, f32, f32, [f32; 32]) {
     ensure_loopback_worker();
     let dt = dt_sec.clamp(1.0 / 360.0, 0.08);
@@ -2396,52 +2691,38 @@ pub fn sample_rhythm_levels_fast(dt_sec: f32) -> (bool, f32, f32, f32, f32, [f32
         return (false, 0.0, 0.0, 0.0, 0.0, [0.0; 32]);
     };
 
-    let mut re = [0.0f32; 512];
-    let mut im = [0.0f32; 512];
-    let (active_signal, sr) = {
+    let (active_signal, sr, shared_spec) = {
         let Ok(ring) = RING_STATE.read() else {
             return (false, 0.0, 0.0, 0.0, 0.0, sm.spec_32);
         };
-        if ring.active_signal {
-            let start = (ring.write_pos + RING_LEN - 512) & RING_MASK;
+        let sp = SHARED_SPECTRUM.read().map(|s| *s).unwrap_or_default();
+        if ring.active_signal && sp.seq == 0 {
+            let wp = ring.write_pos;
+            let start = (wp + RING_LEN - 512) & RING_MASK;
             for i in 0..512 {
                 let lr = ring.stereo[(start + i) & RING_MASK];
-                re[i] = 0.5 * (lr[0] + lr[1]) * sm.fft_window_512[i];
+                sm.mono_2048[i] = 0.5 * (lr[0] + lr[1]);
             }
         }
-        (ring.active_signal, ring.sample_rate.max(8_000))
+        (ring.active_signal, ring.sample_rate.max(8_000), sp)
     };
 
     let attack = 1.0 - (-28.0 * dt).exp();
     let release = 1.0 - (-9.5 * dt).exp();
 
     if active_signal {
-        fft_radix2_in_place(&mut re, &mut im);
-        let sr_f = sr as f32;
-        let nyq = sr_f * 0.5;
-        let bin_hz = sr_f / 512.0;
-        let norm = 2.0 / 256.0;
-        let mut mag = [0.0f32; 256];
-        for k in 1..256 {
-            mag[k] = (re[k] * re[k] + im[k] * im[k]).sqrt() * norm;
-        }
+        let raw32 = if shared_spec.seq > 0 {
+            shared_spec.raw_32
+        } else {
+            let RenderTimeSmoother {
+                ref mut fallback_analyzer,
+                ref mono_2048,
+                ..
+            } = *sm;
+            fallback_analyzer.compute_raw_32_fast(&mono_2048[..512], sr)
+        };
         for i in 0..32 {
-            let fc = SPECTRUM_FREQS[i];
-            let raw = if fc < nyq * 0.98 {
-                let b0 = (((fc * 0.86) / bin_hz).floor() as usize).clamp(1, 254);
-                let b1 = (((fc * 1.16) / bin_hz).ceil() as usize).clamp(b0 + 1, 255);
-                let mut pk = 0.0f32;
-                for &m in &mag[b0..b1] {
-                    if m > pk {
-                        pk = m;
-                    }
-                }
-                let tilt = 1.0 + (i as f32) * 0.055;
-                let db = 20.0 * ((pk * tilt).max(1e-5)).log10();
-                ((db + 58.0) / 52.0).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
+            let raw = raw32[i];
             let k = if raw > sm.spec_32[i] { attack } else { release };
             sm.spec_32[i] += (raw - sm.spec_32[i]) * k;
         }
@@ -2469,11 +2750,19 @@ pub fn sample_rhythm_levels_fast(dt_sec: f32) -> (bool, f32, f32, f32, f32, [f32
     (active_signal, bass, mid, high, sm.beat_pulse, sm.spec_32)
 }
 
-/// Samples the high-speed stereo ring buffer at the exact render frame tick (60Hz .. VSync)
+/// Zero-clone Arc wrapper around `sample_live_visualizer` for UI render paths.
+pub fn sample_live_visualizer_arc(dt_sec: f32) -> Arc<LiveVisualizerSnapshot> {
+    Arc::new(sample_live_visualizer(dt_sec))
+}
+
+/// Samples the loopback-computed spectrum & ring buffer at render frame tick (60Hz .. VSync).
+/// The shared 2048-pt FFT runs at fixed ~60 Hz on the loopback worker thread (zero UI-thread FFT!),
+/// and `split_stereo_5band_soundstage` + forensic clones are strictly gated to `AudioInspector` mode.
 pub fn sample_live_visualizer(dt_sec: f32) -> LiveVisualizerSnapshot {
     ensure_loopback_worker();
     let dt = dt_sec.clamp(1.0 / 360.0, 0.08);
     let paused = INSPECTOR_PAUSED.load(Ordering::Acquire);
+    let inspector_active = INSPECTOR_STYLE_ACTIVE.load(Ordering::Acquire);
 
     let Ok(mut sm) = RENDER_SMOOTHER.lock() else {
         return LiveVisualizerSnapshot::default();
@@ -2487,8 +2776,12 @@ pub fn sample_live_visualizer(dt_sec: f32) -> LiveVisualizerSnapshot {
         }
     }
 
+    let shared_spec = SHARED_SPECTRUM.read().map(|s| *s).unwrap_or_default();
+    let need_fallback_fft = shared_spec.seq == 0;
+
     let (
         active_signal,
+        wpos,
         dev_id,
         dev_name,
         sr,
@@ -2508,7 +2801,7 @@ pub fn sample_live_visualizer(dt_sec: f32) -> LiveVisualizerSnapshot {
             return LiveVisualizerSnapshot::default();
         };
         let wpos = ring.write_pos;
-        if ring.active_signal {
+        if ring.active_signal && need_fallback_fft {
             let start = (wpos + RING_LEN - 2048) & RING_MASK;
             for i in 0..2048 {
                 let lr = ring.stereo[(start + i) & RING_MASK];
@@ -2518,7 +2811,11 @@ pub fn sample_live_visualizer(dt_sec: f32) -> LiveVisualizerSnapshot {
 
         let mut wl = vec![0.0f32; 192];
         let mut wr = vec![0.0f32; 192];
-        let mut st_lr = vec![[0.0f32; 2]; 256];
+        let mut st_lr = if inspector_active {
+            vec![[0.0f32; 2]; 256]
+        } else {
+            Vec::new()
+        };
         if ring.active_signal {
             let w_start = (wpos + RING_LEN - 768) & RING_MASK;
             for i in 0..192 {
@@ -2536,15 +2833,18 @@ pub fn sample_live_visualizer(dt_sec: f32) -> LiveVisualizerSnapshot {
                 wl[i] = bl.clamp(-1.0, 1.0);
                 wr[i] = br.clamp(-1.0, 1.0);
             }
-            let s_start = (wpos + RING_LEN - 512) & RING_MASK;
-            for i in 0..256 {
-                let lr = ring.stereo[(s_start + i * 2) & RING_MASK];
-                st_lr[i] = [lr[0].clamp(-1.0, 1.0), lr[1].clamp(-1.0, 1.0)];
+            if inspector_active {
+                let s_start = (wpos + RING_LEN - 512) & RING_MASK;
+                for i in 0..256 {
+                    let lr = ring.stereo[(s_start + i * 2) & RING_MASK];
+                    st_lr[i] = [lr[0].clamp(-1.0, 1.0), lr[1].clamp(-1.0, 1.0)];
+                }
             }
         }
 
         (
             ring.active_signal,
+            wpos,
             ring.device_id.clone(),
             ring.device_name.clone(),
             ring.sample_rate.max(8_000),
@@ -2569,49 +2869,19 @@ pub fn sample_live_visualizer(dt_sec: f32) -> LiveVisualizerSnapshot {
     let mut beat_triggered = false;
 
     if active_signal {
-        sm.ensure_band_tables(sr);
-        for i in 0..2048 {
-            sm.fft_re[i] = sm.mono_2048[i] * sm.fft_window_2048[i];
-            sm.fft_im[i] = 0.0;
-        }
-        let RenderTimeSmoother {
-            ref mut fft_re,
-            ref mut fft_im,
-            ref mut fft_mag,
-            ..
-        } = *sm;
-        fft_radix2_in_place(fft_re, fft_im);
-
-        let sr_f = sr as f32;
-        let nyq = sr_f * 0.5;
-        let bin_hz = sr_f / 2048.0;
-        let norm = 2.0 / 1024.0;
-        fft_mag[0] = 0.0;
-        for k in 1..1024 {
-            fft_mag[k] = (fft_re[k] * fft_re[k] + fft_im[k] * fft_im[k]).sqrt() * norm;
-        }
-
-        let peak_in_bins = |mag: &[f32], b0: usize, b1: usize, tilt: f32| -> f32 {
-            let mut pk = 0.0f32;
-            for &m in &mag[b0..b1] {
-                if m > pk {
-                    pk = m;
-                }
-            }
-            let db = 20.0 * ((pk * tilt).max(1e-5)).log10();
-            ((db + 58.0) / 52.0).clamp(0.0, 1.0)
+        let (raw_32, raw_64, raw_120) = if !need_fallback_fft {
+            (shared_spec.raw_32, shared_spec.raw_64, shared_spec.raw_120)
+        } else {
+            let RenderTimeSmoother {
+                ref mut fallback_analyzer,
+                ref mono_2048,
+                ..
+            } = *sm;
+            fallback_analyzer.compute_raw_bands(mono_2048, sr)
         };
 
-        // 32-band spectrum
         for i in 0..32 {
-            let fc = SPECTRUM_FREQS[i];
-            let raw = if fc < nyq * 0.98 {
-                let b0 = (((fc * 0.86) / bin_hz).floor() as usize).clamp(1, 1022);
-                let b1 = (((fc * 1.16) / bin_hz).ceil() as usize).clamp(b0 + 1, 1023);
-                peak_in_bins(&sm.fft_mag, b0, b1, 1.0 + (i as f32) * 0.055)
-            } else {
-                0.0
-            };
+            let raw = raw_32[i];
             let k = if raw > sm.spec_32[i] { attack } else { release };
             sm.spec_32[i] += (raw - sm.spec_32[i]) * k;
             if sm.spec_32[i] >= sm.peaks_32[i] {
@@ -2621,14 +2891,8 @@ pub fn sample_live_visualizer(dt_sec: f32) -> LiveVisualizerSnapshot {
             }
         }
 
-        // 64-band log spectrum (precomputed bins!)
         for i in 0..64 {
-            let (b0, b1) = sm.bands_64[i];
-            let raw = if (b0 as f32) * bin_hz < nyq * 0.98 {
-                peak_in_bins(&sm.fft_mag, b0, b1, 1.0 + (i as f32) * 0.032)
-            } else {
-                0.0
-            };
+            let raw = raw_64[i];
             let k = if raw > sm.spec_64[i] { attack } else { release };
             sm.spec_64[i] += (raw - sm.spec_64[i]) * k;
             if sm.spec_64[i] >= sm.peaks_64[i] {
@@ -2638,10 +2902,8 @@ pub fn sample_live_visualizer(dt_sec: f32) -> LiveVisualizerSnapshot {
             }
         }
 
-        // 120-band radial spectrum (precomputed bins!)
         for i in 0..120 {
-            let (b0, b1) = sm.bands_120[i];
-            let raw = peak_in_bins(&sm.fft_mag, b0, b1, 1.0 + (i as f32) * 0.022);
+            let raw = raw_120[i];
             let k = if raw > sm.radial_120[i] {
                 (attack * 1.15).min(1.0)
             } else {
@@ -2682,19 +2944,52 @@ pub fn sample_live_visualizer(dt_sec: f32) -> LiveVisualizerSnapshot {
             *v *= decay;
         }
         sm.beat_pulse *= decay;
+        sm.last_soundstage_wp = usize::MAX;
+        sm.cached_soundstage_pts.clear();
     }
 
     let bass_energy = sm.spec_32[0..7].iter().sum::<f32>() / 7.0;
     let mid_energy = sm.spec_32[8..20].iter().sum::<f32>() / 12.0;
     let high_energy = sm.spec_32[20..32].iter().sum::<f32>() / 12.0;
 
-    let soundstage_band_pts = if active_signal && !stage_lr.is_empty() {
-        split_stereo_5band_soundstage(&stage_lr, sr)
+    // Gate 5-band stereo IIR decomposition strictly to AudioInspector AND deduplicate unchanged ring frames!
+    let soundstage_band_pts = if inspector_active && active_signal && !stage_lr.is_empty() {
+        if sm.last_soundstage_wp != wpos || sm.cached_soundstage_pts.is_empty() {
+            sm.cached_soundstage_pts = split_stereo_5band_soundstage(&stage_lr, sr);
+            sm.last_soundstage_wp = wpos;
+        }
+        sm.cached_soundstage_pts.clone()
     } else {
         Vec::new()
     };
 
-    let forensic = FORENSIC_SUMMARY.read().map(|f| f.clone()).unwrap_or_default();
+    let forensic = if inspector_active {
+        FORENSIC_SUMMARY
+            .read()
+            .map(|f| f.clone())
+            .unwrap_or_default()
+    } else {
+        SharedForensicSummary {
+            inst_spectrum_db: Vec::new(),
+            peak_envelope_db: Vec::new(),
+            inst_spectrum_low24_db: Vec::new(),
+            peak_envelope_low24_db: Vec::new(),
+            tier_code: String::new(),
+            verdict_title: String::new(),
+            estimated_bitrate: String::new(),
+            confidence_pct: 0,
+            forensic_notes: String::new(),
+            cutoff_hz: 0.0,
+            inst_cutoff_hz: 0.0,
+            brickwall_drop_db: 0.0,
+            has_brickwall_cut: false,
+            mdct_hole_pct: 0.0,
+            detected_bit_grid: String::new(),
+            clip_count: 0,
+            analyzed_frames: 0,
+            active_apps: Vec::new(),
+        }
+    };
 
     let snap = LiveVisualizerSnapshot {
         active_signal,
@@ -2912,6 +3207,7 @@ mod win {
     #[link(name = "ole32")]
     extern "system" {
         fn CoInitializeEx(pv_reserved: *mut c_void, dw_coinit: u32) -> HRESULT;
+        fn CoUninitialize();
         fn CoCreateInstance(
             rclsid: *const GUID,
             p_unk_outer: *mut c_void,
@@ -2921,6 +3217,15 @@ mod win {
         ) -> HRESULT;
         fn CoTaskMemFree(pv: *mut c_void);
         fn PropVariantClear(pvar: *mut PROPVARIANT) -> HRESULT;
+    }
+
+    struct ComGuard(bool);
+    impl Drop for ComGuard {
+        fn drop(&mut self) {
+            if self.0 {
+                unsafe { CoUninitialize() };
+            }
+        }
     }
 
     #[link(name = "kernel32")]
@@ -3068,7 +3373,7 @@ mod win {
 
     pub fn is_default_endpoint_spatial_ready() -> bool {
         unsafe {
-            let _ = CoInitializeEx(null_mut(), 0);
+            let _com_guard = ComGuard(CoInitializeEx(null_mut(), 0) >= 0);
             let _ = crate::am_agent::init_process_com_security();
             let mut enumerator: *mut c_void = null_mut();
             if CoCreateInstance(
@@ -3103,7 +3408,7 @@ mod win {
 
     pub fn list_output_devices() -> Result<Vec<AudioOutputDevice>, String> {
         unsafe {
-            let _ = CoInitializeEx(null_mut(), 0);
+            let _com_guard = ComGuard(CoInitializeEx(null_mut(), 0) >= 0);
             let _ = crate::am_agent::init_process_com_security();
             let mut enumerator: *mut c_void = null_mut();
             let hr = CoCreateInstance(
@@ -3193,7 +3498,7 @@ mod win {
             return Err("设备 ID 不能为空".to_string());
         }
         unsafe {
-            let _ = CoInitializeEx(null_mut(), 0);
+            let _com_guard = ComGuard(CoInitializeEx(null_mut(), 0) >= 0);
             let _ = crate::am_agent::init_process_com_security();
             let mut policy: *mut c_void = null_mut();
             let mut hr = CoCreateInstance(
@@ -3723,11 +4028,13 @@ mod win {
             .name("am-wasapi-viz".to_string())
             .stack_size(512 * 1024)
             .spawn(move || unsafe {
-                let _ = CoInitializeEx(null_mut(), 0);
+                let _com_guard = ComGuard(CoInitializeEx(null_mut(), 0) >= 0);
                 let _ = crate::am_agent::init_process_com_security();
                 let mut cap: Option<LoopbackCapture> = None;
                 let mut accum = ForensicAccumulator::new(48_000);
                 let mut tempo = TempoTracker::new(48_000);
+                let mut spec_analyzer = SharedSpectrumAnalyzer::new();
+                let mut spec_buf_2048: Vec<f32> = vec![0.0; 2048];
                 let mut fft_win_buf: Vec<f32> = vec![0.0; accum.fft_len()];
                 let mut pcm_scratch: Vec<[f32; 2]> = Vec::with_capacity(2048);
 
@@ -3735,6 +4042,7 @@ mod win {
                 let mut was_silent_long = false;
                 let mut was_live_prev = false;
                 let mut last_dev_check = Instant::now();
+                let mut last_shared_fft = Instant::now() - Duration::from_secs(1);
                 let mut last_forensic_fft = Instant::now() - Duration::from_secs(1);
                 let mut last_session_poll = Instant::now() - Duration::from_secs(2);
                 let mut cached_apps: Vec<ActiveAudioApp> = Vec::new();
@@ -3746,7 +4054,9 @@ mod win {
 
                 loop {
                     let mut awaiting_onset = AMP_AWAITING_ONSET.load(Ordering::Acquire);
-                    let viz_sub = VIZ_SUBSCRIBED.load(Ordering::Acquire);
+                    let sub_mode = viz_sub_mode();
+                    let viz_sub = sub_mode != VizSubMode::Off;
+                    let full_viz = sub_mode == VizSubMode::FullVisualizer;
 
                     // Zero-CPU Condvar sleep when UI is NOT subscribed to visualizer AND not awaiting onset
                     if !viz_sub && !awaiting_onset {
@@ -3756,10 +4066,15 @@ mod win {
                         if let Ok(mut rs) = RING_STATE.write() {
                             rs.active_signal = false;
                         }
+                        if let Ok(mut sp) = SHARED_SPECTRUM.write() {
+                            sp.raw_32 = [0.0; 32];
+                            sp.raw_64 = [0.0; 64];
+                            sp.raw_120 = [0.0; 120];
+                        }
                         was_live_prev = false;
                         let (lock, cvar) = &*WAKE_COND;
                         if let Ok(mut g) = lock.lock() {
-                            while !VIZ_SUBSCRIBED.load(Ordering::Acquire)
+                            while !is_viz_subscribed()
                                 && !AMP_AWAITING_ONSET.load(Ordering::Acquire)
                             {
                                 let res = cvar.wait_timeout(g, Duration::from_secs(5)).unwrap();
@@ -3959,6 +4274,8 @@ mod win {
                         continue;
                     }
 
+                    let inspector_active =
+                        full_viz && INSPECTOR_STYLE_ACTIVE.load(Ordering::Acquire);
                     let has_signal = total_frames > 0 && (peak_l > 1.2e-4 || peak_r > 1.2e-4);
                     if has_signal {
                         if was_silent_long && AUTO_RESET_SILENCE.load(Ordering::Acquire) {
@@ -3967,12 +4284,17 @@ mod win {
                         }
                         was_silent_long = false;
                         last_packet_at = Instant::now();
-                        accum.observe_pcm_samples(&pcm_scratch);
-                        tempo.observe_stereo_pcm(&pcm_scratch);
-                        if let Ok(mut ts) = SHARED_TEMPO.write() {
-                            ts.bpm = tempo.locked_bpm;
-                            ts.beat_phase = tempo.beat_phase;
-                            ts.beat_seq = tempo.beat_seq;
+                        // Run ForensicAccumulator ONLY in AudioInspector mode; TempoTracker in FullVisualizer
+                        if full_viz {
+                            if inspector_active {
+                                accum.observe_pcm_samples(&pcm_scratch);
+                            }
+                            tempo.observe_stereo_pcm(&pcm_scratch);
+                            if let Ok(mut ts) = SHARED_TEMPO.write() {
+                                ts.bpm = tempo.locked_bpm;
+                                ts.beat_phase = tempo.beat_phase;
+                                ts.beat_seq = tempo.beat_seq;
+                            }
                         }
                     } else if last_packet_at.elapsed() >= Duration::from_millis(2200) {
                         was_silent_long = true;
@@ -3983,6 +4305,7 @@ mod win {
                     if let Some(ref c) = cap {
                         // Commit new stereo samples into the shared high-speed ring buffer
                         let mut mono_tail_for_fft = false;
+                        let mut shared_fft_kind: u8 = 0; // 0=none, 1=mini512 (~30Hz), 2=full2048 (~60Hz)
                         if let Ok(mut rs) = RING_STATE.write() {
                             rs.active_signal = is_live;
                             rs.device_id = c.dev_id.clone();
@@ -3997,61 +4320,116 @@ mod win {
                                 rs.write_pos = (wp + 1) & RING_MASK;
                             }
 
-                            if is_live && total_frames > 0 {
-                                let rms = (sum_sq / (total_frames as f32)).sqrt();
-                                let dl = (20.0 * peak_l.max(1.58e-5).log10()).clamp(-96.0, 0.0);
-                                let dr = (20.0 * peak_r.max(1.58e-5).log10()).clamp(-96.0, 0.0);
-                                let drms = (20.0 * rms.max(1.58e-5).log10()).clamp(-96.0, 0.0);
-                                let crest = (dl.max(dr) - drms).max(0.0);
-                                let denom = (sum_l2 * sum_r2).sqrt();
-                                let corr = if denom > 1e-9 {
-                                    (sum_lr / denom).clamp(-1.0, 1.0)
-                                } else {
-                                    1.0
-                                };
-                                let tot_ms = sum_mid2 + sum_side2;
-                                let width = if tot_ms > 1e-9 {
-                                    ((sum_side2 / tot_ms).sqrt() * 140.0).clamp(0.0, 100.0)
-                                } else {
-                                    0.0
-                                };
-                                rs.peak_db_l = rs.peak_db_l * 0.45 + dl * 0.55;
-                                rs.peak_db_r = rs.peak_db_r * 0.45 + dr * 0.55;
-                                rs.rms_db = rs.rms_db * 0.55 + drms * 0.45;
-                                rs.dynamic_range_db = rs.dynamic_range_db * 0.65 + crest * 0.35;
-                                rs.phase_correlation = rs.phase_correlation * 0.6 + corr * 0.4;
-                                rs.stereo_width_pct = rs.stereo_width_pct * 0.6 + width * 0.4;
-                            } else if !is_live {
-                                rs.peak_db_l = -96.0;
-                                rs.peak_db_r = -96.0;
-                                rs.rms_db = -96.0;
-                                rs.dynamic_range_db = 0.0;
+                            if is_live {
+                                if full_viz && last_shared_fft.elapsed() >= Duration::from_millis(16)
+                                {
+                                    let start = (rs.write_pos + RING_LEN - 2048) & RING_MASK;
+                                    for i in 0..2048 {
+                                        let lr = rs.stereo[(start + i) & RING_MASK];
+                                        spec_buf_2048[i] = 0.5 * (lr[0] + lr[1]);
+                                    }
+                                    shared_fft_kind = 2;
+                                } else if !full_viz
+                                    && last_shared_fft.elapsed() >= Duration::from_millis(32)
+                                {
+                                    let start = (rs.write_pos + RING_LEN - 512) & RING_MASK;
+                                    for i in 0..512 {
+                                        let lr = rs.stereo[(start + i) & RING_MASK];
+                                        spec_buf_2048[i] = 0.5 * (lr[0] + lr[1]);
+                                    }
+                                    shared_fft_kind = 1;
+                                }
                             }
 
-                            if is_live && last_forensic_fft.elapsed() >= Duration::from_millis(14) {
-                                last_forensic_fft = Instant::now();
-                                let flen = accum.fft_len();
-                                let start = (rs.write_pos + RING_LEN - flen) & RING_MASK;
-                                for i in 0..flen {
-                                    let lr = rs.stereo[(start + i) & RING_MASK];
-                                    fft_win_buf[i] = 0.5 * (lr[0] + lr[1]);
+                            if full_viz {
+                                if is_live && total_frames > 0 {
+                                    let rms = (sum_sq / (total_frames as f32)).sqrt();
+                                    let dl = (20.0 * peak_l.max(1.58e-5).log10()).clamp(-96.0, 0.0);
+                                    let dr = (20.0 * peak_r.max(1.58e-5).log10()).clamp(-96.0, 0.0);
+                                    let drms = (20.0 * rms.max(1.58e-5).log10()).clamp(-96.0, 0.0);
+                                    let crest = (dl.max(dr) - drms).max(0.0);
+                                    let denom = (sum_l2 * sum_r2).sqrt();
+                                    let corr = if denom > 1e-9 {
+                                        (sum_lr / denom).clamp(-1.0, 1.0)
+                                    } else {
+                                        1.0
+                                    };
+                                    let tot_ms = sum_mid2 + sum_side2;
+                                    let width = if tot_ms > 1e-9 {
+                                        ((sum_side2 / tot_ms).sqrt() * 140.0).clamp(0.0, 100.0)
+                                    } else {
+                                        0.0
+                                    };
+                                    rs.peak_db_l = rs.peak_db_l * 0.45 + dl * 0.55;
+                                    rs.peak_db_r = rs.peak_db_r * 0.45 + dr * 0.55;
+                                    rs.rms_db = rs.rms_db * 0.55 + drms * 0.45;
+                                    rs.dynamic_range_db = rs.dynamic_range_db * 0.65 + crest * 0.35;
+                                    rs.phase_correlation = rs.phase_correlation * 0.6 + corr * 0.4;
+                                    rs.stereo_width_pct = rs.stereo_width_pct * 0.6 + width * 0.4;
+                                } else if !is_live {
+                                    rs.peak_db_l = -96.0;
+                                    rs.peak_db_r = -96.0;
+                                    rs.rms_db = -96.0;
+                                    rs.dynamic_range_db = 0.0;
                                 }
-                                mono_tail_for_fft = true;
+
+                                if inspector_active
+                                    && is_live
+                                    && last_forensic_fft.elapsed() >= Duration::from_millis(16)
+                                {
+                                    last_forensic_fft = Instant::now();
+                                    let flen = accum.fft_len();
+                                    let start = (rs.write_pos + RING_LEN - flen) & RING_MASK;
+                                    for i in 0..flen {
+                                        let lr = rs.stereo[(start + i) & RING_MASK];
+                                        fft_win_buf[i] = 0.5 * (lr[0] + lr[1]);
+                                    }
+                                    mono_tail_for_fft = true;
+                                }
+                            }
+                        }
+
+                        // Compute shared 2048-pt / 512-pt FFT on loopback DSP thread (~60 Hz / ~30 Hz)
+                        if shared_fft_kind == 2 {
+                            last_shared_fft = Instant::now();
+                            let (r32, r64, r120) =
+                                spec_analyzer.compute_raw_bands(&spec_buf_2048, c.sample_rate);
+                            if let Ok(mut sp) = SHARED_SPECTRUM.write() {
+                                sp.seq = sp.seq.wrapping_add(1).max(1);
+                                sp.raw_32 = r32;
+                                sp.raw_64 = r64;
+                                sp.raw_120 = r120;
+                            }
+                        } else if shared_fft_kind == 1 {
+                            last_shared_fft = Instant::now();
+                            let r32 = spec_analyzer
+                                .compute_raw_32_fast(&spec_buf_2048[..512], c.sample_rate);
+                            if let Ok(mut sp) = SHARED_SPECTRUM.write() {
+                                sp.seq = sp.seq.wrapping_add(1).max(1);
+                                sp.raw_32 = r32;
+                            }
+                        } else if !is_live && was_live_prev {
+                            if let Ok(mut sp) = SHARED_SPECTRUM.write() {
+                                sp.raw_32 = [0.0; 32];
+                                sp.raw_64 = [0.0; 64];
+                                sp.raw_120 = [0.0; 120];
                             }
                         }
 
                         // Wake idle UI window immediately when audio transitions from silence -> active
                         let onset_now = is_live && !was_live_prev;
                         if onset_now {
-                            cached_apps =
-                                query_active_audio_apps_on_device(&c.dev_id, &mut io_hist);
-                            last_session_poll = Instant::now();
-                            if !AMP_AWAITING_ONSET.load(Ordering::Acquire) {
-                                let amp_on = cached_apps.iter().any(|a| {
-                                    a.exe_name.eq_ignore_ascii_case("AMPLibraryAgent.exe")
-                                        && a.peak_db > -80.0
-                                });
-                                AMP_AGENT_SESSION_ACTIVE.store(amp_on, Ordering::Release);
+                            if inspector_active {
+                                cached_apps =
+                                    query_active_audio_apps_on_device(&c.dev_id, &mut io_hist);
+                                last_session_poll = Instant::now();
+                                if !AMP_AWAITING_ONSET.load(Ordering::Acquire) {
+                                    let amp_on = cached_apps.iter().any(|a| {
+                                        a.exe_name.eq_ignore_ascii_case("AMPLibraryAgent.exe")
+                                            && a.peak_db > -80.0
+                                    });
+                                    AMP_AGENT_SESSION_ACTIVE.store(amp_on, Ordering::Release);
+                                }
                             }
                             wake_registered_ui_window();
                         } else if !is_live && !AMP_AWAITING_ONSET.load(Ordering::Acquire) {
@@ -4059,8 +4437,8 @@ mod win {
                         }
                         was_live_prev = is_live;
 
-                        // Update forensic 4096/8192-pt FFT & Spek column at >=60Hz when live
-                        if mono_tail_for_fft {
+                        // Update forensic 4096/8192-pt FFT & Spek column ONLY in AudioInspector mode
+                        if inspector_active && mono_tail_for_fft {
                             if last_session_poll.elapsed() >= Duration::from_millis(850) {
                                 last_session_poll = Instant::now();
                                 cached_apps =
@@ -4107,7 +4485,7 @@ mod win {
                                 fs.active_apps = cached_apps.clone();
                             }
 
-                            // Also keep legacy LATEST_VIZ snapshot fresh for tests/diagnostics
+                            // Keep lightweight LATEST_VIZ device metadata fresh WITHOUT burning dead 32x512 Goertzel!
                             if let Ok(mut lv) = LATEST_VIZ.write() {
                                 lv.active_signal = is_live;
                                 lv.device_id = c.dev_id.clone();
@@ -4115,11 +4493,6 @@ mod win {
                                 lv.device_sample_rate = c.sample_rate;
                                 lv.device_bit_depth = c.bit_depth;
                                 lv.device_channels = c.channels;
-                                lv.spectrum = compute_spectrum_32(
-                                    &fft_win_buf[fft_win_buf.len() - 512..],
-                                    c.sample_rate as f32,
-                                )
-                                .to_vec();
                                 if let Ok(rs) = RING_STATE.read() {
                                     lv.peak_db_l = rs.peak_db_l;
                                     lv.peak_db_r = rs.peak_db_r;
@@ -4129,7 +4502,7 @@ mod win {
                                     lv.stereo_width_pct = rs.stereo_width_pct;
                                 }
                             }
-                        } else if !is_live {
+                        } else if full_viz && !is_live {
                             // During silence on Visualizer page, decay spectrum once and sleep deeply (~60ms) so CPU < 0.1%
                             if let Ok(mut fs) = FORENSIC_SUMMARY.write() {
                                 let mut any_above = false;
@@ -4152,8 +4525,9 @@ mod win {
                     }
 
                     if is_live {
-                        // ~6ms capture cadence (~166Hz) keeps the ring buffer silky-smooth for 60Hz..240Hz VSync rendering
-                        std::thread::sleep(Duration::from_millis(6));
+                        // ~10ms (~100Hz) for FullVisualizer, ~33ms (~30Hz) aligned for lightweight MiniBars5 mode!
+                        let live_sleep = if full_viz { 10 } else { 33 };
+                        std::thread::sleep(Duration::from_millis(live_sleep));
                     } else if awaiting_onset {
                         // 25ms cadence while awaiting AMPLibraryAgent audio onset
                         std::thread::sleep(Duration::from_millis(25));

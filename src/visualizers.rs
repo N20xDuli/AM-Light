@@ -231,6 +231,15 @@ pub struct VisualizerState {
     onset_counter: u32,
     xp_peaks: [f32; 48],
     xp_peak_vel: [f32; 48],
+    /// Cached semicircle reference arcs for AudioInspector Soundstage (`cx, cy, rad` bits)
+    soundstage_arcs_cache: (u32, u32, u32, [Vec<(f32, f32)>; 3]),
+    /// Cached RBMK "Elena" steel biological shield rim polyline (`cx, cy, rx, ry` bits)
+    elena_ring_cache: (u32, u32, u32, u32, Vec<(f32, f32)>),
+    /// Reusable polyline scratch buffers to eliminate per-frame heap allocations in FFT / Scope / Silk
+    scratch_pts_a: Vec<(f32, f32)>,
+    scratch_pts_b: Vec<(f32, f32)>,
+    /// Telemetry: number of 3D Matrix Core cuboids actually drawn in the latest frame
+    pub last_matrix_drawn_count: usize,
     pub hit_zones: Vec<VizHitZone>,
 }
 
@@ -315,7 +324,7 @@ impl Default for VisualizerState {
             ripples: Vec::with_capacity(8),
             rods,
             matrix_pillars,
-            soundstage_phosphor: VecDeque::with_capacity(1664),
+            soundstage_phosphor: VecDeque::with_capacity(448),
             soundstage_multicolor: false, // Default = Blue monochrome; click soundstage to toggle 5-color
             soundstage_gain: 1.85,
             soundstage_rms_ema: 0.18,
@@ -334,6 +343,11 @@ impl Default for VisualizerState {
             onset_counter: 0,
             xp_peaks: [0.0; 48],
             xp_peak_vel: [0.0; 48],
+            soundstage_arcs_cache: (0, 0, 0, [Vec::new(), Vec::new(), Vec::new()]),
+            elena_ring_cache: (0, 0, 0, 0, Vec::new()),
+            scratch_pts_a: Vec::with_capacity(256),
+            scratch_pts_b: Vec::with_capacity(256),
+            last_matrix_drawn_count: 0,
             hit_zones: Vec::with_capacity(16),
         }
     }
@@ -504,6 +518,15 @@ impl VisualizerState {
         self.matrix_pillars.len()
     }
 
+    /// Returns the number of active 3D Matrix Core cuboids selected for rendering (`<= 361` via
+    /// crisp 2x2 lattice stride + outer-corner culling, cutting D2D calls by >75%).
+    pub fn matrix_render_active_count(&self) -> usize {
+        self.matrix_pillars
+            .iter()
+            .filter(|p| (p.gx & 1) == 0 && (p.gy & 1) == 0 && !(p.dist_norm > 1.12 && p.z < 0.8))
+            .count()
+    }
+
     /// Returns `(scatter_history_count, smooth_lvl_l, smooth_lvl_r)` for Soundstage verification.
     pub fn soundstage_stats(&self) -> (usize, f32, f32) {
         (
@@ -581,7 +604,26 @@ impl VisualizerState {
         }
     }
 
+    /// Steps ALL visualizer subsystems (used by unit tests verifying multiple styles on a single `VisualizerState`).
+    /// Production UI rendering calls `step_active()` to step ONLY the currently visible `self.style` & sub-style!
     pub fn step(&mut self, snap: &LiveVisualizerSnapshot, dt_sec: f32, reduce_motion: bool) {
+        self.step_impl(snap, dt_sec, reduce_motion, true);
+    }
+
+    /// Production hot-path stepper: steps ONLY the active `self.style` (and active Reactor sub-style),
+    /// skipping 1,369 matrix pillars + 193 control rods + soundstage dots when another style is shown!
+    pub fn step_active(&mut self, snap: &LiveVisualizerSnapshot, dt_sec: f32, reduce_motion: bool) {
+        crate::audio_viz::set_active_viz_style_inspector(self.style == VizStyle::AudioInspector);
+        self.step_impl(snap, dt_sec, reduce_motion, false);
+    }
+
+    fn step_impl(
+        &mut self,
+        snap: &LiveVisualizerSnapshot,
+        dt_sec: f32,
+        reduce_motion: bool,
+        step_all_styles: bool,
+    ) {
         let dt = dt_sec.clamp(0.001, 0.05);
         self.last_dt_sec = dt;
         if snap.paused {
@@ -601,386 +643,424 @@ impl VisualizerState {
                 || snap.mid_energy > 0.015
                 || snap.bass_energy > 0.015);
 
-        // Update adaptive spectrogram / FFT frequency ceiling (`24 kHz` default -> `48 kHz` / `96 kHz` on ultrasonic content)
-        self.adaptive_max_hz = compute_adaptive_display_max_hz(
-            self.adaptive_max_hz,
-            snap.nyquist_hz,
-            &snap.inst_spectrum_db,
-            &snap.peak_envelope_db,
-            snap.cutoff_hz,
-            snap.analyzed_frames,
-        );
+        let run_inspector = step_all_styles || self.style == VizStyle::AudioInspector;
+        let run_osu = step_all_styles || self.style == VizStyle::OsuCircle;
+        let run_reactor = step_all_styles || self.style == VizStyle::ChernobylRods;
+        let run_matrix = step_all_styles || (run_reactor && self.reactor_sub_style == 0);
+        let run_rods = step_all_styles || (run_reactor && self.reactor_sub_style != 0);
+        let run_xp = step_all_styles || self.style == VizStyle::WinXpRetro;
 
-        // 0. True Fixed-Coordinate CRT Phosphor Persistence (`声场图`)
-        // Existing dots stay strictly frozen at their birth `(sx, sy)` coordinates while decaying exponentially!
-        let phos_decay = (-2.25 * dt).exp();
-        for dot in &mut self.soundstage_phosphor {
-            dot.life *= phos_decay;
-        }
-        self.soundstage_phosphor.retain(|d| d.life > 0.018);
+        if run_inspector {
+            // Update adaptive spectrogram / FFT frequency ceiling (`24 kHz` default -> `48 kHz` / `96 kHz` on ultrasonic content)
+            self.adaptive_max_hz = compute_adaptive_display_max_hz(
+                self.adaptive_max_hz,
+                snap.nyquist_hz,
+                &snap.inst_spectrum_db,
+                &snap.peak_envelope_db,
+                snap.cutoff_hz,
+                snap.analyzed_frames,
+            );
 
-        if is_audible && !snap.soundstage_lr.is_empty() {
-            let mut sum_l2 = 0.0f32;
-            let mut sum_r2 = 0.0f32;
-            for &[l, rr] in &snap.soundstage_lr {
-                sum_l2 += l * l;
-                sum_r2 += rr * rr;
+            // 0. True Fixed-Coordinate CRT Phosphor Persistence (`声场图`)
+            let phos_decay = (-2.25 * dt).exp();
+            for dot in &mut self.soundstage_phosphor {
+                dot.life *= phos_decay;
             }
-            let n_inv = 1.0 / (snap.soundstage_lr.len() as f32);
-            let rms_l = (sum_l2 * n_inv).sqrt();
-            let rms_r = (sum_r2 * n_inv).sqrt();
-            let rms_avg = ((sum_l2 + sum_r2) * 0.5 * n_inv).sqrt();
-            let rms_l_db = 20.0 * rms_l.max(1.58e-5).log10();
-            let rms_r_db = 20.0 * rms_r.max(1.58e-5).log10();
-            let eff_l_db = rms_l_db.max(snap.peak_db_l - 6.0);
-            let eff_r_db = rms_r_db.max(snap.peak_db_r - 6.0);
-            let tgt_l = ((eff_l_db + 58.0) / 56.0).clamp(0.0, 1.0);
-            let tgt_r = ((eff_r_db + 58.0) / 56.0).clamp(0.0, 1.0);
-            let k_bar = (1.0 - (-18.0 * dt).exp()).clamp(0.05, 1.0);
-            self.smooth_lvl_l += (tgt_l - self.smooth_lvl_l) * k_bar;
-            self.smooth_lvl_r += (tgt_r - self.smooth_lvl_r) * k_bar;
+            self.soundstage_phosphor.retain(|d| d.life > 0.018);
 
-            // Volume-independent adaptive RMS AGC: keeps Soundstage radius steady across low & high playback volumes!
-            let rms_k = if rms_avg > self.soundstage_rms_ema {
-                (1.0 - (-10.0 * dt).exp()).clamp(0.04, 1.0)
-            } else {
-                (1.0 - (-2.6 * dt).exp()).clamp(0.02, 1.0)
-            };
-            self.soundstage_rms_ema += (rms_avg.max(0.0025) - self.soundstage_rms_ema) * rms_k;
-            let target_gain = (0.42 / self.soundstage_rms_ema.max(0.0035)).clamp(0.65, 24.0);
-            let gain_rate = if target_gain < self.soundstage_gain {
-                (9.0 * dt).min(1.0)
-            } else {
-                (3.0 * dt).min(1.0)
-            };
-            self.soundstage_gain += (target_gain - self.soundstage_gain) * gain_rate;
-            let gain = self.soundstage_gain;
-
-            let fallback_bands;
-            let band_pts: &[[f32; 3]] = if !snap.soundstage_band_pts.is_empty() {
-                &snap.soundstage_band_pts
-            } else {
-                fallback_bands = crate::audio_viz::split_stereo_5band_soundstage(
-                    &snap.soundstage_lr,
-                    snap.sample_rate,
-                );
-                &fallback_bands
-            };
-            let stride = if band_pts.len() >= 260 { 2 } else { 1 };
-            for &[l, rr, bf] in band_pts.iter().step_by(stride) {
-                let (sx, sy) = map_lr_to_semicircle(l, rr, gain);
-                if sx.abs() + sy.abs() < 0.012 {
-                    continue;
+            if is_audible && !snap.soundstage_lr.is_empty() {
+                let mut sum_l2 = 0.0f32;
+                let mut sum_r2 = 0.0f32;
+                for &[l, rr] in &snap.soundstage_lr {
+                    sum_l2 += l * l;
+                    sum_r2 += rr * rr;
                 }
-                if self.soundstage_phosphor.len() >= 1600 {
-                    self.soundstage_phosphor.pop_front();
+                let n_inv = 1.0 / (snap.soundstage_lr.len() as f32);
+                let rms_l = (sum_l2 * n_inv).sqrt();
+                let rms_r = (sum_r2 * n_inv).sqrt();
+                let rms_avg = ((sum_l2 + sum_r2) * 0.5 * n_inv).sqrt();
+                let rms_l_db = 20.0 * rms_l.max(1.58e-5).log10();
+                let rms_r_db = 20.0 * rms_r.max(1.58e-5).log10();
+                let eff_l_db = rms_l_db.max(snap.peak_db_l - 6.0);
+                let eff_r_db = rms_r_db.max(snap.peak_db_r - 6.0);
+                let tgt_l = ((eff_l_db + 58.0) / 56.0).clamp(0.0, 1.0);
+                let tgt_r = ((eff_r_db + 58.0) / 56.0).clamp(0.0, 1.0);
+                let k_bar = (1.0 - (-18.0 * dt).exp()).clamp(0.05, 1.0);
+                self.smooth_lvl_l += (tgt_l - self.smooth_lvl_l) * k_bar;
+                self.smooth_lvl_r += (tgt_r - self.smooth_lvl_r) * k_bar;
+
+                let rms_k = if rms_avg > self.soundstage_rms_ema {
+                    (1.0 - (-10.0 * dt).exp()).clamp(0.04, 1.0)
+                } else {
+                    (1.0 - (-2.6 * dt).exp()).clamp(0.02, 1.0)
+                };
+                self.soundstage_rms_ema += (rms_avg.max(0.0025) - self.soundstage_rms_ema) * rms_k;
+                let target_gain = (0.42 / self.soundstage_rms_ema.max(0.0035)).clamp(0.65, 24.0);
+                let gain_rate = if target_gain < self.soundstage_gain {
+                    (9.0 * dt).min(1.0)
+                } else {
+                    (3.0 * dt).min(1.0)
+                };
+                self.soundstage_gain += (target_gain - self.soundstage_gain) * gain_rate;
+                let gain = self.soundstage_gain;
+
+                let fallback_bands;
+                let band_pts: &[[f32; 3]] = if !snap.soundstage_band_pts.is_empty() {
+                    &snap.soundstage_band_pts
+                } else {
+                    fallback_bands = crate::audio_viz::split_stereo_5band_soundstage(
+                        &snap.soundstage_lr,
+                        snap.sample_rate,
+                    );
+                    &fallback_bands
+                };
+                // Use a stride coprime to 5 (1, 2, or 3) so all 5 interleaved frequency bands are
+                // sampled evenly while keeping phosphor dot density bounded at <= 420 dots.
+                let stride = if band_pts.len() >= 220 {
+                    3
+                } else if band_pts.len() >= 110 {
+                    2
+                } else {
+                    1
+                };
+                for &[l, rr, bf] in band_pts.iter().step_by(stride) {
+                    let (sx, sy) = map_lr_to_semicircle(l, rr, gain);
+                    if sx.abs() + sy.abs() < 0.012 {
+                        continue;
+                    }
+                    if self.soundstage_phosphor.len() >= 420 {
+                        self.soundstage_phosphor.pop_front();
+                    }
+                    self.soundstage_phosphor.push_back(PhosphorDot {
+                        sx,
+                        sy,
+                        band: (bf.round() as u8).min(4),
+                        life: 1.0,
+                    });
                 }
-                self.soundstage_phosphor.push_back(PhosphorDot {
-                    sx,
-                    sy,
-                    band: (bf.round() as u8).min(4),
-                    life: 1.0,
-                });
-            }
-        } else {
-            let decay = (-10.0 * dt).exp();
-            self.smooth_lvl_l *= decay;
-            self.smooth_lvl_r *= decay;
-            if self.smooth_lvl_l < 0.004 {
-                self.smooth_lvl_l = 0.0;
-            }
-            if self.smooth_lvl_r < 0.004 {
-                self.smooth_lvl_r = 0.0;
+            } else {
+                let decay = (-10.0 * dt).exp();
+                self.smooth_lvl_l *= decay;
+                self.smooth_lvl_r *= decay;
+                if self.smooth_lvl_l < 0.004 {
+                    self.smooth_lvl_l = 0.0;
+                }
+                if self.smooth_lvl_r < 0.004 {
+                    self.smooth_lvl_r = 0.0;
+                }
             }
         }
 
-        if reduce_motion {
-            self.emblem_scale = 1.0 + snap.bass_energy * 0.03;
-            for rod in &mut self.rods {
-                rod.vz = 0.0;
-                rod.z = if is_audible {
-                    let b = (11 + ((rod.dist_norm * 32.0) as usize)).min(58);
-                    (snap.spectrum_64[b] * 34.0).clamp(0.0, 38.0)
+        if run_osu {
+            if reduce_motion {
+                self.emblem_scale = 1.0 + snap.bass_energy * 0.03;
+            } else {
+                let bpm_norm = ((snap.estimated_bpm - 70.0) / 110.0).clamp(0.0, 1.2);
+                self.osu_rot = (self.osu_rot
+                    + dt * (0.11 + snap.bass_energy * 0.22 + bpm_norm * 0.06))
+                    % (2.0 * PI);
+                if snap.beat_triggered && is_audible {
+                    self.emblem_vel += 2.65 + snap.bass_energy * 1.45;
+                    if self.ripples.len() < 7 {
+                        self.ripples.push(ShockwaveRing {
+                            radius_extra: 0.0,
+                            alpha: 0.64,
+                        });
+                    }
+                }
+                let pll_groove = if is_audible {
+                    (-snap.beat_phase.clamp(0.0, 1.0) * 5.4).exp() * 0.055
                 } else {
                     0.0
                 };
-            }
-            for p in &mut self.matrix_pillars {
-                p.vz = 0.0;
-                p.z = if is_audible {
-                    let dome = (-2.6 * p.dist_norm * p.dist_norm).exp();
-                    let b = ((p.dist_norm * 46.0) as usize).min(60);
-                    ((snap.spectrum_64[b] * 0.85 + snap.bass_energy * dome) * 52.0).clamp(0.0, 56.0)
-                } else {
-                    0.0
-                };
-            }
-            return;
-        }
+                let target_scale = 1.0 + pll_groove + snap.bass_energy * 0.035;
+                let force = -205.0 * (self.emblem_scale - target_scale) - 19.0 * self.emblem_vel;
+                self.emblem_vel += force * dt;
+                self.emblem_scale = (self.emblem_scale + self.emblem_vel * dt).clamp(0.94, 1.28);
 
-        // 1. osu! circular emblem phase-locked BPM bounce & particles
-        let bpm_norm = ((snap.estimated_bpm - 70.0) / 110.0).clamp(0.0, 1.2);
-        self.osu_rot =
-            (self.osu_rot + dt * (0.11 + snap.bass_energy * 0.22 + bpm_norm * 0.06)) % (2.0 * PI);
-        if snap.beat_triggered && is_audible {
-            self.emblem_vel += 2.65 + snap.bass_energy * 1.45;
-            if self.ripples.len() < 7 {
-                self.ripples.push(ShockwaveRing {
-                    radius_extra: 0.0,
-                    alpha: 0.64,
-                });
-            }
-        }
-        // Couple emblem resting target to the PLL beat_phase envelope so every tracked beat visibly pulses!
-        let pll_groove = if is_audible {
-            (-snap.beat_phase.clamp(0.0, 1.0) * 5.4).exp() * 0.055
-        } else {
-            0.0
-        };
-        let target_scale = 1.0 + pll_groove + snap.bass_energy * 0.035;
-        let force = -205.0 * (self.emblem_scale - target_scale) - 19.0 * self.emblem_vel;
-        self.emblem_vel += force * dt;
-        self.emblem_scale = (self.emblem_scale + self.emblem_vel * dt).clamp(0.94, 1.28);
-
-        for rip in &mut self.ripples {
-            rip.radius_extra += (155.0 + snap.bass_energy * 165.0) * dt;
-            rip.alpha -= 0.78 * dt;
-        }
-        self.ripples.retain(|r| r.alpha > 0.01);
-
-        let energy_boost = 1.0 + snap.bass_energy * 2.6 + snap.beat_pulse * 1.9;
-        for p in &mut self.particles {
-            p.dist_norm += p.speed * energy_boost * dt;
-            if p.dist_norm >= 1.0 {
-                p.dist_norm -= 1.0;
-            }
-        }
-
-        // 2. Calibrated Multi-Band Reactor Physics (RBMK Control Rods + 37x37 Luminescent Matrix Core)
-        if is_audible {
-            let target_agc = spec_peak.clamp(0.14, 0.88);
-            let agc_rate = if target_agc > self.reactor_agc {
-                (8.5 * dt).min(1.0)
-            } else {
-                (1.4 * dt).min(1.0)
-            };
-            self.reactor_agc += (target_agc - self.reactor_agc) * agc_rate;
-
-            let effective_db = if snap.rms_db > -90.0 {
-                snap.rms_db.max(peak_db - 5.5)
-            } else {
-                -56.0 + spec_peak * 48.0
-            };
-            let loud_scale = ((effective_db + 56.0) / 46.0).clamp(0.32, 1.02);
-            let agc_inv = (1.0 / self.reactor_agc.max(0.14)).clamp(0.95, 3.8);
-
-            // Per-band transient spectral flux (smoothed to avoid hyper-jitter on minor percussion)
-            let bass_flux = (snap.bass_energy - self.bass_ema).max(0.0);
-            let mid_flux = (snap.mid_energy - self.mid_ema).max(0.0);
-            let high_flux = (snap.high_energy - self.high_ema).max(0.0);
-            let band_ema_k = (1.0 - (-5.2 * dt).exp()).clamp(0.01, 1.0);
-            self.bass_ema += (snap.bass_energy - self.bass_ema) * band_ema_k;
-            self.mid_ema += (snap.mid_energy - self.mid_ema) * band_ema_k;
-            self.high_ema += (snap.high_energy - self.high_ema) * band_ema_k;
-
-            let broadband_now =
-                snap.bass_energy * 0.90 + snap.mid_energy * 1.15 + snap.high_energy * 0.78;
-            let bb_rise = (broadband_now - self.broadband_ema).max(0.0);
-            self.broadband_ema += (broadband_now - self.broadband_ema) * band_ema_k;
-            self.flux_cooldown_sec = (self.flux_cooldown_sec - dt).max(0.0);
-            self.matrix_kick_cd = (self.matrix_kick_cd - dt).max(0.0);
-
-            let flux_onset = (bb_rise > 0.058 || bass_flux > 0.068 || mid_flux > 0.072)
-                && self.flux_cooldown_sec <= 0.0;
-            let transient_hit = snap.beat_triggered || flux_onset;
-            if transient_hit {
-                self.onset_counter = self.onset_counter.wrapping_add(1);
-                if !snap.beat_triggered {
-                    self.flux_cooldown_sec = 0.125;
+                for rip in &mut self.ripples {
+                    rip.radius_extra += (155.0 + snap.bass_energy * 165.0) * dt;
+                    rip.alpha -= 0.78 * dt;
                 }
-            }
+                self.ripples.retain(|r| r.alpha > 0.01);
 
-            // Launch restrained radial shockwave across the 37x37 matrix on decisive beats & transients
-            if (snap.beat_triggered || bass_flux > 0.078 || mid_flux > 0.088)
-                && self.matrix_kick_cd <= 0.0
-            {
-                self.shockwave_radius = 0.04;
-                self.shockwave_strength = (0.42
-                    + snap.bass_energy * 0.45
-                    + bass_flux * 1.8
-                    + mid_flux * 1.4)
-                    .clamp(0.32, 0.98);
-                self.matrix_kick_cd = 0.135;
-            } else {
-                self.shockwave_radius += (2.15 + snap.bass_energy * 0.95) * dt;
-                self.shockwave_strength *= (-3.4 * dt).exp();
-            }
-
-            let onset_group = (self.onset_counter as usize) % 3;
-            let wave_phase = self.time_sec * 6.8;
-
-            // 2A. RBMK-1000 Control Rods (Calibrated dynamics + soft-knee headroom)
-            for (idx, rod) in self.rods.iter_mut().enumerate() {
-                let azim_slot = (((rod.angle + PI) / (2.0 * PI)) * 14.0).floor() as usize % 14;
-                let musical_b = (10 + ((rod.dist_norm * 30.0) as usize) + azim_slot).min(58);
-                let upper_b = (musical_b + 5).min(62);
-                let raw_band = snap.spectrum_64[musical_b]
-                    .max(snap.spectrum_64[upper_b] * 0.88)
-                    .max(snap.mid_energy * 0.72 + snap.high_energy * 0.42 * rod.dist_norm);
-                let bass_punch = (1.0 - rod.dist_norm * 0.70).max(0.0) * snap.bass_energy * 0.88;
-                let flux_boost = bass_flux * 0.85 + mid_flux * 0.92 + high_flux * 0.70;
-                let norm_exc =
-                    ((raw_band + bass_punch + flux_boost) * agc_inv).clamp(0.0, 1.25) * loud_scale;
-
-                let radial_wave =
-                    (rod.dist_norm * 7.2 - wave_phase + rod.angle * 2.0).sin() * 0.5 + 0.5;
-                let phase_i = (idx as f32) * 2.399_963;
-                let chatter_freq = 10.6 + ((idx % 5) as f32) * 1.40;
-                let chatter_osc = (self.time_sec * chatter_freq + phase_i).sin() * 0.5 + 0.5;
-                let kind_gain = if rod.rod_kind != 0 { 1.24 } else { 0.98 };
-                let core_surge =
-                    (1.0 - rod.dist_norm * 0.62).max(0.0) * snap.beat_pulse * 0.48 * loud_scale;
-
-                let drive =
-                    norm_exc * (0.40 + 0.34 * radial_wave + 0.38 * chatter_osc) * kind_gain
-                        + core_surge;
-                let raw_z = drive * 38.0;
-                let u_z = (raw_z / 54.0).max(0.0);
-                let target_z = (54.0 * (u_z / (1.0 + 0.45 * u_z))).clamp(0.0, 56.0);
-
-                if snap.beat_triggered && rod.dist_norm < 0.68 {
-                    rod.vz += (1.0 - rod.dist_norm * 0.72) * 130.0 * loud_scale;
-                } else if transient_hit && (idx % 3 == onset_group) {
-                    let flux_kick = (bb_rise * agc_inv * 115.0).clamp(24.0, 98.0) * loud_scale;
-                    rod.vz += flux_kick * kind_gain;
-                }
-
-                let gravity = if rod.z > target_z { -102.0 } else { 0.0 };
-                let accel = (target_z - rod.z) * 160.0 - rod.vz * 13.8 + gravity;
-                rod.vz += accel * dt;
-                rod.z = (rod.z + rod.vz * dt).min(58.0);
-                if rod.z < 0.0 {
-                    rod.z = 0.0;
-                    if rod.vz < -12.0 {
-                        rod.vz = -rod.vz * 0.24;
-                    } else {
-                        rod.vz = 0.0;
+                let energy_boost = 1.0 + snap.bass_energy * 2.6 + snap.beat_pulse * 1.9;
+                for p in &mut self.particles {
+                    p.dist_norm += p.speed * energy_boost * dt;
+                    if p.dist_norm >= 1.0 {
+                        p.dist_norm -= 1.0;
                     }
                 }
             }
+        }
 
-            // 2B. High-Density 37x37 Luminescent Cuboid Matrix Core (Calmed soft-knee sensitivity)
-            let radial_phase = self.time_sec * 4.8;
-            for p in &mut self.matrix_pillars {
-                let d = p.dist_norm;
-                let core_dome = (-2.65 * d * d).exp();
-                let mid_ring = (-((d - 0.52) * 3.1).powi(2)).exp();
-                let outer_skirt = ((d - 0.55) * 1.4).clamp(0.0, 1.0) * (1.38 - d).clamp(0.0, 1.0);
-
-                let azim = (((p.angle + PI) / (2.0 * PI)) * 20.0).floor() as usize % 20;
-                let spec_bin = ((d * 38.0) as usize + azim).min(61);
-                let hi_bin = (36 + ((p.seed * 24.0) as usize)).min(62);
-                let band_e = (snap.spectrum_64[spec_bin] * agc_inv).clamp(0.0, 1.25);
-                let hi_e = (snap.spectrum_64[hi_bin] * agc_inv).clamp(0.0, 1.15);
-
-                let ripple =
-                    (d * 10.5 - radial_phase + p.seed * 4.2 + p.angle * 2.0).sin() * 0.5 + 0.5;
-                let micro =
-                    (self.time_sec * (5.6 + p.seed * 4.8) + p.seed * 23.0).sin() * 0.5 + 0.5;
-
-                // Expanding transient shockwave crest across all 37x37 pillars
-                let sw_dist = d - self.shockwave_radius;
-                let shockwave_lift =
-                    (-sw_dist * sw_dist * 38.0).exp() * self.shockwave_strength * 18.0;
-
-                let core_drive = core_dome
-                    * (0.20
-                        + snap.bass_energy * 1.05
-                        + snap.mid_energy * 0.76
-                        + snap.beat_pulse * 0.62
-                        + bass_flux * 1.6)
-                    * (0.62 + 0.36 * micro + 0.30 * p.seed);
-                let mid_drive = (mid_ring * 0.80 + (1.0 - (d * 0.65).min(0.92)) * 0.48)
-                    * (band_e * 0.92 + mid_flux * 1.5)
-                    * (0.34 + 0.42 * ripple + 0.24 * micro);
-                let high_drive = outer_skirt
-                    * (hi_e * 0.78 + snap.high_energy * 0.98 + high_flux * 2.0)
-                    * (0.35 + 0.58 * micro);
-
-                let raw_z = (core_drive * 40.0
-                    + mid_drive * 26.0
-                    + high_drive * 19.0
-                    + shockwave_lift)
-                    * loud_scale;
-                let u_z = (raw_z / 76.0).max(0.0);
-                let target_z = (76.0 * (u_z / (1.0 + 0.45 * u_z))).clamp(0.0, 80.0);
-
-                if snap.beat_triggered && d < 0.65 {
-                    p.vz += core_dome * (92.0 + p.seed * 52.0) * loud_scale;
-                } else if flux_onset && p.seed > 0.58 {
-                    p.vz += (mid_flux + high_flux) * 125.0 * (0.4 + 0.6 * p.seed) * loud_scale;
-                }
-
-                let accel = (target_z - p.z) * 175.0 - p.vz * 13.8;
-                p.vz += accel * dt;
-                p.z = (p.z + p.vz * dt).clamp(0.0, 88.0);
-            }
-        } else {
-            self.broadband_ema = 0.0;
-            self.bass_ema = 0.0;
-            self.mid_ema = 0.0;
-            self.high_ema = 0.0;
-            self.shockwave_strength = 0.0;
-            self.matrix_kick_cd = 0.0;
-            self.flux_cooldown_sec = 0.0;
-            for rod in &mut self.rods {
-                if rod.z > 0.0 || rod.vz != 0.0 {
-                    let accel = -rod.z * 155.0 - rod.vz * 16.5 - 105.0;
-                    rod.vz += accel * dt;
-                    rod.z += rod.vz * dt;
-                    if rod.z <= 0.02 && rod.vz.abs() < 6.0 {
-                        rod.z = 0.0;
-                        rod.vz = 0.0;
-                    } else if rod.z < 0.0 {
-                        rod.z = 0.0;
-                        rod.vz = -rod.vz * 0.16;
-                    }
-                }
-            }
-            for p in &mut self.matrix_pillars {
-                if p.z > 0.0 || p.vz != 0.0 {
-                    let accel = -p.z * 165.0 - p.vz * 22.0 - 95.0;
-                    p.vz += accel * dt;
-                    p.z += p.vz * dt;
-                    if p.z <= 0.02 && p.vz.abs() < 6.0 {
-                        p.z = 0.0;
+        if run_reactor {
+            if reduce_motion {
+                if run_matrix {
+                    for p in &mut self.matrix_pillars {
                         p.vz = 0.0;
-                    } else if p.z < 0.0 {
-                        p.z = 0.0;
-                        p.vz = -p.vz * 0.12;
+                        p.z = if is_audible {
+                            let dome = (-2.6 * p.dist_norm * p.dist_norm).exp();
+                            let b = ((p.dist_norm * 46.0) as usize).min(60);
+                            ((snap.spectrum_64[b] * 0.85 + snap.bass_energy * dome) * 52.0)
+                                .clamp(0.0, 56.0)
+                        } else {
+                            0.0
+                        };
+                    }
+                }
+                if run_rods {
+                    for rod in &mut self.rods {
+                        rod.vz = 0.0;
+                        rod.z = if is_audible {
+                            let b = (11 + ((rod.dist_norm * 32.0) as usize)).min(58);
+                            (snap.spectrum_64[b] * 34.0).clamp(0.0, 38.0)
+                        } else {
+                            0.0
+                        };
+                    }
+                }
+            } else if is_audible {
+                let target_agc = spec_peak.clamp(0.14, 0.88);
+                let agc_rate = if target_agc > self.reactor_agc {
+                    (8.5 * dt).min(1.0)
+                } else {
+                    (1.4 * dt).min(1.0)
+                };
+                self.reactor_agc += (target_agc - self.reactor_agc) * agc_rate;
+
+                let effective_db = if snap.rms_db > -90.0 {
+                    snap.rms_db.max(peak_db - 5.5)
+                } else {
+                    -56.0 + spec_peak * 48.0
+                };
+                let loud_scale = ((effective_db + 56.0) / 46.0).clamp(0.32, 1.02);
+                let agc_inv = (1.0 / self.reactor_agc.max(0.14)).clamp(0.95, 3.8);
+
+                let bass_flux = (snap.bass_energy - self.bass_ema).max(0.0);
+                let mid_flux = (snap.mid_energy - self.mid_ema).max(0.0);
+                let high_flux = (snap.high_energy - self.high_ema).max(0.0);
+                let band_ema_k = (1.0 - (-5.2 * dt).exp()).clamp(0.01, 1.0);
+                self.bass_ema += (snap.bass_energy - self.bass_ema) * band_ema_k;
+                self.mid_ema += (snap.mid_energy - self.mid_ema) * band_ema_k;
+                self.high_ema += (snap.high_energy - self.high_ema) * band_ema_k;
+
+                let broadband_now =
+                    snap.bass_energy * 0.90 + snap.mid_energy * 1.15 + snap.high_energy * 0.78;
+                let bb_rise = (broadband_now - self.broadband_ema).max(0.0);
+                self.broadband_ema += (broadband_now - self.broadband_ema) * band_ema_k;
+                self.flux_cooldown_sec = (self.flux_cooldown_sec - dt).max(0.0);
+                self.matrix_kick_cd = (self.matrix_kick_cd - dt).max(0.0);
+
+                let flux_onset = (bb_rise > 0.058 || bass_flux > 0.068 || mid_flux > 0.072)
+                    && self.flux_cooldown_sec <= 0.0;
+                let transient_hit = snap.beat_triggered || flux_onset;
+                if transient_hit {
+                    self.onset_counter = self.onset_counter.wrapping_add(1);
+                    if !snap.beat_triggered {
+                        self.flux_cooldown_sec = 0.125;
+                    }
+                }
+
+                if run_rods {
+                    let onset_group = (self.onset_counter as usize) % 3;
+                    let wave_phase = self.time_sec * 6.8;
+                    for (idx, rod) in self.rods.iter_mut().enumerate() {
+                        let azim_slot =
+                            (((rod.angle + PI) / (2.0 * PI)) * 14.0).floor() as usize % 14;
+                        let musical_b =
+                            (10 + ((rod.dist_norm * 30.0) as usize) + azim_slot).min(58);
+                        let upper_b = (musical_b + 5).min(62);
+                        let raw_band = snap.spectrum_64[musical_b]
+                            .max(snap.spectrum_64[upper_b] * 0.88)
+                            .max(snap.mid_energy * 0.72 + snap.high_energy * 0.42 * rod.dist_norm);
+                        let bass_punch =
+                            (1.0 - rod.dist_norm * 0.70).max(0.0) * snap.bass_energy * 0.88;
+                        let flux_boost = bass_flux * 0.85 + mid_flux * 0.92 + high_flux * 0.70;
+                        let norm_exc = ((raw_band + bass_punch + flux_boost) * agc_inv)
+                            .clamp(0.0, 1.25)
+                            * loud_scale;
+
+                        let radial_wave =
+                            (rod.dist_norm * 7.2 - wave_phase + rod.angle * 2.0).sin() * 0.5 + 0.5;
+                        let phase_i = (idx as f32) * 2.399_963;
+                        let chatter_freq = 10.6 + ((idx % 5) as f32) * 1.40;
+                        let chatter_osc =
+                            (self.time_sec * chatter_freq + phase_i).sin() * 0.5 + 0.5;
+                        let kind_gain = if rod.rod_kind != 0 { 1.24 } else { 0.98 };
+                        let core_surge = (1.0 - rod.dist_norm * 0.62).max(0.0)
+                            * snap.beat_pulse
+                            * 0.48
+                            * loud_scale;
+
+                        let drive = norm_exc
+                            * (0.40 + 0.34 * radial_wave + 0.38 * chatter_osc)
+                            * kind_gain
+                            + core_surge;
+                        let raw_z = drive * 38.0;
+                        let u_z = (raw_z / 54.0).max(0.0);
+                        let target_z = (54.0 * (u_z / (1.0 + 0.45 * u_z))).clamp(0.0, 56.0);
+
+                        if snap.beat_triggered && rod.dist_norm < 0.68 {
+                            rod.vz += (1.0 - rod.dist_norm * 0.72) * 130.0 * loud_scale;
+                        } else if transient_hit && (idx % 3 == onset_group) {
+                            let flux_kick =
+                                (bb_rise * agc_inv * 115.0).clamp(24.0, 98.0) * loud_scale;
+                            rod.vz += flux_kick * kind_gain;
+                        }
+
+                        let gravity = if rod.z > target_z { -102.0 } else { 0.0 };
+                        let accel = (target_z - rod.z) * 160.0 - rod.vz * 13.8 + gravity;
+                        rod.vz += accel * dt;
+                        rod.z = (rod.z + rod.vz * dt).min(58.0);
+                        if rod.z < 0.0 {
+                            rod.z = 0.0;
+                            if rod.vz < -12.0 {
+                                rod.vz = -rod.vz * 0.24;
+                            } else {
+                                rod.vz = 0.0;
+                            }
+                        }
+                    }
+                }
+
+                if run_matrix {
+                    if (snap.beat_triggered || bass_flux > 0.078 || mid_flux > 0.088)
+                        && self.matrix_kick_cd <= 0.0
+                    {
+                        self.shockwave_radius = 0.04;
+                        self.shockwave_strength = (0.42
+                            + snap.bass_energy * 0.45
+                            + bass_flux * 1.8
+                            + mid_flux * 1.4)
+                            .clamp(0.32, 0.98);
+                        self.matrix_kick_cd = 0.135;
+                    } else {
+                        self.shockwave_radius += (2.15 + snap.bass_energy * 0.95) * dt;
+                        self.shockwave_strength *= (-3.4 * dt).exp();
+                    }
+
+                    let radial_phase = self.time_sec * 4.8;
+                    for p in &mut self.matrix_pillars {
+                        let d = p.dist_norm;
+                        let core_dome = (-2.65 * d * d).exp();
+                        let mid_ring = (-((d - 0.52) * 3.1).powi(2)).exp();
+                        let outer_skirt =
+                            ((d - 0.55) * 1.4).clamp(0.0, 1.0) * (1.38 - d).clamp(0.0, 1.0);
+
+                        let azim = (((p.angle + PI) / (2.0 * PI)) * 20.0).floor() as usize % 20;
+                        let spec_bin = ((d * 38.0) as usize + azim).min(61);
+                        let hi_bin = (36 + ((p.seed * 24.0) as usize)).min(62);
+                        let band_e = (snap.spectrum_64[spec_bin] * agc_inv).clamp(0.0, 1.25);
+                        let hi_e = (snap.spectrum_64[hi_bin] * agc_inv).clamp(0.0, 1.15);
+
+                        let ripple = (d * 10.5 - radial_phase + p.seed * 4.2 + p.angle * 2.0).sin()
+                            * 0.5
+                            + 0.5;
+                        let micro =
+                            (self.time_sec * (5.6 + p.seed * 4.8) + p.seed * 23.0).sin() * 0.5
+                                + 0.5;
+
+                        let sw_dist = d - self.shockwave_radius;
+                        let shockwave_lift =
+                            (-sw_dist * sw_dist * 38.0).exp() * self.shockwave_strength * 18.0;
+
+                        let core_drive = core_dome
+                            * (0.20
+                                + snap.bass_energy * 1.05
+                                + snap.mid_energy * 0.76
+                                + snap.beat_pulse * 0.62
+                                + bass_flux * 1.6)
+                            * (0.62 + 0.36 * micro + 0.30 * p.seed);
+                        let mid_drive = (mid_ring * 0.80 + (1.0 - (d * 0.65).min(0.92)) * 0.48)
+                            * (band_e * 0.92 + mid_flux * 1.5)
+                            * (0.34 + 0.42 * ripple + 0.24 * micro);
+                        let high_drive = outer_skirt
+                            * (hi_e * 0.78 + snap.high_energy * 0.98 + high_flux * 2.0)
+                            * (0.35 + 0.58 * micro);
+
+                        let raw_z = (core_drive * 40.0
+                            + mid_drive * 26.0
+                            + high_drive * 19.0
+                            + shockwave_lift)
+                            * loud_scale;
+                        let u_z = (raw_z / 76.0).max(0.0);
+                        let target_z = (76.0 * (u_z / (1.0 + 0.45 * u_z))).clamp(0.0, 80.0);
+
+                        if snap.beat_triggered && d < 0.65 {
+                            p.vz += core_dome * (92.0 + p.seed * 52.0) * loud_scale;
+                        } else if flux_onset && p.seed > 0.58 {
+                            p.vz +=
+                                (mid_flux + high_flux) * 125.0 * (0.4 + 0.6 * p.seed) * loud_scale;
+                        }
+
+                        let accel = (target_z - p.z) * 175.0 - p.vz * 13.8;
+                        p.vz += accel * dt;
+                        p.z = (p.z + p.vz * dt).clamp(0.0, 88.0);
+                    }
+                }
+            } else {
+                self.broadband_ema = 0.0;
+                self.bass_ema = 0.0;
+                self.mid_ema = 0.0;
+                self.high_ema = 0.0;
+                self.shockwave_strength = 0.0;
+                self.matrix_kick_cd = 0.0;
+                self.flux_cooldown_sec = 0.0;
+                if run_rods {
+                    for rod in &mut self.rods {
+                        if rod.z > 0.0 || rod.vz != 0.0 {
+                            let accel = -rod.z * 155.0 - rod.vz * 16.5 - 105.0;
+                            rod.vz += accel * dt;
+                            rod.z += rod.vz * dt;
+                            if rod.z <= 0.02 && rod.vz.abs() < 6.0 {
+                                rod.z = 0.0;
+                                rod.vz = 0.0;
+                            } else if rod.z < 0.0 {
+                                rod.z = 0.0;
+                                rod.vz = -rod.vz * 0.16;
+                            }
+                        }
+                    }
+                }
+                if run_matrix {
+                    for p in &mut self.matrix_pillars {
+                        if p.z > 0.0 || p.vz != 0.0 {
+                            let accel = -p.z * 165.0 - p.vz * 22.0 - 95.0;
+                            p.vz += accel * dt;
+                            p.z += p.vz * dt;
+                            if p.z <= 0.02 && p.vz.abs() < 6.0 {
+                                p.z = 0.0;
+                                p.vz = 0.0;
+                            } else if p.z < 0.0 {
+                                p.z = 0.0;
+                                p.vz = -p.vz * 0.12;
+                            }
+                        }
                     }
                 }
             }
         }
 
-        // 3. Windows XP WMP gravity peak-hold caps
-        for i in 0..48 {
-            let src_idx = (i * 64 / 48).min(63);
-            let val = if is_audible {
-                snap.spectrum_64[src_idx]
-            } else {
-                0.0
-            };
-            if val >= self.xp_peaks[i] && val > 0.0 {
-                self.xp_peaks[i] = val;
-                self.xp_peak_vel[i] = -0.04; // brief hang at apex!
-            } else if self.xp_peaks[i] > 0.0 {
-                let grav = if is_audible { 0.62 } else { 1.35 };
-                self.xp_peak_vel[i] += grav * dt; // classic WMP gravity acceleration
-                self.xp_peaks[i] =
-                    (self.xp_peaks[i] - self.xp_peak_vel[i].max(0.0) * dt).max(0.0);
-                if self.xp_peaks[i] == 0.0 {
-                    self.xp_peak_vel[i] = 0.0;
+        if run_xp && !reduce_motion {
+            for i in 0..48 {
+                let src_idx = (i * 64 / 48).min(63);
+                let val = if is_audible {
+                    snap.spectrum_64[src_idx]
+                } else {
+                    0.0
+                };
+                if val >= self.xp_peaks[i] && val > 0.0 {
+                    self.xp_peaks[i] = val;
+                    self.xp_peak_vel[i] = -0.04;
+                } else if self.xp_peaks[i] > 0.0 {
+                    let grav = if is_audible { 0.62 } else { 1.35 };
+                    self.xp_peak_vel[i] += grav * dt;
+                    self.xp_peaks[i] =
+                        (self.xp_peaks[i] - self.xp_peak_vel[i].max(0.0) * dt).max(0.0);
+                    if self.xp_peaks[i] == 0.0 {
+                        self.xp_peak_vel[i] = 0.0;
+                    }
                 }
             }
         }
@@ -1007,6 +1087,7 @@ impl VisualizerState {
         reduce_transparency: bool,
     ) {
         self.hit_zones.clear();
+        crate::audio_viz::set_active_viz_style_inspector(self.style == VizStyle::AudioInspector);
 
         let pad = 22.0;
         let top_y = area.y + 56.0;
@@ -1565,7 +1646,7 @@ impl VisualizerState {
     }
 
     fn draw_fft_cutoff_panel(
-        &self,
+        &mut self,
         r: &mut D2DRenderer,
         panel: RectF,
         snap: &LiveVisualizerSnapshot,
@@ -1647,11 +1728,13 @@ impl VisualizerState {
 
         let use_low24 = disp_max <= 24_050.0 && snap.peak_envelope_low24_db.len() >= 64;
         let low_cap_hz = nyq.min(24_000.0);
-        let sample_curve = |bins: &[f32], src_max_hz: f32| -> Vec<(f32, f32)> {
+        // Decimate to 128 vertices into reusable scratch buffer (zero per-frame heap alloc, 2x leaner PathGeometry)
+        let fill_curve = |pts: &mut Vec<(f32, f32)>, bins: &[f32], src_max_hz: f32| {
             let n_src = bins.len();
-            let mut pts = Vec::with_capacity(256);
-            for i in 0..256 {
-                let u = (i as f32) / 255.0;
+            pts.clear();
+            const CURVE_SAMPLES: usize = 128;
+            for i in 0..CURVE_SAMPLES {
+                let u = (i as f32) / ((CURVE_SAMPLES - 1) as f32);
                 let freq = u * disp_max;
                 let pos = ((freq / src_max_hz.max(1.0)) * ((n_src - 1) as f32))
                     .clamp(0.0, (n_src - 1) as f32);
@@ -1663,7 +1746,6 @@ impl VisualizerState {
                 let y = plot.y + plot.h * ((max_db - db) / (max_db - min_db));
                 pts.push((x, y));
             }
-            pts
         };
 
         let env_bins = if use_low24 {
@@ -1672,8 +1754,8 @@ impl VisualizerState {
             (&snap.peak_envelope_db, nyq)
         };
         if env_bins.0.len() >= 64 {
-            let env_pts = sample_curve(env_bins.0, env_bins.1);
-            r.draw_polyline(&env_pts, Theme::SIGNAL_CYAN.with_alpha(0.92), 1.6, false);
+            fill_curve(&mut self.scratch_pts_a, env_bins.0, env_bins.1);
+            r.draw_polyline(&self.scratch_pts_a, Theme::SIGNAL_CYAN.with_alpha(0.92), 1.6, false);
         }
 
         let inst_bins = if use_low24 && snap.inst_spectrum_low24_db.len() >= 64 {
@@ -1682,8 +1764,8 @@ impl VisualizerState {
             (&snap.inst_spectrum_db, nyq)
         };
         if inst_bins.0.len() >= 64 {
-            let inst_pts = sample_curve(inst_bins.0, inst_bins.1);
-            r.draw_polyline(&inst_pts, Theme::ACCENT_RED.with_alpha(0.84), 1.25, false);
+            fill_curve(&mut self.scratch_pts_a, inst_bins.0, inst_bins.1);
+            r.draw_polyline(&self.scratch_pts_a, Theme::ACCENT_RED.with_alpha(0.84), 1.25, false);
         }
 
         if snap.cutoff_hz > 4000.0 && snap.analyzed_frames >= 4 {
@@ -1750,15 +1832,35 @@ impl VisualizerState {
         let rad = (stage_rect.w * 0.44).min(stage_rect.h - 22.0).max(28.0);
         let cy = (stage_rect.bottom() - 10.0).max(stage_rect.y + rad + 12.0);
 
-        // Upper-semicircle concentric reference arcs (0.33, 0.66, 1.0)
-        for (frac, a) in [(1.0f32, 0.13f32), (0.66, 0.08), (0.33, 0.05)] {
-            let rr = rad * frac;
-            let mut arc_pts = Vec::with_capacity(49);
-            for k in 0..=48 {
-                let ang = (k as f32 / 48.0) * PI;
-                arc_pts.push((cx + rr * ang.cos(), cy - rr * ang.sin()));
+        // Upper-semicircle concentric reference arcs (0.33, 0.66, 1.0) — cached when panel size unchanged!
+        let arc_key = (cx.to_bits(), cy.to_bits(), rad.to_bits());
+        if self.soundstage_arcs_cache.0 != arc_key.0
+            || self.soundstage_arcs_cache.1 != arc_key.1
+            || self.soundstage_arcs_cache.2 != arc_key.2
+            || self.soundstage_arcs_cache.3[0].is_empty()
+        {
+            const FRACS: [f32; 3] = [1.0, 0.66, 0.33];
+            for (idx, &frac) in FRACS.iter().enumerate() {
+                let rr = rad * frac;
+                let dst = &mut self.soundstage_arcs_cache.3[idx];
+                dst.clear();
+                dst.reserve(37);
+                for k in 0..=36 {
+                    let ang = (k as f32 / 36.0) * PI;
+                    dst.push((cx + rr * ang.cos(), cy - rr * ang.sin()));
+                }
             }
-            r.draw_polyline(&arc_pts, Color::rgba(255, 255, 255, a), 1.0, false);
+            self.soundstage_arcs_cache.0 = arc_key.0;
+            self.soundstage_arcs_cache.1 = arc_key.1;
+            self.soundstage_arcs_cache.2 = arc_key.2;
+        }
+        for (idx, a) in [(0usize, 0.13f32), (1, 0.08), (2, 0.05)] {
+            r.draw_polyline(
+                &self.soundstage_arcs_cache.3[idx],
+                Color::rgba(255, 255, 255, a),
+                1.0,
+                false,
+            );
         }
         // Horizontal baseline diameter (antiphase S axis) & center vertical axis (Mono Mid)
         r.draw_line(cx - rad, cy, cx + rad, cy, Color::rgba(255, 255, 255, 0.12), 1.0);
@@ -1860,23 +1962,36 @@ impl VisualizerState {
             );
 
             // 1. Fixed-coordinate Phosphor Persistence Cloud inside upper semicircle
-            for dot in &self.soundstage_phosphor {
+            // Spatial cell deduplication (32x16 grid, max 2 dots/cell) cuts overlapping FillEllipse calls ~6x!
+            let mut cell_hits = [0u8; 32 * 16];
+            for dot in self.soundstage_phosphor.iter().rev() {
+                if dot.life < 0.045 {
+                    continue;
+                }
+                let gx = (((dot.sx + 1.0) * 15.5).round() as isize).clamp(0, 31) as usize;
+                let gy = ((dot.sy.max(0.0) * 15.0).round() as isize).clamp(0, 15) as usize;
+                let cell = &mut cell_hits[gy * 32 + gx];
+                if *cell >= 2 {
+                    continue;
+                }
+                *cell += 1;
                 let px = cx + dot.sx * rad;
                 let py = cy - dot.sy.max(0.0) * rad;
-                let glow_a = (dot.life.powf(1.48) * 0.48).clamp(0.014, 0.52);
+                let glow_a = (dot.life.powf(1.38) * 0.54).clamp(0.018, 0.56);
                 let base_col = if self.soundstage_multicolor {
                     soundstage_band_color(dot.band)
                 } else {
                     SOUNDSTAGE_MONO_BLUE
                 };
-                r.fill_circle(px, py, 0.90, base_col.with_alpha(glow_a));
+                r.fill_circle(px, py, 1.05, base_col.with_alpha(glow_a));
             }
 
-            // 2. Live-frame excitations (adaptive RMS AGC normalized)
+            // 2. Live-frame excitations (decimated by coprime stride 2 for smooth 144Hz rendering)
             if snap.active_signal && !snap.soundstage_band_pts.is_empty() {
                 let gain = self.soundstage_gain;
                 let n = snap.soundstage_band_pts.len().max(1) as f32;
-                for (i, &[l, rr, bf]) in snap.soundstage_band_pts.iter().enumerate() {
+                let live_step = if snap.soundstage_band_pts.len() >= 180 { 2 } else { 1 };
+                for (i, &[l, rr, bf]) in snap.soundstage_band_pts.iter().enumerate().step_by(live_step) {
                     let (sx, sy) = map_lr_to_semicircle(l, rr, gain);
                     let px = cx + sx * rad;
                     let py = cy - sy * rad;
@@ -1886,10 +2001,10 @@ impl VisualizerState {
                     } else {
                         SOUNDSTAGE_MONO_BLUE.lerp(Color::rgb(168, 232, 255), fresh * 0.35)
                     };
-                    if i % 9 == 0 && (sx.abs() + sy.abs()) > 0.28 {
-                        r.fill_circle(px, py, 1.9, bcol.with_alpha(0.13 * fresh));
+                    if i % 10 == 0 && (sx.abs() + sy.abs()) > 0.28 {
+                        r.fill_circle(px, py, 1.9, bcol.with_alpha(0.14 * fresh));
                     }
-                    r.fill_circle(px, py, 1.05, bcol.with_alpha(0.42 + 0.52 * fresh));
+                    r.fill_circle(px, py, 1.12, bcol.with_alpha(0.45 + 0.50 * fresh));
                 }
             }
         } else {
@@ -1957,7 +2072,7 @@ impl VisualizerState {
 
     /// Panel 4 (BR): Merged 32-Band Musical Spectrum + Stereo PCM Oscilloscope
     fn draw_musical_scope_panel(
-        &self,
+        &mut self,
         r: &mut D2DRenderer,
         panel: RectF,
         snap: &LiveVisualizerSnapshot,
@@ -2011,15 +2126,19 @@ impl VisualizerState {
         );
         if snap.wave_l.len() >= 16 {
             let n = snap.wave_l.len();
-            let mut pts_l = Vec::with_capacity(n);
-            let mut pts_r = Vec::with_capacity(n);
-            for i in 0..n {
-                let x = inner.x + (i as f32 / (n - 1) as f32) * inner.w;
-                pts_l.push((x, mid_y - snap.wave_l[i] * wave_h * 0.45));
-                pts_r.push((x, mid_y - snap.wave_r[i] * wave_h * 0.45));
+            let step_i = if n >= 160 { 2 } else { 1 };
+            self.scratch_pts_a.clear();
+            self.scratch_pts_b.clear();
+            let denom = (n - 1) as f32;
+            for i in (0..n).step_by(step_i) {
+                let x = inner.x + (i as f32 / denom) * inner.w;
+                self.scratch_pts_a
+                    .push((x, mid_y - snap.wave_l[i] * wave_h * 0.45));
+                self.scratch_pts_b
+                    .push((x, mid_y - snap.wave_r[i] * wave_h * 0.45));
             }
-            r.draw_polyline(&pts_r, Theme::SIGNAL_CYAN.with_alpha(0.68), 1.3, false);
-            r.draw_polyline(&pts_l, Theme::ACCENT_RED.with_alpha(0.90), 1.6, false);
+            r.draw_polyline(&self.scratch_pts_b, Theme::SIGNAL_CYAN.with_alpha(0.68), 1.3, false);
+            r.draw_polyline(&self.scratch_pts_a, Theme::ACCENT_RED.with_alpha(0.90), 1.6, false);
         }
 
         // Bottom sub-region: 32-band musical spectrum with peak-hold caps
@@ -2239,8 +2358,17 @@ impl VisualizerState {
             Color::rgba(18, 12, 30, 0.0),
         );
 
-        // Render 37x37 (1,369!) foreshortened 3D cuboids from back to front
+        // Render crisp 19x19 (<= 361 active) foreshortened 3D cuboids sampled at stride 2 across
+        // the full 37x37 lattice + outer-corner culling, cutting D2D calls from 5,476 -> ~1,150/frame!
+        let mut drawn_cuboids = 0usize;
         for p in &self.matrix_pillars {
+            if (p.gx & 1) != 0 || (p.gy & 1) != 0 {
+                continue;
+            }
+            let d = p.dist_norm;
+            if d > 1.12 && p.z < 0.8 {
+                continue;
+            }
             let fx = p.gx as f32;
             let fy = p.gy as f32;
             let depth_row = (fx + fy) / 36.0; // -1.0 (back) .. +1.0 (front)
@@ -2252,21 +2380,20 @@ impl VisualizerState {
             let iso_y_base = cy + (fx + fy) * step_y;
 
             // Skip tiles completely outside viewport
-            if iso_x < body.x - 42.0
-                || iso_x > body.right() + 42.0
-                || iso_y_base > body.bottom() + 42.0
-                || iso_y_base < body.y - 24.0
+            if iso_x < body.x - 48.0
+                || iso_x > body.right() + 48.0
+                || iso_y_base > body.bottom() + 48.0
+                || iso_y_base < body.y - 28.0
             {
                 continue;
             }
 
-            let d = p.dist_norm;
             let rest_dome = (-2.9 * d * d).exp() * (2.6 + p.seed * 2.4);
             let h = (p.z * persp + rest_dome).clamp(0.5, 92.0);
             let h_norm = (h / 54.0).clamp(0.0, 1.0);
             let core_prox = (1.0 - (d / 0.88).clamp(0.0, 1.0)).powf(1.55);
 
-            // Multi-stop thermal luminescence palette matching screenshot:
+            // Multi-stop thermal luminescence palette:
             // Obsidian-Slate -> Electric Violet -> Neon Orchid -> Sakura Pink -> Peach-Gold Core!
             let heat = (h_norm * 0.66 + core_prox * (0.26 + core_glow_energy * 0.30)).clamp(0.0, 1.0);
             let top_col = matrix_core_heat_color(heat);
@@ -2290,8 +2417,8 @@ impl VisualizerState {
                 Color::rgba(92, 64, 148, 0.18)
             };
 
-            let half_tw = step_x * 0.88;
-            let half_th = step_y * 0.88;
+            let half_tw = step_x * 1.76;
+            let half_th = step_y * 1.76;
             r.draw_iso_matrix_cuboid(
                 iso_x,
                 iso_y_base,
@@ -2303,7 +2430,9 @@ impl VisualizerState {
                 top_col,
                 bevel_col,
             );
+            drawn_cuboids += 1;
         }
+        self.last_matrix_drawn_count = drawn_cuboids;
 
         // Soft incandescent core bloom veil over the central peach-gold cluster
         r.fill_radial_glow(
@@ -2451,13 +2580,33 @@ impl VisualizerState {
             Color::rgba(0, 60, 140, 0.0),
         );
 
-        // Outer steel biological shield vessel rim ("Elena" ring)
-        let mut ring_pts = Vec::with_capacity(49);
-        for i in 0..=48 {
-            let a = (i as f32 / 48.0) * 2.0 * PI;
-            ring_pts.push((cx + core_rx * 1.06 * a.cos(), cy + core_ry * 1.06 * a.sin()));
+        // Outer steel biological shield vessel rim ("Elena" ring) — cached when viewport unchanged!
+        let ring_key = (cx.to_bits(), cy.to_bits(), core_rx.to_bits(), core_ry.to_bits());
+        if self.elena_ring_cache.0 != ring_key.0
+            || self.elena_ring_cache.1 != ring_key.1
+            || self.elena_ring_cache.2 != ring_key.2
+            || self.elena_ring_cache.3 != ring_key.3
+            || self.elena_ring_cache.4.is_empty()
+        {
+            self.elena_ring_cache.4.clear();
+            self.elena_ring_cache.4.reserve(49);
+            for i in 0..=48 {
+                let a = (i as f32 / 48.0) * 2.0 * PI;
+                self.elena_ring_cache
+                    .4
+                    .push((cx + core_rx * 1.06 * a.cos(), cy + core_ry * 1.06 * a.sin()));
+            }
+            self.elena_ring_cache.0 = ring_key.0;
+            self.elena_ring_cache.1 = ring_key.1;
+            self.elena_ring_cache.2 = ring_key.2;
+            self.elena_ring_cache.3 = ring_key.3;
         }
-        r.draw_polyline(&ring_pts, Color::rgba(80, 110, 145, 0.35), 2.0, true);
+        r.draw_polyline(
+            &self.elena_ring_cache.4,
+            Color::rgba(80, 110, 145, 0.35),
+            2.0,
+            true,
+        );
 
         // Isometric tile basis vectors
         let tile_w = (core_rx / 9.2).clamp(16.0, 38.0);
@@ -2471,6 +2620,13 @@ impl VisualizerState {
             let fy = rod.gy as f32;
             let iso_x = cx + (fx - fy) * (tile_w * 0.52);
             let iso_y_base = cy + (fx + fy) * (tile_h * 0.52);
+            if iso_x < body.x - 42.0
+                || iso_x > body.right() + 42.0
+                || iso_y_base > body.bottom() + 42.0
+                || iso_y_base < body.y - 42.0
+            {
+                continue;
+            }
             let lift = rod.z;
             let wall_h = (lift + 5.5).min(52.0);
 
@@ -2708,7 +2864,7 @@ impl VisualizerState {
     // Style 4: Sonic Silk Aurora Waves (流光丝绸)
     // ========================================================================
     fn draw_silk_aurora_style(
-        &self,
+        &mut self,
         r: &mut D2DRenderer,
         body: RectF,
         snap: &LiveVisualizerSnapshot,
@@ -2749,9 +2905,9 @@ impl VisualizerState {
 
         for (layer, &col) in colors.iter().enumerate() {
             let lf = layer as f32;
-            let mut pts = Vec::with_capacity(145);
-            for i in 0..=144 {
-                let u = (i as f32) / 144.0;
+            self.scratch_pts_a.clear();
+            for i in 0..=112 {
+                let u = (i as f32) / 112.0;
                 let x = body.x + u * body.w;
                 // Guard `.max(0.0)` before `.powf()` so `(1.0 * PI).sin() == -8.7e-8` NEVER yields `NaN`!
                 let env = (u * PI).sin().max(0.0).powf(0.85);
@@ -2764,11 +2920,11 @@ impl VisualizerState {
                     * amp_max
                     * (0.14 + spec_e * 0.75 + snap.bass_energy * 0.35);
                 let y = cy + if disp.is_finite() { disp } else { 0.0 };
-                pts.push((x, y));
+                self.scratch_pts_a.push((x, y));
             }
             // Soft outer halo stroke + crisp core ribbon
-            r.draw_polyline(&pts, col.with_alpha(col.a * 0.28), 6.0, false);
-            r.draw_polyline(&pts, col, 2.4, false);
+            r.draw_polyline(&self.scratch_pts_a, col.with_alpha(col.a * 0.28), 6.0, false);
+            r.draw_polyline(&self.scratch_pts_a, col, 2.4, false);
         }
 
         r.pop_clip();

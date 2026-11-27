@@ -12,7 +12,8 @@ const QQ_MUSICU_URL: &str = "https://u.y.qq.com/cgi-bin/musicu.fcg";
 
 static QQ_HTTP: Lazy<reqwest::Client> = Lazy::new(|| {
     reqwest::Client::builder()
-        .timeout(Duration::from_secs(12))
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
         .pool_max_idle_per_host(16)
         .tcp_nodelay(true)
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
@@ -830,23 +831,28 @@ pub async fn fetch_radio_tracks(label_id: &str, cookie: Option<&str>) -> Result<
 pub async fn search_catalog(
     query: &str,
     cookie: Option<&str>,
-) -> Result<(Vec<QQCard>, Vec<QQCard>, Vec<AgentTrackInput>), String> {
+) -> Result<(Vec<QQCard>, Vec<QQCard>, Vec<QQCard>, Vec<AgentTrackInput>), String> {
     let q = query.trim();
     let payload = json!({
         "s_song": {
             "module": "music.search.SearchCgiService",
             "method": "DoSearchForQQMusicDesktop",
-            "param": {"query": q, "search_type": 0, "num_per_page": 24, "page_num": 1, "grp": 1}
+            "param": {"query": q, "search_type": 0, "num_per_page": 15, "page_num": 1, "grp": 1}
+        },
+        "s_art": {
+            "module": "music.search.SearchCgiService",
+            "method": "DoSearchForQQMusicDesktop",
+            "param": {"query": q, "search_type": 1, "num_per_page": 8, "page_num": 1}
         },
         "s_alb": {
             "module": "music.search.SearchCgiService",
             "method": "DoSearchForQQMusicDesktop",
-            "param": {"query": q, "search_type": 2, "num_per_page": 12, "page_num": 1, "grp": 1}
+            "param": {"query": q, "search_type": 2, "num_per_page": 10, "page_num": 1, "grp": 1}
         },
         "s_pl": {
             "module": "music.search.SearchCgiService",
             "method": "DoSearchForQQMusicDesktop",
-            "param": {"query": q, "search_type": 3, "num_per_page": 12, "page_num": 1}
+            "param": {"query": q, "search_type": 3, "num_per_page": 10, "page_num": 1}
         }
     });
 
@@ -860,6 +866,43 @@ pub async fn search_catalog(
                 .collect()
         })
         .unwrap_or_default();
+
+    let mut artists = Vec::new();
+    if let Some(arr) = json.pointer("/s_art/data/body/singer/list").and_then(Value::as_array) {
+        for v in arr {
+            let Some(mid) = v
+                .get("singerMID")
+                .or_else(|| v.get("singerMid"))
+                .or_else(|| v.get("singer_mid"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            let title = v
+                .get("singerName")
+                .or_else(|| v.get("singer_name"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let art = v
+                .get("singerPic")
+                .or_else(|| v.get("singer_pic"))
+                .and_then(Value::as_str)
+                .map(upgrade_https)
+                .filter(|s| !s.is_empty())
+                .or_else(|| Some(format!("https://y.gtimg.cn/music/photo_new/T001R300x300M000{mid}.jpg")));
+            artists.push(QQCard {
+                id: mid.to_string(),
+                kind: "qq-artist".to_string(),
+                title,
+                subtitle: "QQ 音乐艺人".to_string(),
+                description: String::new(),
+                artwork_url: art,
+                badge: Some("艺人".to_string()),
+            });
+        }
+    }
 
     let mut albums = Vec::new();
     if let Some(arr) = json.pointer("/s_alb/data/body/album/list").and_then(Value::as_array) {
@@ -925,7 +968,7 @@ pub async fn search_catalog(
         }
     }
 
-    Ok((albums, playlists, songs))
+    Ok((artists, albums, playlists, songs))
 }
 
 pub async fn fetch_container_detail(

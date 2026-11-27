@@ -70,6 +70,13 @@ Subpixel Word-Synced Lyrics · Real-Time WASAPI Audio Inspector · 5 Playback Ba
 
 ## Key Features
 
+### What's New in v0.2.12 — Full Playlist Sync, Windows SMTC & Performance Overhaul
+
+- **Unlimited Cloud Playlist Sync & Exact Cover Art Accuracy**: Full cursor/offset pagination and chunked writes for Apple Music playlists (eliminating the 100-track cap), full `trackIds` batched sync with exact order preservation for NetEase Cloud playlists (eliminating the 200-track cap), and end-to-end artwork isolation across Now Playing, Tracklists, and SMTC (zero cross-track bleed or stale async overwrites).
+- **Native Windows SMTC Publisher & Structured Runtime Logging**: Publishes live metadata, cover art, timeline, and transport controls to Windows System Media Transport Controls with self-loop protection, alongside lightweight rotating runtime & crash logs (`%APPDATA%\AMLight\logs`).
+- **DXVA Hardware Motion Art & 7.5× Strip Liquid Glass VRAM Reduction**: Preserves classic Home shelf card proportions while adding 20-slot silky viewport windowing and 2-slot DXVA ping-pong decode; cuts Liquid Glass VRAM from ~20.4 MB to ~2.7 MB via single-pass strip downscale chains with zero-lag Target→Effect barriers and O(1) true-LRU GPU/DirectWrite caches.
+- **Full P0/P1/P2 CPU, Memory & Network Performance Overhaul**: O(1) revision-based scene/backdrop hashing, zero-clone modals and `Arc`-backed playlist disk cache, cancellable HLS/FLAC streaming with 100% cache reuse, 0 Hz paused WASAPI hibernation, adaptive non-Home idle cadence, and zero-allocation instant local search.
+
 ### Multi-Backend Playback & Cross-Platform Playlist Transfer
 
 Switch seamlessly between **5 playback backends** under **Settings → Playback Backend & Music Source**. Home, New, Radio, Search, and Library pages automatically adapt to the active platform, with **track-by-track cross-platform playlist matching and copying**.
@@ -133,8 +140,8 @@ If third-party iOS signing tools (e.g., Sideloadly) or broken folder ACLs cause 
 
 ### Step 2: Download & Install
 
-1. Download the latest Windows x64 installer (e.g., `AM-Light-Setup-v0.2.11-x64.exe`) from [**GitHub Releases**](https://github.com/N20xDuli/AM-Light/releases).
-   - Silent install: `AM-Light-Setup-v0.2.11-x64.exe --silent [--dir="C:\Path\To\AM-Light"]`
+1. Download the latest Windows x64 installer (e.g., `AM-Light-Setup-v0.2.12-x64.exe`) from [**GitHub Releases**](https://github.com/N20xDuli/AM-Light/releases).
+   - Silent install: `AM-Light-Setup-v0.2.12-x64.exe --silent [--dir="C:\Path\To\AM-Light"]`
    - Uninstall via Windows **Installed Apps** or `Uninstall-AM-Light.exe` inside the install folder.
 2. Launch AM Light and configure your preferred playback backend and UI language under **Settings**.
 
@@ -166,7 +173,7 @@ cargo test --release --bin AM-Light -- --test-threads=1
 # Build main executable (Release)
 cargo build --release --bin AM-Light
 
-# Build Windows installer (outputs to dist\AM-Light-Setup-v0.2.11-x64.exe)
+# Build Windows installer (outputs to dist\AM-Light-Setup-v0.2.12-x64.exe)
 $env:AM_LIGHT_BIN_PATH = "target\release\AM-Light.exe"
 cargo build --release --manifest-path installer\Cargo.toml
 ```

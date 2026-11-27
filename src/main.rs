@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
+    am_light_lib::logger::init();
     am_light_lib::run()
 }
 
@@ -6205,5 +6206,3662 @@ lo48.m3u8\n";
             let _ = DestroyWindow(hwnd_100);
             let _ = DestroyWindow(hwnd_200);
         }
+    }
+
+    #[test]
+    fn test_v0212_am_playlist_pagination_and_fast_search_overhaul() {
+        use am_light_lib::am_agent::AgentTrackInput;
+        use am_light_lib::am_api::{
+            build_next_amp_path, build_offset_amp_path, parse_next_offset,
+        };
+        use am_light_lib::app_ui::{
+            AppUi, MediaCardItem, PageRoute, PlaylistDiskCache, SearchCatalogPayload, UiAction,
+            PLAYLIST_CACHE_SCHEMA_VERSION,
+        };
+
+        // 1. Apple Music pagination URL helpers preserve query params (`include`, `extend`, `limit`, `l`)
+        let init_tracks =
+            "v1/me/library/playlists/p.12345/tracks?include=catalog&extend=audioTraits&limit=100&l=zh-Hans-CN";
+        let next_tracks =
+            build_next_amp_path(init_tracks, "/v1/me/library/playlists/p.12345/tracks?offset=100");
+        assert!(next_tracks.starts_with("v1/me/library/playlists/p.12345/tracks?"));
+        assert!(next_tracks.contains("offset=100"));
+        assert!(next_tracks.contains("include=catalog"));
+        assert!(next_tracks.contains("extend=audioTraits"));
+        assert!(next_tracks.contains("limit=100"));
+        assert!(next_tracks.contains("l=zh-Hans-CN"));
+        assert_eq!(parse_next_offset(&next_tracks), Some(100));
+        assert_eq!(
+            parse_next_offset("/v1/me/library/playlists?cursor=abc123"),
+            None
+        );
+
+        let off_path = build_offset_amp_path(init_tracks, 300);
+        assert!(off_path.contains("offset=300"));
+        assert!(off_path.contains("include=catalog"));
+        assert!(off_path.contains("limit=100"));
+        assert_eq!(off_path.matches("offset=").count(), 1);
+
+        // 2. PlaylistDiskCache schema version & complete >24/>40 playlist retention
+        let legacy: PlaylistDiskCache =
+            serde_json::from_str(r#"{"sidebar_playlists":[],"details":{},"last_sync_unix_sec":1}"#)
+                .expect("legacy playlist cache deserialize");
+        assert_eq!(legacy.schema_version, 0);
+
+        let mut many_pls: Vec<MediaCardItem> = Vec::new();
+        for i in 0..85 {
+            many_pls.push(MediaCardItem {
+                id: format!("p.pl_{i}"),
+                kind: "library-playlists".to_string(),
+                title: if i == 60 {
+                    "周杰伦经典全集".to_string()
+                } else {
+                    format!("我的苹果歌单 #{i}")
+                },
+                subtitle: "资料库播放列表".to_string(),
+                description: String::new(),
+                artwork_url: None,
+                badge: None,
+                track_input: None,
+            });
+        }
+        let mut cache = PlaylistDiskCache::default();
+        cache.upsert_sidebar(&many_pls, 1_700_000_000);
+        assert_eq!(cache.schema_version, PLAYLIST_CACHE_SCHEMA_VERSION);
+        assert_eq!(cache.sidebar_playlists.len(), 85);
+
+        // 3. Search zero-redraw typing, instant local matches, 0ms LRU cache hit, and stale seq guard
+        let mut ui = AppUi::new(0);
+        ui.sidebar_playlists = many_pls;
+        ui.lib_songs.push(AgentTrackInput {
+            id: "1001".to_string(),
+            catalog_id: Some("1001".to_string()),
+            kind: Some("songs".to_string()),
+            name: "晴天".to_string(),
+            artist_name: "周杰伦".to_string(),
+            album_name: "叶惠美".to_string(),
+            duration_sec: 269.0,
+            artwork_url: None,
+            audio_traits: vec!["lossless".to_string()],
+        });
+
+        ui.search_focused = true;
+        for ch in "周杰伦".chars() {
+            assert!(ui.on_char_input(ch));
+        }
+        assert_eq!(ui.search_query, "周杰伦");
+        assert!(ui.last_search_typed.is_some());
+        // Typing debounce must NEVER trigger continuous full-window redraws!
+        assert!(
+            !ui.needs_continuous_animation(),
+            "typing in search box must NOT cause continuous idle redraw storms"
+        );
+        // Instant 0ms local library matches find playlist #60 (>24 cap!) and local song!
+        assert!(
+            ui.search_local_cards.iter().any(|c| c.id == "p.pl_60"),
+            "instant local search must find playlist beyond old 24/40 cap"
+        );
+        assert!(
+            ui.search_local_songs.iter().any(|s| s.name == "晴天"),
+            "instant local search must match library tracks"
+        );
+
+        // Populate search LRU cache and verify 0ms hit when typing/editing back to cached query
+        let cache_key = format!(
+            "{:?}:{}:{}",
+            ui.settings.playback_backend,
+            ui.settings.storefront.to_ascii_lowercase(),
+            "周杰伦"
+        );
+        ui.put_search_cache(
+            cache_key,
+            SearchCatalogPayload {
+                artists: vec![MediaCardItem {
+                    id: "300117743".to_string(),
+                    kind: "artists".to_string(),
+                    title: "周杰伦".to_string(),
+                    subtitle: "艺人".to_string(),
+                    description: String::new(),
+                    artwork_url: None,
+                    badge: None,
+                    track_input: None,
+                }],
+                albums: Vec::new(),
+                playlists: Vec::new(),
+                songs: vec![ui.lib_songs[0].clone()],
+            },
+        );
+        // Add a char then backspace back to "周杰伦" -> instant 0ms cache hit!
+        assert!(ui.on_char_input('a'));
+        assert!(ui.on_char_input('\u{08}'));
+        assert_eq!(ui.search_query, "周杰伦");
+        assert!(!ui.search_loading);
+        assert!(ui.last_search_typed.is_none());
+        assert_eq!(ui.search_artists.len(), 1);
+        assert_eq!(ui.search_songs.len(), 1);
+
+        // ClearSearch resets all search caches/state cleanly
+        ui.execute_action(UiAction::ClearSearch);
+        assert!(ui.search_query.is_empty());
+        assert!(ui.search_char_xs_query.is_empty());
+        assert!(ui.search_artists.is_empty());
+        assert!(ui.search_songs.is_empty());
+        assert!(ui.search_local_cards.is_empty());
+        assert!(!ui.search_loading);
+        assert!(ui.route != PageRoute::Settings);
+    }
+
+    #[test]
+    fn test_v0212_windows_smtc_publisher_timeline_commands_and_self_loop_guard() {
+        use am_light_lib::app_ui::{AppSettings, AppUi, UiAction};
+        use am_light_lib::backends::PlaybackBackend;
+        use am_light_lib::smtc::{
+            self, compute_timeline_should_update, is_self_aumid, SmtcPublishPayload,
+            SmtcPublishedCommand, SmtcState,
+        };
+        use windows::core::w;
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_OVERLAPPEDWINDOW,
+        };
+
+        // 1. Legacy AppSettings JSON backward compatibility: `smtc_publish_enabled` defaults to `true`
+        let legacy: AppSettings = serde_json::from_str(r#"{"storefront":"cn"}"#)
+            .expect("legacy settings deserialize");
+        assert!(legacy.smtc_publish_enabled);
+
+        // 2. Self-AUMID defense-in-depth guard prevents SMTC consumer from binding to AM-Light itself
+        assert!(is_self_aumid("am-light.exe"));
+        assert!(is_self_aumid("c:\\apps\\amlight\\am-light.exe"));
+        assert!(!is_self_aumid("appleinc.applemusicwin_nzyj5cx40ttqa!app"));
+
+        // 3. Deterministic timeline sync policy (essential for Lyricify Fusion accuracy without spam)
+        assert!(compute_timeline_should_update(
+            false, true, false, true, 0.0, 210.0, 0.0, 210.0, 0.1
+        )); // track changed
+        assert!(compute_timeline_should_update(
+            false, false, true, false, 45.0, 210.0, 45.0, 210.0, 0.1
+        )); // status changed
+        assert!(compute_timeline_should_update(
+            true, false, false, true, 45.0, 210.0, 44.9, 210.0, 0.1
+        )); // forced seek
+        assert!(compute_timeline_should_update(
+            false, false, false, true, 46.8, 210.0, 45.0, 210.0, 1.0
+        )); // drift >0.35s
+        assert!(compute_timeline_should_update(
+            false, false, false, true, 50.1, 210.0, 45.0, 210.0, 5.1
+        )); // gentle 5s heartbeat
+        assert!(!compute_timeline_should_update(
+            false, false, false, true, 46.05, 210.0, 45.0, 210.0, 1.0
+        )); // smooth <0.35s playback -> no IPC spam!
+        assert!(!compute_timeline_should_update(
+            false, false, false, false, 45.05, 210.0, 45.0, 210.0, 10.0
+        )); // paused without seek -> no spam!
+        assert!(compute_timeline_should_update(
+            false, false, false, false, 52.0, 210.0, 45.0, 210.0, 0.5
+        )); // paused user seek -> immediate sync!
+
+        // 4. Backend self-loop guard & Settings toggle in AppUi
+        let mut ui = AppUi::new(0);
+        ui.settings.smtc_publish_enabled = true;
+        ui.settings.playback_backend = PlaybackBackend::AppleMusicNative;
+        ui.smtc = SmtcState {
+            active: true,
+            title: "晴天".to_string(),
+            artist: "周杰伦".to_string(),
+            album: "叶惠美".to_string(),
+            status: "Playing".to_string(),
+            position_sec: 32.5,
+            duration_sec: 269.0,
+            backend_mode: "agent".to_string(),
+            ..SmtcState::default()
+        };
+        assert!(ui.should_publish_smtc());
+
+        // Passive external Apple Music SMTC mirror must NOT duplicate-publish
+        ui.smtc.backend_mode = "smtc".to_string();
+        assert!(!ui.should_publish_smtc());
+
+        // NetEase / QQ Music / Web AM built-in backends DO publish
+        ui.settings.playback_backend = PlaybackBackend::NetEase;
+        ui.smtc.backend_mode = "netease".to_string();
+        assert!(ui.should_publish_smtc());
+        ui.settings.playback_backend = PlaybackBackend::QQMusic;
+        ui.smtc.backend_mode = "qqmusic".to_string();
+        assert!(ui.should_publish_smtc());
+        ui.settings.playback_backend = PlaybackBackend::AppleMusicWeb;
+        ui.smtc.backend_mode = "web-am".to_string();
+        assert!(ui.should_publish_smtc());
+
+        // ExternalSmtc backend MUST disable publishing to prevent self-loop
+        ui.settings.playback_backend = PlaybackBackend::ExternalSmtc;
+        ui.smtc.backend_mode = "agent".to_string();
+        assert!(!ui.should_publish_smtc());
+
+        // ToggleSmtcPublish flips setting cleanly
+        ui.settings.playback_backend = PlaybackBackend::AppleMusicNative;
+        assert!(ui.should_publish_smtc());
+        ui.execute_action(UiAction::ToggleSmtcPublish);
+        assert!(!ui.settings.smtc_publish_enabled);
+        assert!(!ui.should_publish_smtc());
+        ui.execute_action(UiAction::ToggleSmtcPublish);
+        assert!(ui.settings.smtc_publish_enabled);
+        assert!(ui.should_publish_smtc());
+
+        // 5. Media button / seek command queue round-trip
+        let _ = smtc::drain_published_commands();
+        smtc::enqueue_published_command(SmtcPublishedCommand::Pause);
+        smtc::enqueue_published_command(SmtcPublishedCommand::Next);
+        smtc::enqueue_published_command(SmtcPublishedCommand::SeekSec(42.5));
+        let cmds = smtc::drain_published_commands();
+        assert_eq!(
+            cmds,
+            vec![
+                SmtcPublishedCommand::Pause,
+                SmtcPublishedCommand::Next,
+                SmtcPublishedCommand::SeekSec(42.5),
+            ]
+        );
+        assert!(smtc::drain_published_commands().is_empty());
+
+        // 6. Live WinRT `ISystemMediaTransportControlsInterop::GetForWindow` + Thumbnail Stream test
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let hinst = GetModuleHandleW(None).unwrap_or_default();
+            let hwnd = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("AM-Light-SMTC-Test"),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                100,
+                100,
+                None,
+                None,
+                Some(hinst.into()),
+                None,
+            )
+            .expect("create hidden test window");
+
+            let inited = smtc::init_publisher(hwnd.0 as usize);
+            assert!(inited, "ISystemMediaTransportControlsInterop::GetForWindow must succeed");
+            assert!(!smtc::is_publisher_enabled(), "publisher starts disabled when idle");
+
+            let payload = SmtcPublishPayload {
+                title: "稻香".to_string(),
+                artist: "周杰伦".to_string(),
+                album: "魔杰座".to_string(),
+                status: "Playing".to_string(),
+                position_sec: 12.345,
+                duration_sec: 223.0,
+                track_key: "稻香\x1f周杰伦\x1f魔杰座".to_string(),
+            };
+            let need_thumb = smtc::sync_publisher_state(&payload, true);
+            assert!(need_thumb);
+            assert!(smtc::is_publisher_enabled());
+
+            // Minimal valid 1x1 PNG bytes for InMemoryRandomAccessStream thumbnail upload
+            const TINY_PNG: &[u8] = &[
+                0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49,
+                0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02,
+                0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44,
+                0x41, 0x54, 0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01,
+                0x00, 0x18, 0xDD, 0x8D, 0xB0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44,
+                0xAE, 0x42, 0x60, 0x82,
+            ];
+            let thumb_ok = smtc::set_publisher_thumbnail_bytes(&payload.track_key, TINY_PNG);
+            assert!(thumb_ok, "WinRT InMemoryRandomAccessStream thumbnail upload must succeed");
+            // Second sync for the same track does not re-request thumbnail
+            let need_thumb_again = smtc::sync_publisher_state(&payload, false);
+            assert!(!need_thumb_again);
+
+            // Disable & clean shutdown
+            smtc::disable_publisher();
+            assert!(!smtc::is_publisher_enabled());
+            smtc::shutdown_publisher();
+            let _ = DestroyWindow(hwnd);
+        }
+
+        // 7. Rolling runtime & crash logger path validation
+        let log_p = am_light_lib::logger::log_file_path().expect("log file path");
+        let crash_p = am_light_lib::logger::crash_log_path().expect("crash log path");
+        assert!(log_p.to_string_lossy().ends_with("amlight.log"));
+        assert!(crash_p.to_string_lossy().ends_with("crash_latest.log"));
+    }
+
+    #[test]
+    fn test_performance_investigation_optimizations() {
+        use am_light_lib::am_agent::AgentTrackInput;
+        use am_light_lib::app_ui::{AppUi, FpsCap, PageRoute, UiAction};
+        use am_light_lib::audio_viz::{is_viz_subscribed, set_viz_sub_mode, viz_sub_mode, VizSubMode};
+        use am_light_lib::backends::ResolvedAudioStream;
+        use am_light_lib::i18n::{translate_ui_text_for, ResolvedLang};
+        use am_light_lib::lyrics::{parse_yrc_lyrics, LyricsAnimator};
+        use am_light_lib::native_player::inspect_audio_file_specs;
+        use std::borrow::Cow;
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        // 1. P0-1: inspect_audio_file_specs reads ONLY 64 bytes (zero full-file allocation on large FLAC!)
+        let tmp_flac = std::env::temp_dir().join(format!(
+            "am_light_perf_flac_{}.flac",
+            std::process::id()
+        ));
+        {
+            let mut buf = vec![0u8; 4 * 1024 * 1024]; // 4 MiB synthetic FLAC
+            buf[0..4].copy_from_slice(b"fLaC");
+            buf[4] = 0x80; // last metadata block, type 0 = STREAMINFO
+            buf[7] = 34; // STREAMINFO length
+            // Encode 96,000 Hz (20-bit: 0x17700), 2 ch (ch-1 = 1 -> 0b001), 24-bit (bps-1 = 23 -> 0b10111)
+            // byte[18] = sr[19..12] = 0x17
+            // byte[19] = sr[11..4]  = 0x70
+            // byte[20] = sr[3..0]<<4 | (ch-1)<<1 | (bps-1)>>4 = 0x00 | 0x02 | 0x01 = 0x03
+            // byte[21] = ((bps-1)&0x0F)<<4 = 0x70
+            buf[18] = 0x17;
+            buf[19] = 0x70;
+            buf[20] = 0x03;
+            buf[21] = 0x70;
+            std::fs::write(&tmp_flac, &buf).expect("write temp flac");
+        }
+        let dummy_stream = ResolvedAudioStream {
+            url: "https://example.invalid/audio.flac".to_string(),
+            file_ext: "flac".to_string(),
+            quality_label: "Hi-Res FLAC".to_string(),
+            nominal_bitrate_kbps: 0,
+            is_trial: false,
+            referer: String::new(),
+            cookie: None,
+        };
+        let t0 = Instant::now();
+        let mut last_spec = None;
+        for _ in 0..50 {
+            last_spec = Some(inspect_audio_file_specs(&tmp_flac, &dummy_stream, 44100, 2, 120.0));
+        }
+        let elapsed_ms = t0.elapsed().as_millis();
+        let _ = std::fs::remove_file(&tmp_flac);
+        let spec = last_spec.expect("spec");
+        assert_eq!(spec.codec, "FLAC");
+        assert_eq!(spec.sample_rate_hz, 96_000);
+        assert_eq!(spec.bit_depth, Some(24));
+        assert!(spec.codec_label.contains("FLAC"));
+        assert!(
+            elapsed_ms < 250,
+            "50x 64-byte header inspections on 4 MiB file must stay fast (took {elapsed_ms}ms)"
+        );
+
+        // 2. P0-3: logger::has_recent_crash_log() is atomic-cached (zero per-frame syscalls)
+        let _ = am_light_lib::logger::has_recent_crash_log();
+        let t_log = Instant::now();
+        for _ in 0..10_000 {
+            let _ = std::hint::black_box(am_light_lib::logger::has_recent_crash_log());
+        }
+        assert!(
+            t_log.elapsed().as_millis() < 20,
+            "10,000 cached has_recent_crash_log() calls must complete in <20ms"
+        );
+
+        // 3. P0-4: 3-tier VizSubMode (Off / MiniBars5 / FullVisualizer)
+        set_viz_sub_mode(VizSubMode::Off);
+        let mut ui = AppUi::new(0);
+        ui.route = PageRoute::Home;
+        ui.show_lyrics_overlay = false;
+        ui.smtc.status = "Paused".to_string();
+        ui.update_viz_subscription();
+        assert_eq!(viz_sub_mode(), VizSubMode::Off);
+        assert!(!is_viz_subscribed());
+
+        ui.smtc.status = "Playing".to_string();
+        ui.settings.live_eq_icon_spectrum = true;
+        ui.settings.reduce_motion = false;
+        ui.update_viz_subscription();
+        assert_eq!(
+            viz_sub_mode(),
+            VizSubMode::MiniBars5,
+            "Home playing with live EQ icon must subscribe lightweight MiniBars5, NOT FullVisualizer"
+        );
+        assert!(is_viz_subscribed());
+
+        ui.route = PageRoute::Visualizer;
+        ui.update_viz_subscription();
+        assert_eq!(viz_sub_mode(), VizSubMode::FullVisualizer);
+
+        ui.show_lyrics_overlay = true;
+        ui.update_viz_subscription();
+        assert_eq!(viz_sub_mode(), VizSubMode::Off);
+        set_viz_sub_mode(VizSubMode::Off);
+
+        // 4. P0-2: Cover Flow runs at full VSync (not 30 FPS), paused mouse over blank content does NOT dirty,
+        //          and unfocused Visualizer VSync throttles cleanly to Adaptive 60/72Hz
+        ui.show_lyrics_overlay = false;
+        ui.smtc.status = "Paused".to_string();
+        ui.current_monitor_hz = 144;
+        ui.is_window_focused = true;
+        ui.route = PageRoute::LibAlbums;
+        ui.albums_cover_flow = true;
+        ui.cover_flow_index = 0.0;
+        ui.cover_flow_target = 3;
+        assert!(
+            ui.has_active_ui_motion(),
+            "Cover Flow settling must trigger high-refresh UI motion"
+        );
+        assert_eq!(
+            ui.effective_frame_pacing().1,
+            144,
+            "Cover Flow must run at full 144Hz VSync instead of 30 FPS"
+        );
+
+        ui.albums_cover_flow = false;
+        ui.route = PageRoute::Home;
+        ui.settings.liquid_glass_enabled = true;
+        ui.top_bar_guard_spring.snap(0.0);
+        ui.hit_regions.clear();
+        let _ = ui.on_mouse_move(400.0, 400.0); // prime cursor outside top bar
+        assert!(
+            !ui.on_mouse_move(420.0, 410.0),
+            "Paused pointer motion over non-interactive content with Liquid Glass ON must NOT dirty idle frame"
+        );
+        assert!(
+            ui.on_mouse_move(420.0, 20.0),
+            "Moving pointer into top bar must wake top-bar guard & glass specular cleanly"
+        );
+
+        ui.route = PageRoute::Visualizer;
+        ui.execute_action(UiAction::SetVizFpsCap(FpsCap::VSync));
+        ui.is_window_focused = false;
+        assert_eq!(
+            ui.effective_frame_pacing().1,
+            72,
+            "Unfocused Visualizer VSync on 144Hz display should throttle cleanly to 72Hz"
+        );
+        ui.is_window_focused = true;
+        assert_eq!(ui.effective_frame_pacing().1, 144);
+
+        // 5. P0-5: active_queue_tracks_cached returns O(1) Arc clone + effective_adam_id_str zero-alloc + Lyrics idle lift skip
+        let q1 = ui.active_queue_tracks_cached();
+        let q2 = ui.active_queue_tracks_cached();
+        assert!(
+            Arc::ptr_eq(&q1, &q2),
+            "Repeated active_queue_tracks_cached() calls without queue changes must reuse the same Arc slice"
+        );
+        let tr = AgentTrackInput {
+            id: "i.abc".to_string(),
+            catalog_id: Some("12345678".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(tr.effective_adam_id_str(), "12345678");
+        assert_eq!(tr.effective_adam_id_str(), tr.effective_adam_id());
+
+        let yrc_multi = "[1000,1000](1000,500,0)一(1500,500,0)二\n[5000,1000](5000,500,0)三(5500,500,0)四\n";
+        let plyr = parse_yrc_lyrics(yrc_multi, None).expect("parse yrc");
+        let mut anim = LyricsAnimator::default();
+        anim.bind_lyrics("perf:skip", &plyr);
+        anim.step(&plyr, 1.2, 600.0, 0.016);
+        assert!(anim.line_states[0].has_active_lifts, "active line steps lifts");
+        assert!(!anim.line_states[1].has_active_lifts, "inactive future line skips lift stepping");
+
+        // 6. P2: i18n fast-reject preserves translations and avoids scanning non-UI CJK song metadata
+        let media_title = translate_ui_text_for("青花瓷", ResolvedLang::En);
+        assert!(matches!(media_title, Cow::Borrowed("青花瓷")));
+        assert_eq!(
+            translate_ui_text_for("待播清单 (12)", ResolvedLang::En).as_ref(),
+            "Up Next (12)"
+        );
+        assert_eq!(
+            translate_ui_text_for("Hi-Res 无损 · 杜比全景声", ResolvedLang::En).as_ref(),
+            "Hi-Res Lossless · Dolby Atmos"
+        );
+
+        // 7. P2: VisualizerState::step_active steps ONLY active style (skips reactor pillars on AudioInspector!)
+        let mut viz_active = am_light_lib::visualizers::VisualizerState::default();
+        viz_active.style = am_light_lib::visualizers::VizStyle::AudioInspector;
+        let mut loud_snap = am_light_lib::audio_viz::LiveVisualizerSnapshot {
+            active_signal: true,
+            rms_db: -18.0,
+            peak_db_l: -12.0,
+            peak_db_r: -12.0,
+            bass_energy: 0.4,
+            mid_energy: 0.4,
+            high_energy: 0.2,
+            ..Default::default()
+        };
+        loud_snap.spectrum_64.fill(0.35);
+        for _ in 0..10 {
+            viz_active.step_active(&loud_snap, 1.0 / 60.0, false);
+        }
+        assert_eq!(
+            viz_active.matrix_pillar_stats().1,
+            0.0,
+            "step_active on AudioInspector must NOT burn CPU stepping inactive 37x37 Matrix Core"
+        );
+        viz_active.style = am_light_lib::visualizers::VizStyle::ChernobylRods;
+        viz_active.reactor_sub_style = 0;
+        for _ in 0..15 {
+            viz_active.step_active(&loud_snap, 1.0 / 60.0, false);
+        }
+        assert!(
+            viz_active.matrix_pillar_stats().1 > 8.0,
+            "step_active on ChernobylRods Matrix Core must actively elevate pillars"
+        );
+    }
+
+    #[test]
+    fn test_m1_liquid_glass_pipeline_optimization() {
+        use am_light_lib::am_api::{EditorialItem, EditorialShelf, EditorialShelfKind};
+        use am_light_lib::app_ui::{AppUi, PageRoute};
+        use am_light_lib::backends::PlaybackBackend;
+        use am_light_lib::d2d_renderer::D2DRenderer;
+        use am_light_lib::lyrics::parse_lrc_lyrics;
+        use am_light_lib::smtc::SmtcState;
+        use windows::core::{w, PCWSTR};
+        use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, CS_HREDRAW, CS_VREDRAW,
+            WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP, WS_POPUP,
+        };
+
+        unsafe extern "system" fn m1_wnd_proc(
+            h: HWND,
+            m: u32,
+            w: WPARAM,
+            l: LPARAM,
+        ) -> LRESULT {
+            DefWindowProcW(h, m, w, l)
+        }
+
+        let hwnd = unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let hinst: HINSTANCE = GetModuleHandleW(None).unwrap_or_default().into();
+            let cls = w!("AMLightM1PerfUnitHost");
+            let wc = WNDCLASSW {
+                style: CS_HREDRAW | CS_VREDRAW,
+                lpfnWndProc: Some(m1_wnd_proc),
+                hInstance: hinst,
+                lpszClassName: cls,
+                ..Default::default()
+            };
+            let _ = RegisterClassW(&wc);
+            CreateWindowExW(
+                WS_EX_NOREDIRECTIONBITMAP,
+                cls,
+                PCWSTR(w!("AM Light M1 Unit").as_ptr()),
+                WS_POPUP,
+                0,
+                0,
+                1400,
+                880,
+                None,
+                None,
+                Some(hinst),
+                None,
+            )
+            .expect("CreateWindowExW")
+        };
+
+        let mut renderer = D2DRenderer::new(hwnd, 1400, 880, 1.0).expect("D2DRenderer::new 100%");
+        let mut ui = AppUi::new(0);
+        // Mutate settings directly (never execute_action) so %APPDATA%\AMLight\settings_v2.json is untouched.
+        ui.settings.liquid_glass_enabled = true;
+        ui.settings.reduce_transparency = false;
+        ui.settings.reduce_motion = false;
+        ui.settings.playback_backend = PlaybackBackend::NetEase;
+        ui.settings.sidebar_collapsed = false;
+        ui.route = PageRoute::Home;
+        ui.show_lyrics_overlay = false;
+        ui.route_trans = 1.0;
+        ui.sidebar_open_spring.snap(1.0);
+        ui.top_bar_guard_spring.snap(0.0);
+        ui.mouse_pos = (-100.0, -100.0);
+        ui.smtc = SmtcState {
+            title: "Liquid Glass M1".to_string(),
+            artist: "AM Light".to_string(),
+            status: "Paused".to_string(),
+            position_sec: 42.0,
+            duration_sec: 210.0,
+            ..Default::default()
+        };
+        ui.home_shelves = vec![
+            EditorialShelf {
+                title: "Top Picks".to_string(),
+                subtitle: String::new(),
+                kind: EditorialShelfKind::HomeTopPicks,
+                items: (0..4)
+                    .map(|i| EditorialItem {
+                        id: format!("pick_{i}"),
+                        kind: "album".to_string(),
+                        play_kind: "album".to_string(),
+                        title: format!("Featured Pick {i}"),
+                        subtitle: "Editorial".to_string(),
+                        ..Default::default()
+                    })
+                    .collect(),
+            },
+            EditorialShelf {
+                title: "Recently Played".to_string(),
+                subtitle: String::new(),
+                kind: EditorialShelfKind::SquareShelf,
+                items: (0..12)
+                    .map(|i| EditorialItem {
+                        id: format!("sq_{i}"),
+                        kind: "album".to_string(),
+                        play_kind: "album".to_string(),
+                        title: format!("Album {i}"),
+                        subtitle: "Artist".to_string(),
+                        ..Default::default()
+                    })
+                    .collect(),
+            },
+        ];
+
+        // 1. 100% DPI (1400x880, 1.0) steady-state Home
+        ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, false);
+        renderer.step_glass_animations(1.0);
+        ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, false);
+        renderer.step_glass_animations(1.0);
+        ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, false);
+        let st_100 = renderer.frame_stats();
+        assert_eq!(st_100.glass_push_layers, 0, "100% DPI must use ID2D1ImageBrush (0 PushLayers)");
+        assert_eq!(st_100.glass_effect_rebinds, 0, "100% DPI steady-state must have 0 effect rebinds");
+        assert_eq!(st_100.glass_shadow_geom_allocs, 0, "100% DPI steady-state must have 0 shadow geom allocs");
+        assert!(
+            st_100.glass_solid_fastpath_draws >= 6,
+            "100% DPI top bar must take solid fastpath (>=6 draws), got {}",
+            st_100.glass_solid_fastpath_draws
+        );
+        assert_eq!(st_100.glass_snapshot_flushes, 0, "100% DPI steady-state must have 0 snapshot flushes");
+        assert_eq!(st_100.glass_snapshot_blurs, 0, "100% DPI steady-state must have 0 snapshot blurs");
+        assert!(
+            st_100.glass_snapshot_cache_hits >= 1,
+            "100% DPI steady-state must reuse cached bottom snapshot strip"
+        );
+
+        let (rb_w, rb_h, bgra) = renderer.readback_backbuffer_bgra().expect("readback 100%");
+        assert_eq!((rb_w, rb_h), (1400, 880));
+        let has_non_bg_in_rect = |x0: u32, y0: u32, x1: u32, y1: u32| -> bool {
+            for py in y0..y1.min(rb_h) {
+                for px in x0..x1.min(rb_w) {
+                    let i = ((py * rb_w + px) * 4) as usize;
+                    let (b, g, r) = (bgra[i], bgra[i + 1], bgra[i + 2]);
+                    if b.abs_diff(19) > 2 || g.abs_diff(16) > 2 || r.abs_diff(16) > 2 {
+                        return true;
+                    }
+                }
+            }
+            false
+        };
+        assert!(
+            has_non_bg_in_rect(1348, 14, 1382, 48),
+            "top-right close glass button must render visible non-background pixels"
+        );
+        assert!(
+            has_non_bg_in_rect(452, 804, 1212, 866),
+            "bottom MiniPlayer glass pill must render visible non-background pixels"
+        );
+
+        // 2. Scrolled Home (scroll_y = 140.0) -> 1 flush + 1 blur on scroll, then 0 on settled frame
+        ui.scroll_y = 140.0;
+        ui.scroll_target_y = 140.0;
+        ui.scroll_vel_y = 0.0;
+        ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, false);
+        let st_scroll = renderer.frame_stats();
+        assert_eq!(st_scroll.glass_push_layers, 0, "scrolled Home must have 0 PushLayers");
+        assert_eq!(st_scroll.glass_solid_fastpath_draws, 0, "scrolled Home must disable top-bar solid fastpath");
+        assert_eq!(st_scroll.glass_snapshot_flushes, 1, "scrolled frame must issue exactly 1 pre-copy Flush");
+        assert_eq!(st_scroll.glass_snapshot_blurs, 1, "scrolled frame must issue exactly 1 blur pass");
+
+        // Warm pool slots for the 6 top-bar controls + MiniPlayer, then verify settled frame hits 0s
+        ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, false);
+        let st_scroll_settled = renderer.frame_stats();
+        assert_eq!(st_scroll_settled.glass_push_layers, 0);
+        assert_eq!(st_scroll_settled.glass_effect_rebinds, 0, "settled scrolled Home must have 0 effect rebinds");
+        assert_eq!(st_scroll_settled.glass_shadow_geom_allocs, 0);
+        assert_eq!(st_scroll_settled.glass_snapshot_flushes, 0, "settled scrolled Home must have 0 flushes");
+        assert_eq!(st_scroll_settled.glass_snapshot_blurs, 0, "settled scrolled Home must have 0 blurs");
+        assert!(
+            st_scroll_settled.glass_snapshot_cache_hits >= 1,
+            "settled scrolled Home must reuse cached top & bottom strips"
+        );
+
+        // 3. Top-Bar Scrim (tb_guard_a > 0.5 at scroll_y = 0.0)
+        ui.scroll_y = 0.0;
+        ui.scroll_target_y = 0.0;
+        ui.mouse_pos = (700.0, 20.0);
+        ui.top_bar_guard_spring.snap(1.0);
+        ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, false);
+        ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, false);
+        let st_scrim = renderer.frame_stats();
+        assert_eq!(st_scrim.glass_push_layers, 0);
+        assert!(
+            st_scrim.glass_solid_fastpath_draws >= 6,
+            "scrim top bar at scroll_y=0 must still use solid fastpath (>=6), got {}",
+            st_scrim.glass_solid_fastpath_draws
+        );
+        assert_eq!(st_scrim.glass_snapshot_blurs, 0, "scrim top bar settled frame must have 0 blurs");
+        ui.mouse_pos = (-100.0, -100.0);
+        ui.top_bar_guard_spring.snap(0.0);
+
+        // 4. !use_batch_snapshot fallback parity (More popover rendered after end_glass_backdrop_snapshot)
+        ui.show_more_popover = true;
+        ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, false);
+        let st_fallback = renderer.frame_stats();
+        assert_eq!(st_fallback.glass_push_layers, 0, "fallback popover must also use ID2D1ImageBrush (0 PushLayers)");
+        assert!(st_fallback.glass_snapshot_flushes >= 1, "fallback popover must perform local capture flush");
+        ui.show_more_popover = false;
+        // Confirm batch pool & cached snapshot remain intact after fallback
+        ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, false);
+        ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, false);
+        let st_after_fb = renderer.frame_stats();
+        assert_eq!(st_after_fb.glass_effect_rebinds, 0, "fallback must not corrupt batch pool slots");
+        assert_eq!(st_after_fb.glass_snapshot_flushes, 0);
+        assert_eq!(st_after_fb.glass_snapshot_blurs, 0);
+
+        // 5. reduce_transparency = true
+        ui.settings.reduce_transparency = true;
+        ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, false);
+        let st_red = renderer.frame_stats();
+        assert_eq!(st_red.glass_push_layers, 0);
+        assert_eq!(st_red.glass_snapshot_flushes, 0);
+        assert_eq!(st_red.glass_snapshot_blurs, 0);
+        assert_eq!(st_red.glass_solid_fastpath_draws, 0);
+        ui.settings.reduce_transparency = false;
+
+        // 6. 200% HiDPI (2800x1760, 2.0) + resize(2400, 1600, 2.0) invalidation + DPI change (1.0)
+        renderer.resize(2800, 1760, 2.0);
+        ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, false);
+        renderer.step_glass_animations(1.0);
+        ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, false);
+        let st_200 = renderer.frame_stats();
+        assert_eq!(st_200.glass_push_layers, 0, "200% DPI must have 0 PushLayers");
+        assert_eq!(st_200.glass_effect_rebinds, 0, "200% DPI steady-state must have 0 effect rebinds");
+        assert_eq!(st_200.glass_shadow_geom_allocs, 0, "200% DPI steady-state must have 0 shadow allocs");
+        assert!(st_200.glass_solid_fastpath_draws >= 6);
+        assert_eq!(st_200.glass_snapshot_flushes, 0);
+        assert_eq!(st_200.glass_snapshot_blurs, 0);
+        assert!(st_200.glass_snapshot_cache_hits >= 1);
+
+        let (rb_w2, rb_h2, bgra2) = renderer.readback_backbuffer_bgra().expect("readback 200%");
+        assert_eq!((rb_w2, rb_h2), (2800, 1760));
+        let has_2x_close = (28..96).any(|py| {
+            (2696..2764).any(|px| {
+                let i = ((py * rb_w2 + px) * 4) as usize;
+                bgra2[i].abs_diff(19) > 2 || bgra2[i + 1].abs_diff(16) > 2 || bgra2[i + 2].abs_diff(16) > 2
+            })
+        });
+        assert!(has_2x_close, "200% DPI top-right close button must render visible non-background pixels");
+
+        renderer.resize(2400, 1600, 2.0);
+        ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, false);
+        let st_resz = renderer.frame_stats();
+        assert_eq!(st_resz.glass_push_layers, 0);
+        assert_eq!(st_resz.glass_snapshot_flushes, 1, "resize must invalidate snapshot cache");
+        assert_eq!(st_resz.glass_snapshot_blurs, 1);
+        assert_eq!(st_resz.glass_snapshot_cache_hits, 0);
+        ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, false);
+        let st_resz2 = renderer.frame_stats();
+        assert_eq!(st_resz2.glass_effect_rebinds, 0);
+        assert_eq!(st_resz2.glass_snapshot_flushes, 0);
+        assert_eq!(st_resz2.glass_snapshot_blurs, 0);
+
+        renderer.resize(1200, 800, 1.0);
+        ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, false);
+        let st_dpi_drop = renderer.frame_stats();
+        assert_eq!(st_dpi_drop.glass_push_layers, 0);
+        assert_eq!(st_dpi_drop.glass_snapshot_flushes, 1);
+
+        // 7. LyricsViewState wrapper parity (`begin_glass_backdrop_snapshot_strips`)
+        ui.current_lyrics = parse_lrc_lyrics("[00:01.00]Line One\n[00:05.00]Line Two\n", None, "test");
+        ui.current_lyrics_key = "m1_lyrics_test".to_string();
+        ui.show_lyrics_overlay = true;
+        ui.lyrics_open_spring.snap(1.0);
+        ui.mouse_pos = (60.0, 30.0);
+        ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, false);
+        let st_lyr = renderer.frame_stats();
+        assert_eq!(st_lyr.glass_push_layers, 0, "LyricsViewState must have 0 PushLayers");
+        assert_eq!(st_lyr.glass_snapshot_flushes, 1, "LyricsViewState strip wrapper must issue 1 flush");
+        assert_eq!(st_lyr.glass_snapshot_blurs, 1, "LyricsViewState strip wrapper must issue 1 blur");
+
+        // 8. Iteration 2 Regressions:
+        //    8a. Single-frame readback_backbuffer_bgra() after Present() returns the exact just-presented frame
+        {
+            use am_light_lib::theme::{Color, RectF};
+            renderer.resize(880, 880, 1.0);
+            renderer.begin_draw(Color::rgb(21, 99, 177));
+            renderer.fill_rect(RectF::new(100.0, 100.0, 120.0, 120.0), Color::rgb(220, 45, 55));
+            renderer.end_window_draw_and_present(0.0, true, 0);
+            let (rw, rh, rbuf) = renderer.readback_backbuffer_bgra().expect("single-frame readback");
+            assert_eq!((rw, rh), (880, 880));
+            let bg_i = ((50 * rw + 50) * 4) as usize;
+            let fg_i = ((150 * rw + 150) * 4) as usize;
+            assert!(
+                rbuf[bg_i].abs_diff(177) <= 2 && rbuf[bg_i + 1].abs_diff(99) <= 2 && rbuf[bg_i + 2].abs_diff(21) <= 2,
+                "single-frame readback bg mismatch: {:?}",
+                &rbuf[bg_i..bg_i + 4]
+            );
+            assert!(
+                rbuf[fg_i].abs_diff(55) <= 2 && rbuf[fg_i + 1].abs_diff(45) <= 2 && rbuf[fg_i + 2].abs_diff(220) <= 2,
+                "single-frame readback fg mismatch: {:?}",
+                &rbuf[fg_i..fg_i + 4]
+            );
+        }
+
+        //    8b. LibSongs playback_loading spinner_phase (0.0 -> 0.5) refreshes snapshot & updates MiniPlayer pixels
+        {
+            use am_light_lib::am_agent::AgentTrackInput;
+            use am_light_lib::app_ui::ContainerDetailData;
+            use am_light_lib::downloads::{DownloadedTrackItem, DownloadsOverview};
+
+            ui.show_lyrics_overlay = false;
+            ui.lyrics_open_spring.snap(0.0);
+            ui.mouse_pos = (-100.0, -100.0);
+            ui.top_bar_guard_spring.snap(0.0);
+            ui.sidebar_open_spring.snap(1.0);
+            ui.settings.sidebar_collapsed = false;
+            ui.settings.reduce_motion = false;
+            ui.scroll_y = 0.0;
+            ui.scroll_target_y = 0.0;
+            ui.scroll_vel_y = 0.0;
+            renderer.resize(880, 880, 1.0);
+
+            let make_tracks = |prefix: &str| -> Vec<AgentTrackInput> {
+                (0..25)
+                    .map(|i| AgentTrackInput {
+                        id: format!("trk_{i}"),
+                        catalog_id: Some(format!("{}", 10000 + i)),
+                        kind: Some("songs".to_string()),
+                        name: format!("{prefix} {i}"),
+                        artist_name: format!("Artist {i}"),
+                        album_name: "Album".to_string(),
+                        duration_sec: 180.0,
+                        artwork_url: None,
+                        audio_traits: Vec::new(),
+                    })
+                    .collect()
+            };
+
+            ui.route = PageRoute::LibSongs;
+            ui.lib_songs = make_tracks("Song");
+            ui.playback_loading = true;
+            ui.playback_loading_track_id = Some("10012".to_string());
+            ui.spinner_phase = 0.0;
+            ui.step_and_render_ex(&mut renderer, 0.0, false);
+            ui.step_and_render_ex(&mut renderer, 0.0, false);
+            let (_, _, spin_px_a) = renderer.readback_backbuffer_bgra().expect("spin A");
+
+            ui.spinner_phase = 0.5;
+            ui.step_and_render_ex(&mut renderer, 0.0, false);
+            let st_spin = renderer.frame_stats();
+            assert!(
+                st_spin.glass_snapshot_blurs >= 1,
+                "advancing spinner_phase during playback_loading must refresh snapshot"
+            );
+            let (rw, rh, spin_px_b) = renderer.readback_backbuffer_bgra().expect("spin B");
+            let mini_max_diff = (804..866.min(rh as usize))
+                .flat_map(|py| (290..856.min(rw as usize)).map(move |px| (py, px)))
+                .map(|(py, px)| {
+                    let i = (py * rw as usize + px) * 4;
+                    spin_px_a[i]
+                        .abs_diff(spin_px_b[i])
+                        .max(spin_px_a[i + 1].abs_diff(spin_px_b[i + 1]))
+                        .max(spin_px_a[i + 2].abs_diff(spin_px_b[i + 2]))
+                })
+                .max()
+                .unwrap_or(0);
+            assert!(
+                mini_max_diff >= 3,
+                "spinner_phase change behind MiniPlayer must visually update pixels (max_diff={mini_max_diff})"
+            );
+
+            //    8c. Same-.len() content mutations on LibSongs, ContainerDetail, LibDownloads
+            ui.playback_loading = false;
+            ui.playback_loading_track_id = None;
+            ui.step_and_render_ex(&mut renderer, 0.0, false);
+            ui.step_and_render_ex(&mut renderer, 0.0, false);
+            assert_eq!(renderer.frame_stats().glass_snapshot_blurs, 0);
+
+            for i in 10..16 {
+                ui.lib_songs[i].name = format!("Mutated Lib Title {i} WWWWW");
+            }
+            ui.step_and_render_ex(&mut renderer, 0.0, false);
+            assert!(
+                renderer.frame_stats().glass_snapshot_blurs >= 1,
+                "same-.len() LibSongs mutation must trigger snapshot refresh"
+            );
+
+            ui.route = PageRoute::ContainerDetail {
+                id: "det_1".to_string(),
+                kind: "album".to_string(),
+                title_hint: "Album".to_string(),
+            };
+            ui.detail_loading = false;
+            ui.detail_data = Some(ContainerDetailData {
+                id: "det_1".to_string(),
+                kind: "album".to_string(),
+                title: "Album Title".to_string(),
+                subtitle: "Artist".to_string(),
+                description: String::new(),
+                artwork_url: None,
+                motion_video_url: None,
+                tracks: make_tracks("DetailTrack"),
+                related_albums: Vec::new(),
+            });
+            ui.step_and_render_ex(&mut renderer, 0.0, false);
+            ui.step_and_render_ex(&mut renderer, 0.0, false);
+            assert_eq!(renderer.frame_stats().glass_snapshot_blurs, 0);
+            if let Some(ref mut d) = ui.detail_data {
+                for i in 6..15 {
+                    d.tracks[i].name = format!("Mutated Detail {i} WWWWW");
+                }
+            }
+            ui.step_and_render_ex(&mut renderer, 0.0, false);
+            assert!(
+                renderer.frame_stats().glass_snapshot_blurs >= 1,
+                "same-.len() ContainerDetail tracks mutation must trigger snapshot refresh"
+            );
+
+            ui.route = PageRoute::LibDownloads;
+            ui.downloads_info = DownloadsOverview {
+                media_folder: "C:\\Media".to_string(),
+                folder_exists: true,
+                total_bytes: 1024 * 1024 * 20,
+                complete_count: 20,
+                partial_count: 0,
+                items: (0..20)
+                    .map(|i| DownloadedTrackItem {
+                        path: format!("C:\\Media\\t_{i}.movpkg"),
+                        title: format!("DL {i}"),
+                        track_number: Some(i as u32 + 1),
+                        artist: "Artist".to_string(),
+                        album: "Album".to_string(),
+                        format: "ALAC".to_string(),
+                        resolution: None,
+                        bitrate_kbps: None,
+                        size_bytes: 1024 * 1024,
+                        complete: true,
+                        modified_unix: 100,
+                    })
+                    .collect(),
+            };
+            ui.step_and_render_ex(&mut renderer, 0.0, false);
+            ui.step_and_render_ex(&mut renderer, 0.0, false);
+            assert_eq!(renderer.frame_stats().glass_snapshot_blurs, 0);
+            for i in 10..18 {
+                ui.downloads_info.items[i].title = format!("Mutated DL {i} WWWWW");
+            }
+            ui.downloads_info.total_bytes += 512;
+            ui.step_and_render_ex(&mut renderer, 0.0, false);
+            assert!(
+                renderer.frame_stats().glass_snapshot_blurs >= 1,
+                "same-.len() LibDownloads mutation must trigger snapshot refresh"
+            );
+
+            //    8d. PageRoute::Search live search_query edit triggers snapshot refresh
+            ui.route = PageRoute::Search;
+            ui.search_filter = 1;
+            ui.scroll_y = 25.0;
+            ui.scroll_target_y = 25.0;
+            ui.search_query = "A".to_string();
+            ui.search_completed_query = "A".to_string();
+            ui.search_songs = make_tracks("SearchHit");
+            ui.step_and_render_ex(&mut renderer, 0.0, false);
+            ui.step_and_render_ex(&mut renderer, 0.0, false);
+            assert_eq!(renderer.frame_stats().glass_snapshot_blurs, 0);
+            ui.search_query = "WWWWWWWWWWWWWWWWWWWWWWWWWWWW".to_string();
+            ui.step_and_render_ex(&mut renderer, 0.0, false);
+            assert!(
+                renderer.frame_stats().glass_snapshot_blurs >= 1,
+                "live search_query edit on PageRoute::Search must trigger snapshot refresh"
+            );
+
+            //    8e. Home partially-occluded motion card (0 < cy + card_h <= 46.0) & unfocused tracking
+            ui.route = PageRoute::Home;
+            ui.settings.playback_backend = PlaybackBackend::AppleMusicNative;
+            ui.settings.motion_artwork_enabled = true;
+            ui.is_window_focused = false;
+            ui.home_shelves = vec![
+                EditorialShelf {
+                    title: "Top Picks".to_string(),
+                    subtitle: String::new(),
+                    kind: EditorialShelfKind::HomeTopPicks,
+                    items: vec![EditorialItem {
+                        id: "peek_1".to_string(),
+                        kind: "album".to_string(),
+                        play_kind: "album".to_string(),
+                        title: "Peek".to_string(),
+                        subtitle: "Sub".to_string(),
+                        motion_video_url: Some("https://example.invalid/top_peek.m3u8".to_string()),
+                        ..Default::default()
+                    }],
+                },
+                EditorialShelf {
+                    title: "Below".to_string(),
+                    subtitle: String::new(),
+                    kind: EditorialShelfKind::SquareShelf,
+                    items: (0..12)
+                        .map(|i| EditorialItem {
+                            id: format!("below_{i}"),
+                            kind: "album".to_string(),
+                            play_kind: "album".to_string(),
+                            title: format!("Below {i}"),
+                            subtitle: "Sub".to_string(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                },
+            ];
+            // At win_w=880, sb=264 -> inner_w = 616-64 = 552, cols=2, card_w=267, card_h=341.76
+            // start_y = 62 - scroll_y; header+title = 86; card y = start_y + 86 = 148 - scroll_y
+            // card bottom = 148 + 341.76 - scroll_y -> set scroll_y = 460.0 -> cy+card_h ~= 29.8 in (0, 46]!
+            ui.scroll_y = 460.0;
+            ui.scroll_target_y = 460.0;
+            ui.step_and_render_ex(&mut renderer, 0.0, false);
+            assert!(
+                ui.rendered_home_motion_urls()
+                    .iter()
+                    .any(|u| u == "https://example.invalid/top_peek.m3u8"),
+                "partially-occluded top-bar Home motion card (0 < cy+card_h <= 46) must be tracked even when unfocused"
+            );
+            ui.is_window_focused = true;
+            ui.settings.playback_backend = PlaybackBackend::NetEase;
+
+            //    8f. top_bar_solid_bg grip occlusion at win_w = 880, tb_guard_a = 1.0, in_room = true
+            ui.scroll_y = 0.0;
+            ui.scroll_target_y = 0.0;
+            ui.top_bar_guard_spring.snap(1.0);
+            ui.listen_together.in_room = true;
+            ui.listen_together.room_id = "room1".to_string();
+            ui.step_and_render_ex(&mut renderer, 0.0, false);
+            assert_eq!(
+                renderer.frame_stats().glass_solid_fastpath_draws, 0,
+                "win_w=880 with tb_guard_a=1.0 and overlapping Listen Together must disable top_bar_solid_bg"
+            );
+            let (gw, gh, grip_at_0) = renderer.readback_backbuffer_bgra().expect("grip scroll=0");
+            ui.scroll_y = 2.5;
+            ui.scroll_target_y = 2.5;
+            ui.step_and_render_ex(&mut renderer, 0.0, false);
+            let (_, _, grip_at_25) = renderer.readback_backbuffer_bgra().expect("grip scroll=2.5");
+            let grip_max_diff = (24..34.min(gh as usize))
+                .flat_map(|py| (564..604.min(gw as usize)).map(move |px| (py, px)))
+                .map(|(py, px)| {
+                    let i = (py * gw as usize + px) * 4;
+                    grip_at_0[i]
+                        .abs_diff(grip_at_25[i])
+                        .max(grip_at_0[i + 1].abs_diff(grip_at_25[i + 1]))
+                        .max(grip_at_0[i + 2].abs_diff(grip_at_25[i + 2]))
+                })
+                .max()
+                .unwrap_or(0);
+            assert!(
+                grip_max_diff <= 4,
+                "lt_r over grip at win_w=880 must match GPU blur within <= 4 (got {grip_max_diff})"
+            );
+
+            // Confirm wide win_w=1400 still uses fastpath when grip does NOT overlap lt_r
+            renderer.resize(1400, 880, 1.0);
+            ui.scroll_y = 0.0;
+            ui.scroll_target_y = 0.0;
+            ui.step_and_render_ex(&mut renderer, 0.0, false);
+            assert!(
+                renderer.frame_stats().glass_solid_fastpath_draws >= 6,
+                "win_w=1400 non-overlapping grip must keep top_bar_solid_bg fastpath"
+            );
+            ui.listen_together.in_room = false;
+            ui.top_bar_guard_spring.snap(0.0);
+        }
+
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+    }
+
+    #[test]
+    fn test_r1_home_motion_expanded_slots_prefetch_warm_lru_crossfade_and_sizing() {
+        use am_light_lib::am_api::{EditorialItem, EditorialShelf, EditorialShelfKind};
+        use am_light_lib::app_ui::{AppUi, PageRoute};
+        use am_light_lib::backends::PlaybackBackend;
+        use am_light_lib::d2d_renderer::D2DRenderer;
+        use am_light_lib::motion_art::{
+            MotionArtManager, MAX_VIEWPORT_SLOTS, MAX_WARM_PAUSED_SLOTS,
+        };
+        use am_light_lib::smtc::SmtcState;
+        use std::time::Duration;
+        use windows::core::{w, PCWSTR};
+        use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, CS_HREDRAW, CS_VREDRAW,
+            WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP, WS_POPUP,
+        };
+
+        assert_eq!(MAX_VIEWPORT_SLOTS, 20);
+        assert_eq!(MAX_WARM_PAUSED_SLOTS, 28);
+
+        // 1. Direct MotionArtManager R1 checks: 20 active slots, bounded 28-entry warm-paused LRU,
+        //    warm-cache hit counter on re-entry, and scroll-active prefetch telemetry.
+        {
+            let mgr = MotionArtManager::new();
+            let batch24: Vec<(String, u32)> = (0..24)
+                .map(|i| (format!("https://example.invalid/r1_slot_{i}.m3u8"), 220 + (i as u32) * 10))
+                .collect();
+            mgr.sync_visible_urls_with_targets(&batch24);
+            assert_eq!(
+                mgr.active_slot_urls().len(),
+                20,
+                "expanded active viewport budget must hold MAX_VIEWPORT_SLOTS=20 (>=18)"
+            );
+            assert_eq!(mgr.telemetry_snapshot().active_slots, 20);
+
+            // Demote first 20 slots -> warm LRU holds 20; activate & demote 16 more -> bounded at 28
+            let batch16: Vec<(String, u32)> = (24..40)
+                .map(|i| (format!("https://example.invalid/r1_slot_{i}.m3u8"), 300))
+                .collect();
+            mgr.sync_visible_urls_with_targets(&batch16);
+            assert_eq!(mgr.telemetry_snapshot().warm_slots, 20);
+            mgr.sync_visible_urls_with_targets(&[]);
+            assert_eq!(
+                mgr.telemetry_snapshot().warm_slots,
+                MAX_WARM_PAUSED_SLOTS,
+                "warm-paused LRU must stay strictly bounded at 28 entries"
+            );
+
+            // Re-entering a warm-paused URL promotes it and increments warm_cache_hits
+            let hits_before = mgr.telemetry_snapshot().warm_cache_hits;
+            mgr.sync_visible_urls_with_targets(&[(
+                "https://example.invalid/r1_slot_35.m3u8".to_string(),
+                300,
+            )]);
+            let tel_after = mgr.telemetry_snapshot();
+            assert!(
+                tel_after.warm_cache_hits > hits_before,
+                "re-entering a warm-paused slot must bump warm_cache_hits"
+            );
+            assert_eq!(tel_after.active_slots, 1);
+
+            // Repeated sync_prefetch_urls must queue new URLs once without double-counting
+            let pf_list: Vec<(String, u32)> = (100..108)
+                .map(|i| (format!("https://example.invalid/r1_pf_{i}.m3u8"), 260))
+                .collect();
+            mgr.sync_prefetch_urls(&pf_list);
+            let q1 = mgr.telemetry_snapshot().prefetch_queued_during_scroll;
+            assert_eq!(q1, 8);
+            mgr.sync_prefetch_urls(&pf_list);
+            assert_eq!(
+                mgr.telemetry_snapshot().prefetch_queued_during_scroll,
+                q1,
+                "duplicate prefetch calls must not double-count or spam worker"
+            );
+            mgr.set_global_enabled(false);
+        }
+
+        // 2. Real D2DRenderer + AppUi Home R1 test: larger showcase sizing, >=18 visible slots,
+        //    top-bar overlap inclusion, scroll-active prefetch, and instant cached-MP4 activation!
+        unsafe extern "system" fn r1_wnd_proc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+            DefWindowProcW(h, m, w, l)
+        }
+        let hwnd = unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let hinst: HINSTANCE = GetModuleHandleW(None).unwrap_or_default().into();
+            let cls = w!("AMLightR1UnitHost");
+            let wc = WNDCLASSW {
+                style: CS_HREDRAW | CS_VREDRAW,
+                lpfnWndProc: Some(r1_wnd_proc),
+                hInstance: hinst,
+                lpszClassName: cls,
+                ..Default::default()
+            };
+            let _ = RegisterClassW(&wc);
+            CreateWindowExW(
+                WS_EX_NOREDIRECTIONBITMAP,
+                cls,
+                PCWSTR(w!("AM Light R1 Unit").as_ptr()),
+                WS_POPUP,
+                0,
+                0,
+                1400,
+                1000,
+                None,
+                None,
+                Some(hinst),
+                None,
+            )
+            .expect("CreateWindowExW R1")
+        };
+
+        let mut renderer = D2DRenderer::new(hwnd, 1400, 1000, 1.0).expect("D2DRenderer::new R1");
+        let mut ui = AppUi::new(0);
+        ui.settings.playback_backend = PlaybackBackend::AppleMusicNative;
+        ui.settings.motion_artwork_enabled = true;
+        ui.settings.reduce_motion = false;
+        ui.settings.liquid_glass_enabled = true;
+        ui.settings.reduce_transparency = false;
+        ui.settings.sidebar_collapsed = false;
+        ui.is_window_focused = true;
+        ui.route = PageRoute::Home;
+        ui.show_lyrics_overlay = false;
+        ui.route_trans = 1.0;
+        ui.sidebar_open_spring.snap(1.0);
+        ui.top_bar_guard_spring.snap(0.0);
+        ui.mouse_pos = (-100.0, -100.0);
+        ui.smtc = SmtcState {
+            title: "R1 Home Motion".to_string(),
+            artist: "AM Light".to_string(),
+            status: "Paused".to_string(),
+            position_sec: 12.0,
+            duration_sec: 200.0,
+            ..Default::default()
+        };
+
+        let make_item = |id: &str, url: &str, tall: bool| EditorialItem {
+            id: id.to_string(),
+            kind: "album".to_string(),
+            play_kind: "album".to_string(),
+            title: format!("Item {id}"),
+            subtitle: "Editorial".to_string(),
+            motion_video_url: if tall { None } else { Some(url.to_string()) },
+            motion_tall_video_url: if tall { Some(url.to_string()) } else { None },
+            ..Default::default()
+        };
+
+        // 2a. Verify spacious desktop sizing for HomeTopPicks, HeroFlowcase & SquareShelf (1400x1000)
+        ui.home_shelves = vec![
+            EditorialShelf {
+                title: "Top Picks".to_string(),
+                subtitle: String::new(),
+                kind: EditorialShelfKind::HomeTopPicks,
+                items: (0..6)
+                    .map(|i| make_item(&format!("tp_{i}"), &format!("https://example.invalid/tp_{i}.m3u8"), true))
+                    .collect(),
+            },
+            EditorialShelf {
+                title: "Featured".to_string(),
+                subtitle: String::new(),
+                kind: EditorialShelfKind::HeroFlowcase,
+                items: (0..6)
+                    .map(|i| make_item(&format!("hf_{i}"), &format!("https://example.invalid/hf_{i}.m3u8"), false))
+                    .collect(),
+            },
+            EditorialShelf {
+                title: "Recently Played".to_string(),
+                subtitle: String::new(),
+                kind: EditorialShelfKind::SquareShelf,
+                items: (0..12)
+                    .map(|i| make_item(&format!("sq_{i}"), &format!("https://example.invalid/sq_{i}.m3u8"), false))
+                    .collect(),
+            },
+        ];
+        std::thread::sleep(Duration::from_millis(95));
+        ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, false);
+
+        let tp_card = ui
+            .rendered_home_motion_cards()
+            .iter()
+            .find(|(u, _)| u.ends_with("/tp_0.m3u8"))
+            .map(|(_, r)| *r)
+            .expect("Top Picks card 0 rendered");
+        assert!(
+            tp_card.w >= 260.0 && tp_card.h >= 245.0 && tp_card.h <= 415.5,
+            "Desktop HomeTopPicks must preserve classic Apple Music sizing (<=415 DIP height), got {:?}",
+            tp_card
+        );
+
+        // Scroll to inspect HeroFlowcase + SquareShelf classic desktop card geometry
+        ui.scroll_y = 460.0;
+        ui.scroll_target_y = 460.0;
+        ui.scroll_vel_y = 0.0;
+        ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, false);
+        let hf_card = ui
+            .rendered_home_motion_cards()
+            .iter()
+            .find(|(u, _)| u.ends_with("/hf_0.m3u8"))
+            .map(|(_, r)| *r)
+            .expect("HeroFlowcase card 0 rendered");
+        assert!(
+            hf_card.w >= 320.0 && hf_card.h >= 180.0 && hf_card.h <= 290.5,
+            "Desktop HeroFlowcase must preserve classic sizing (180..=290 DIP height), got {:?}",
+            hf_card
+        );
+
+        ui.scroll_y = 1040.0;
+        ui.scroll_target_y = 1040.0;
+        ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, false);
+        let sq_card = ui
+            .rendered_home_motion_cards()
+            .iter()
+            .find(|(u, _)| u.ends_with("/sq_0.m3u8"))
+            .map(|(_, r)| *r)
+            .expect("SquareShelf card 0 rendered");
+        assert!(
+            sq_card.w >= 160.0 && sq_card.w <= 220.0 && (sq_card.w - sq_card.h).abs() < 1.0,
+            "Desktop Home SquareShelf motion card must preserve classic 6-col square sizing, got {:?}",
+            sq_card
+        );
+
+        // Verify narrow viewport does not overflow content area
+        renderer.resize(780, 760, 1.0);
+        ui.scroll_y = 0.0;
+        ui.scroll_target_y = 0.0;
+        ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, false);
+        for (_, cr) in ui.rendered_home_motion_cards() {
+            assert!(
+                cr.right() <= 780.5 && cr.x >= -0.5,
+                "Narrow Home card must not overflow viewport: {:?}",
+                cr
+            );
+        }
+
+        // 2b. Expanded active viewport slots (>= 18, up to 20) + top-bar overlap inclusion + offscreen prefetch
+        renderer.resize(1760, 1360, 1.0);
+        ui.home_shelves = (0..6)
+            .map(|s| EditorialShelf {
+                title: format!("Shelf {s}"),
+                subtitle: String::new(),
+                kind: EditorialShelfKind::SquareShelf,
+                items: (0..10)
+                    .map(|i| {
+                        make_item(
+                            &format!("m_{s}_{i}"),
+                            &format!("https://example.invalid/m_{s}_{i}.m3u8"),
+                            false,
+                        )
+                    })
+                    .collect(),
+            })
+            .collect();
+        ui.scroll_y = 0.0;
+        ui.scroll_target_y = 0.0;
+        ui.scroll_vel_y = 0.0;
+        ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, false);
+        assert!(
+            ui.visible_home_motion_urls().len() >= 18
+                && ui.visible_home_motion_urls().len() <= MAX_VIEWPORT_SLOTS,
+            "Expanded Home viewport must track >=18 (up to 20) active slots, got {}",
+            ui.visible_home_motion_urls().len()
+        );
+        assert_eq!(
+            ui.active_motion_slot_urls().len(),
+            ui.visible_home_motion_urls().len(),
+            "Settled Home must activate all visible viewport motion slots"
+        );
+        assert!(
+            !ui.prefetch_home_motion_targets().is_empty(),
+            "Offscreen & horizontal-lookahead cards must populate prefetch_home_motion_targets"
+        );
+        assert!(
+            ui.motion_telemetry().prefetch_queued_during_scroll > 0,
+            "Prefetch queue telemetry must increment"
+        );
+
+        // Top-bar overlap inclusion: scroll shelf 0 so its card bottom sits strictly in (0, 46] DIP
+        // (use a standard 700 DIP tall viewport so 3 rows = 18 cards <= 20-slot cap while keeping 6 shelves scrollable)
+        renderer.resize(1760, 700, 1.0);
+        let first_card_h = ui
+            .rendered_home_motion_cards()
+            .first()
+            .map(|(_, r)| r.h)
+            .unwrap_or(240.0);
+        let first_card_y0 = ui
+            .rendered_home_motion_cards()
+            .first()
+            .map(|(_, r)| r.y)
+            .unwrap_or(148.0);
+        let peek_scroll = (first_card_y0 + first_card_h) - 24.0;
+        ui.scroll_y = peek_scroll;
+        ui.scroll_target_y = peek_scroll;
+        ui.scroll_vel_y = 0.0;
+        ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, false);
+        assert!(
+            ui.visible_home_motion_urls()
+                .iter()
+                .any(|u| u.ends_with("/m_0_0.m3u8")),
+            "Card peeking strictly underneath floating top bar (0 < bottom <= 46) must stay in active viewport slots"
+        );
+        renderer.resize(1760, 1360, 1.0);
+
+        // 2c. Instant cached-MP4 activation (0ms settle bypass) + scroll-active prefetch during FAST scroll!
+        let cached_url = format!("https://example.invalid/r1_cached_fast_{}.m3u8", std::process::id());
+        let uncached_url = format!("https://example.invalid/r1_uncached_fast_{}.m3u8", std::process::id());
+        let slot_k = MotionArtManager::slot_key_for_url(&cached_url);
+        let hash_hex = slot_k.strip_prefix("u_").expect("u_ prefix");
+        let cache_dir = std::path::PathBuf::from(
+            std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA"),
+        )
+        .join("AM-Light")
+        .join("cache")
+        .join("motion_art");
+        let _ = std::fs::create_dir_all(&cache_dir);
+        let fake_mp4 = cache_dir.join(format!("{hash_hex}.mp4"));
+        std::fs::write(&fake_mp4, vec![0xAAu8; 16_384]).expect("write temp cached mp4");
+        assert!(
+            ui.motion_art_manager().is_url_cached_ready(&cached_url),
+            "Existing >8KB cached MP4 must report is_url_cached_ready == true"
+        );
+        assert!(
+            !ui.motion_art_manager().is_url_cached_ready(&uncached_url),
+            "Missing MP4 must report is_url_cached_ready == false"
+        );
+
+        // Put cached_url and uncached_url on screen + offscreen prefetch card, then fast-scroll!
+        let offscreen_pf_url =
+            format!("https://example.invalid/r1_scroll_pf_{}.m3u8", std::process::id());
+        ui.home_shelves = vec![
+            EditorialShelf {
+                title: "Fast Scroll".to_string(),
+                subtitle: String::new(),
+                kind: EditorialShelfKind::HomeTopPicks,
+                items: vec![
+                    make_item("fast_cached", &cached_url, true),
+                    make_item("fast_uncached", &uncached_url, true),
+                    make_item("fast_extra1", "https://example.invalid/r1_fast_extra1.m3u8", true),
+                    make_item("fast_extra2", "https://example.invalid/r1_fast_extra2.m3u8", true),
+                    make_item("fast_lookahead", &offscreen_pf_url, true),
+                ],
+            },
+        ];
+        ui.scroll_y = 0.0;
+        ui.scroll_target_y = 260.0;
+        ui.scroll_vel_y = 820.0; // actively fast-scrolling!
+        let pf_before_scroll = ui.motion_telemetry().prefetch_queued_during_scroll;
+        ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, false);
+
+        let fast_active = ui.active_motion_slot_urls();
+        assert!(
+            fast_active.iter().any(|u| u == &cached_url),
+            "Cached MP4 must bypass scroll-settle debounce and activate immediately during fast scroll!"
+        );
+        assert!(
+            !fast_active.iter().any(|u| u == &uncached_url),
+            "Uncached network HLS card must wait out brief settle debounce while prefetching"
+        );
+        assert!(
+            ui.motion_telemetry().prefetch_queued_during_scroll > pf_before_scroll,
+            "Scroll-active prefetch must keep queueing offscreen/uncached URLs during fast scroll"
+        );
+        // Verify crossfade alpha starts at 0.0 before a decoded frame arrives (static cover only, zero black flash)
+        assert_eq!(ui.motion_crossfade_alpha(&uncached_url), 0.0);
+
+        // Clean up temporary synthetic cache file and stop worker cleanly
+        ui.motion_art_manager().set_global_enabled(false);
+        drop(ui);
+        let _ = std::fs::remove_file(&fake_mp4);
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+    }
+
+    #[test]
+    fn test_r3_dxva_target_dim_hls_parser_downscaler_and_gpu_fallback() {
+        use am_light_lib::app_ui::AppUi;
+        use am_light_lib::d2d_renderer::{D2DRenderer, MOTION_TEXTURE_LRU_CAP};
+        use am_light_lib::motion_art::{
+            bucket_target_dim, compute_scaled_dimensions, downscale_bgra_frame,
+            parse_avc_variant_for_target_dim, parse_best_avc_variant_from_master,
+            MotionFrameSnapshot,
+        };
+        use am_light_lib::theme::{Color, RectF};
+        use std::sync::Arc;
+        use windows::core::{w, PCWSTR};
+        use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+        use windows::Win32::Graphics::Direct3D11::{
+            ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
+            D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, CS_HREDRAW, CS_VREDRAW,
+            WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP, WS_POPUP,
+        };
+
+        // 1. parse_avc_variant_for_target_dim picks smallest AVC >= target_px (ignores HEVC & trickplay)
+        let master_url = "https://mvod.itunes.apple.com/motion/master.m3u8";
+        let m3u8 = r#"#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=60000,RESOLUTION=256x256,CODECS="avc1.64001f",URI="iframe_256.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=2600000,RESOLUTION=384x384,CODECS="hvc1.1.6.L90.90"
+hevc_384.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=400000,RESOLUTION=240x240,CODECS="avc1.640015"
+avc_240.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=650000,RESOLUTION=360x360,CODECS="avc1.64001e"
+avc_360.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=950000,RESOLUTION=486x486,CODECS="avc1.64001f"
+avc_486.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=1800000,RESOLUTION=720x720,CODECS="avc1.64001f"
+avc_720.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=3400000,RESOLUTION=1080x1080,CODECS="avc1.640028"
+avc_1080.m3u8
+"#;
+        assert_eq!(
+            parse_avc_variant_for_target_dim(master_url, m3u8, 256).as_deref(),
+            Some("https://mvod.itunes.apple.com/motion/avc_360.m3u8")
+        );
+        assert_eq!(
+            parse_avc_variant_for_target_dim(master_url, m3u8, 360).as_deref(),
+            Some("https://mvod.itunes.apple.com/motion/avc_360.m3u8")
+        );
+        assert_eq!(
+            parse_avc_variant_for_target_dim(master_url, m3u8, 384).as_deref(),
+            Some("https://mvod.itunes.apple.com/motion/avc_486.m3u8")
+        );
+        assert_eq!(
+            parse_avc_variant_for_target_dim(master_url, m3u8, 512).as_deref(),
+            Some("https://mvod.itunes.apple.com/motion/avc_720.m3u8")
+        );
+        assert_eq!(
+            parse_avc_variant_for_target_dim(master_url, m3u8, 2000).as_deref(),
+            Some("https://mvod.itunes.apple.com/motion/avc_1080.m3u8")
+        );
+        assert_eq!(
+            parse_avc_variant_for_target_dim(master_url, m3u8, 0),
+            parse_best_avc_variant_from_master(m3u8, master_url)
+        );
+
+        // 2. Bucket & aspect-preserving downscale math + box/bilinear CPU resampler
+        assert_eq!(bucket_target_dim(0), 384);
+        assert_eq!(bucket_target_dim(180), 256);
+        assert_eq!(bucket_target_dim(256), 256);
+        assert_eq!(bucket_target_dim(280), 320);
+        assert_eq!(bucket_target_dim(360), 384);
+        assert_eq!(bucket_target_dim(480), 512);
+        assert_eq!(compute_scaled_dimensions(486, 486, 256), (256, 256));
+        assert_eq!(compute_scaled_dimensions(200, 200, 384), (200, 200));
+        assert_eq!(compute_scaled_dimensions(1080, 1920, 384), (216, 384));
+
+        // Box-area downscale (>=2x): 512x512 -> 256x256 solid color exactness
+        let mut src_512 = vec![0u8; 512 * 512 * 4];
+        for px in src_512.chunks_exact_mut(4) {
+            px[0] = 200; // B
+            px[1] = 120; // G
+            px[2] = 40;  // R
+            px[3] = 255;
+        }
+        let dst_256 = downscale_bgra_frame(&src_512, 512, 512, 256, 256);
+        assert_eq!(dst_256.len(), 256 * 256 * 4);
+        assert_eq!(&dst_256[0..4], &[200, 120, 40, 255]);
+        assert_eq!(&dst_256[dst_256.len() - 4..], &[200, 120, 40, 255]);
+
+        // Bilinear downscale (<2x): 486x486 -> 320x320 solid color exactness
+        let mut src_486 = vec![0u8; 486 * 486 * 4];
+        for px in src_486.chunks_exact_mut(4) {
+            px[0] = 50;
+            px[1] = 180;
+            px[2] = 230;
+            px[3] = 255;
+        }
+        let dst_320 = downscale_bgra_frame(&src_486, 486, 486, 320, 320);
+        assert_eq!(dst_320.len(), 320 * 320 * 4);
+        assert_eq!(&dst_320[0..4], &[50, 180, 230, 255]);
+
+        // 3. Real D2DRenderer zero-copy DXVA GPU surface wrapping, CPU fallback byte tracking,
+        //    opacity crossfade blending, and 28-entry LRU cap!
+        unsafe extern "system" fn r3_wnd_proc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+            DefWindowProcW(h, m, w, l)
+        }
+        let hwnd = unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let hinst: HINSTANCE = GetModuleHandleW(None).unwrap_or_default().into();
+            let cls = w!("AMLightR3UnitHost");
+            let wc = WNDCLASSW {
+                style: CS_HREDRAW | CS_VREDRAW,
+                lpfnWndProc: Some(r3_wnd_proc),
+                hInstance: hinst,
+                lpszClassName: cls,
+                ..Default::default()
+            };
+            let _ = RegisterClassW(&wc);
+            CreateWindowExW(
+                WS_EX_NOREDIRECTIONBITMAP,
+                cls,
+                PCWSTR(w!("AM Light R3 Unit").as_ptr()),
+                WS_POPUP,
+                0,
+                0,
+                640,
+                640,
+                None,
+                None,
+                Some(hinst),
+                None,
+            )
+            .expect("CreateWindowExW R3")
+        };
+
+        let mut renderer = D2DRenderer::new(hwnd, 640, 640, 1.0).expect("D2DRenderer::new R3");
+        let d3d_dev = renderer.d3d_device().expect("D3D11Device must be exposed");
+        if renderer.has_d3d_video_support() {
+            assert!(
+                renderer.mf_dxgi_device_manager().is_some(),
+                "Video-capable D3D11 device must create IMFDXGIDeviceManager"
+            );
+            assert_ne!(renderer.mf_dxgi_reset_token(), 0);
+        }
+        let mut ui = AppUi::new(0);
+        ui.attach_dxgi_device_manager(renderer.mf_dxgi_device_manager(), renderer.d3d_device());
+        ui.attach_dxgi_device_manager(None, None);
+        drop(ui);
+
+        // Create a real single-slice GPU ID3D11Texture2D filled with cyan BGRA (240, 210, 20, 255)
+        let mut cyan_init = vec![0u8; 256 * 256 * 4];
+        for px in cyan_init.chunks_exact_mut(4) {
+            px[0] = 240; // B
+            px[1] = 210; // G
+            px[2] = 20;  // R
+            px[3] = 255;
+        }
+        let gpu_tex: ID3D11Texture2D = unsafe {
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: 256,
+                Height: 256,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+            };
+            let init_data = D3D11_SUBRESOURCE_DATA {
+                pSysMem: cyan_init.as_ptr() as *const _,
+                SysMemPitch: 256 * 4,
+                SysMemSlicePitch: 0,
+            };
+            let mut out_opt: Option<ID3D11Texture2D> = None;
+            d3d_dev
+                .CreateTexture2D(&desc, Some(&init_data), Some(&mut out_opt))
+                .expect("CreateTexture2D cyan");
+            out_opt.expect("cyan texture")
+        };
+
+        renderer.reset_frame_stats();
+        let dxva_snap = MotionFrameSnapshot {
+            key: "u_r3_gpu_slot".to_string(),
+            width: 256,
+            height: 256,
+            frame_seq: 1,
+            bgra: Arc::new(Vec::new()), // intentionally empty for DXVA zero-copy!
+            dxgi_texture: Some(gpu_tex.clone()),
+            target_dim: 256,
+        };
+        let card_rect = RectF::new(100.0, 100.0, 220.0, 220.0);
+        renderer.begin_draw(Color::rgb(16, 16, 19));
+        assert!(
+            renderer.draw_motion_artwork_alpha(&dxva_snap, card_rect, 12.0, 1.0),
+            "DXVA zero-copy GPU texture draw must succeed even when bgra is empty"
+        );
+        renderer.end_window_draw_and_present(0.0, true, 0);
+
+        let st_dxva = renderer.frame_stats();
+        assert_eq!(st_dxva.motion_dxva_frames, 1);
+        assert_eq!(
+            st_dxva.motion_copy_from_memory_bytes, 0,
+            "DXVA zero-copy path must incur 0 CopyFromMemory bytes"
+        );
+        assert_eq!(st_dxva.motion_cpu_fallback_frames, 0);
+
+        let (rw, rh, px_dxva) = renderer.readback_backbuffer_bgra().expect("readback dxva");
+        assert_eq!((rw, rh), (640, 640));
+        let ci = ((210 * rw + 210) * 4) as usize;
+        assert!(
+            px_dxva[ci].abs_diff(240) <= 3
+                && px_dxva[ci + 1].abs_diff(210) <= 3
+                && px_dxva[ci + 2].abs_diff(20) <= 3,
+            "DXVA surface must render cyan pixels accurately, got {:?}",
+            &px_dxva[ci..ci + 4]
+        );
+
+        // Same key seamlessly transitions to downscaled 256x256 CPU fallback + opacity 0.5 crossfade!
+        let mut blue_cpu = vec![0u8; 256 * 256 * 4];
+        for px in blue_cpu.chunks_exact_mut(4) {
+            px[0] = 240; // B
+            px[1] = 20;  // G
+            px[2] = 20;  // R
+            px[3] = 255;
+        }
+        let cpu_snap = MotionFrameSnapshot {
+            key: "u_r3_gpu_slot".to_string(),
+            width: 256,
+            height: 256,
+            frame_seq: 2,
+            bgra: Arc::new(blue_cpu),
+            dxgi_texture: None,
+            target_dim: 256,
+        };
+        renderer.begin_draw(Color::rgb(220, 20, 20)); // bright red static base
+        assert!(renderer.draw_motion_artwork_alpha(&cpu_snap, card_rect, 12.0, 0.5));
+        renderer.end_window_draw_and_present(0.0, true, 0);
+
+        let st_cpu = renderer.frame_stats();
+        assert_eq!(st_cpu.motion_cpu_fallback_frames, 1);
+        assert_eq!(
+            st_cpu.motion_copy_from_memory_bytes,
+            (256 * 256 * 4) as u64,
+            "Downscaled 256x256 CPU upload must be 262,144 bytes (3.6x less than 486x486)"
+        );
+        let (_, _, px_blend) = renderer.readback_backbuffer_bgra().expect("readback crossfade");
+        // 50% red (B=20,G=20,R=220) + 50% blue (B=240,G=20,R=20) -> B~130, G~20, R~120
+        assert!(
+            px_blend[ci].abs_diff(130) <= 6
+                && px_blend[ci + 1].abs_diff(20) <= 4
+                && px_blend[ci + 2].abs_diff(120) <= 6,
+            "50% motion crossfade must blend smoothly over static cover, got {:?}",
+            &px_blend[ci..ci + 4]
+        );
+
+        // Verify 28-entry bounded LRU cap in D2DRenderer::motion_textures
+        renderer.begin_draw(Color::rgb(16, 16, 19));
+        for idx in 0..36 {
+            let s = MotionFrameSnapshot {
+                key: format!("u_lru_{idx}"),
+                width: 256,
+                height: 256,
+                frame_seq: 1,
+                bgra: Arc::new(Vec::new()),
+                dxgi_texture: Some(gpu_tex.clone()),
+                target_dim: 256,
+            };
+            assert!(renderer.draw_motion_artwork(&s, card_rect, 8.0, 1.0));
+        }
+        renderer.end_window_draw_and_present(0.0, true, 0);
+        assert_eq!(
+            renderer.motion_texture_cache_len(),
+            MOTION_TEXTURE_LRU_CAP,
+            "motion_textures LRU must stay bounded at 28 entries"
+        );
+
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+    }
+
+    #[test]
+    fn test_r4_cadence_alignment_dirty_rect_ring_and_r2_glass_synergy() {
+        use am_light_lib::am_api::{EditorialItem, EditorialShelf, EditorialShelfKind};
+        use am_light_lib::app_ui::{AppUi, PageRoute};
+        use am_light_lib::backends::PlaybackBackend;
+        use am_light_lib::d2d_renderer::{
+            compute_dirty_rects_union_area_px, dirty_area_exceeds_full_threshold,
+            dirty_rects_bounding_box, merge_dirty_rect_ring_union, quantize_and_clamp_dirty_rects,
+            D2DRenderer, DirtyFramePlan, DirtyRectPx, BACKDROP_DIRTY_TOP,
+            DIRTY_RECT_FULL_FALLBACK_RATIO,
+        };
+        use am_light_lib::motion_art::cadence_ms_for_active_count;
+        use am_light_lib::smtc::SmtcState;
+        use am_light_lib::theme::{Color, RectF};
+        use std::time::Duration;
+        use windows::core::{w, PCWSTR};
+        use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, CS_HREDRAW, CS_VREDRAW,
+            WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP, WS_POPUP,
+        };
+
+        // 1. Pure R4 math: cadence thresholds, DPI quantization/clamping, 3-frame ring union, >55% threshold
+        assert_eq!(cadence_ms_for_active_count(0), 33);
+        assert_eq!(cadence_ms_for_active_count(4), 33);
+        assert_eq!(cadence_ms_for_active_count(5), 42);
+        assert_eq!(cadence_ms_for_active_count(20), 42);
+        assert!((DIRTY_RECT_FULL_FALLBACK_RATIO - 0.55).abs() < 1e-6);
+
+        let clamped = quantize_and_clamp_dirty_rects(
+            &[
+                RectF::new(-10.0, -5.0, 50.2, 40.3),
+                RectF::new(980.0, 490.0, 100.0, 50.0),
+                RectF::new(2000.0, 2000.0, 50.0, 50.0), // completely OOB
+                RectF::new(10.0, 10.0, 0.0, 20.0),      // empty
+            ],
+            1.5,
+            1000,
+            500,
+        );
+        assert_eq!(clamped.len(), 1);
+        assert_eq!(clamped[0], DirtyRectPx::new(0, 0, 61, 53));
+
+        let d0 = vec![DirtyRectPx::new(10, 10, 110, 110)]; // 10,000 px
+        let d1 = vec![DirtyRectPx::new(60, 10, 160, 110)]; // overlaps d0 by 50x100 -> union = 15,000 px
+        let d2 = vec![DirtyRectPx::new(300, 200, 400, 300)]; // disjoint 10,000 px
+        let ring_union = merge_dirty_rect_ring_union(&d0, &d1, &d2, 1000, 1000);
+        assert_eq!(ring_union.len(), 2);
+        assert_eq!(compute_dirty_rects_union_area_px(&ring_union), 25_000);
+        assert_eq!(
+            dirty_rects_bounding_box(&ring_union),
+            Some(DirtyRectPx::new(10, 10, 400, 300))
+        );
+        assert!(
+            !dirty_area_exceeds_full_threshold(&[DirtyRectPx::new(0, 0, 550, 1000)], 1000, 1000),
+            "exact 55% must NOT trigger full fallback"
+        );
+        assert!(
+            dirty_area_exceeds_full_threshold(&[DirtyRectPx::new(0, 0, 551, 1000)], 1000, 1000),
+            ">55% must trigger full fallback"
+        );
+
+        // 2. Real D2DRenderer Present1 dirty-rect lifecycle, idle skip, >55% fallback, and R2 #58 cache invalidation
+        unsafe extern "system" fn r4_wnd_proc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+            DefWindowProcW(h, m, w, l)
+        }
+        let hwnd = unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let hinst: HINSTANCE = GetModuleHandleW(None).unwrap_or_default().into();
+            let cls = w!("AMLightR4UnitHost");
+            let wc = WNDCLASSW {
+                style: CS_HREDRAW | CS_VREDRAW,
+                lpfnWndProc: Some(r4_wnd_proc),
+                hInstance: hinst,
+                lpszClassName: cls,
+                ..Default::default()
+            };
+            let _ = RegisterClassW(&wc);
+            CreateWindowExW(
+                WS_EX_NOREDIRECTIONBITMAP,
+                cls,
+                PCWSTR(w!("AM Light R4 Unit").as_ptr()),
+                WS_POPUP,
+                0,
+                0,
+                1400,
+                880,
+                None,
+                None,
+                Some(hinst),
+                None,
+            )
+            .expect("CreateWindowExW R4")
+        };
+
+        let mut renderer = D2DRenderer::new(hwnd, 1400, 880, 1.0).expect("D2DRenderer::new R4");
+        renderer.reset_frame_stats();
+        assert_eq!(renderer.full_invalidation_frames_remaining(), 3);
+
+        // First 3 frames initialize all 3 Flip-Model backbuffers via full Present
+        let small_plan = DirtyFramePlan::with_rects(vec![RectF::new(100.0, 100.0, 200.0, 200.0)]);
+        for _ in 0..3 {
+            assert!(renderer.begin_draw_dirty(Color::rgb(16, 16, 19), &small_plan));
+            renderer.fill_rect(RectF::new(100.0, 100.0, 200.0, 200.0), Color::rgb(40, 120, 220));
+            renderer.end_window_draw_and_present(0.0, true, 0);
+        }
+        let st_init = renderer.frame_stats();
+        assert_eq!(st_init.present_full_frames, 3);
+        assert_eq!(st_init.present1_dirty_frames, 0);
+        assert_eq!(renderer.full_invalidation_frames_remaining(), 0);
+
+        // Frame 4: small dirty rect -> Present1 dirty presentation!
+        assert!(renderer.begin_draw_dirty(Color::rgb(16, 16, 19), &small_plan));
+        renderer.fill_rect(RectF::new(100.0, 100.0, 200.0, 200.0), Color::rgb(60, 160, 240));
+        renderer.end_window_draw_and_present(0.0, true, 0);
+        assert_eq!(renderer.frame_stats().present1_dirty_frames, 1);
+
+        // Frame 5: empty idle plan -> begin_draw_dirty returns false & bumps skipped_idle_frames
+        assert!(!renderer.begin_draw_dirty(Color::rgb(16, 16, 19), &DirtyFramePlan::idle()));
+        assert_eq!(renderer.frame_stats().skipped_idle_frames, 1);
+        assert_eq!(renderer.frame_stats().present1_dirty_frames, 1);
+
+        // Frame 6: >55% dirty rect -> automatic full-frame fallback & resets invalidation ring
+        let huge_plan = DirtyFramePlan::with_rects(vec![RectF::new(0.0, 0.0, 1100.0, 700.0)]);
+        assert!(renderer.begin_draw_dirty(Color::rgb(16, 16, 19), &huge_plan));
+        renderer.end_window_draw_and_present(0.0, true, 0);
+        assert_eq!(renderer.frame_stats().present_full_frames, 4);
+        assert_eq!(renderer.full_invalidation_frames_remaining(), 2);
+
+        // Verify R2 #58 cache invalidation invariant: BACKDROP_DIRTY_TOP while top_bar_solid_bg=Some
+        // must clear glass_cache_valid_top so subsequent top_bar_solid_bg=None + dirty_mask=0 re-blurs!
+        renderer.begin_draw(Color::rgb(16, 16, 19));
+        renderer.begin_glass_backdrop_snapshot_strips_ex(false, 54.0, 82.0, None, 0b11);
+        renderer.end_glass_backdrop_snapshot();
+        renderer.end_window_draw_and_present(0.0, true, 0);
+        assert_eq!(renderer.frame_stats().glass_snapshot_blurs, 1);
+
+        renderer.begin_draw(Color::rgb(16, 16, 19));
+        renderer.begin_glass_backdrop_snapshot_strips_ex(
+            false,
+            54.0,
+            82.0,
+            Some(Color::rgb(16, 16, 19)),
+            BACKDROP_DIRTY_TOP,
+        );
+        renderer.end_glass_backdrop_snapshot();
+        renderer.end_window_draw_and_present(0.0, true, 0);
+
+        renderer.begin_draw(Color::rgb(16, 16, 19));
+        renderer.begin_glass_backdrop_snapshot_strips_ex(false, 54.0, 82.0, None, 0);
+        renderer.end_glass_backdrop_snapshot();
+        renderer.end_window_draw_and_present(0.0, true, 0);
+        assert_eq!(
+            renderer.frame_stats().glass_snapshot_blurs, 1,
+            "Clearing glass_cache_valid_top on BACKDROP_DIRTY_TOP during solid fastpath must force re-blur when returning to live glass"
+        );
+
+        // 3. Settled Home CadenceStats, non-video redraw suppression, cadence lock, & dirty MiniPlayer present
+        let mut ui = AppUi::new(0);
+        ui.settings.playback_backend = PlaybackBackend::AppleMusicWeb;
+        ui.settings.liquid_glass_enabled = true;
+        ui.settings.reduce_transparency = false;
+        ui.settings.reduce_motion = false;
+        ui.settings.motion_artwork_enabled = true;
+        ui.settings.live_eq_icon_spectrum = false;
+        ui.settings.sidebar_collapsed = false;
+        ui.is_window_focused = true;
+        ui.route = PageRoute::Home;
+        ui.show_lyrics_overlay = false;
+        ui.route_trans = 1.0;
+        ui.sidebar_open_spring.snap(1.0);
+        ui.top_bar_guard_spring.snap(0.0);
+        ui.mouse_pos = (-100.0, -100.0);
+        let mk_smtc = |pos: f64| SmtcState {
+            active: true,
+            title: "Cadence Track".to_string(),
+            artist: "AM Light".to_string(),
+            status: "Playing".to_string(),
+            position_sec: pos,
+            duration_sec: 200.0,
+            backend_mode: "web-am".to_string(),
+            adam_id: Some("100001".to_string()),
+            position_is_calibrated: true,
+            ..Default::default()
+        };
+        ui.on_playback_state_changed(mk_smtc(30.0));
+        ui.home_shelves = vec![
+            EditorialShelf {
+                title: "Top Picks".to_string(),
+                subtitle: String::new(),
+                kind: EditorialShelfKind::HomeTopPicks,
+                items: (0..3)
+                    .map(|i| EditorialItem {
+                        id: format!("c_tp_{i}"),
+                        kind: "album".to_string(),
+                        play_kind: "album".to_string(),
+                        title: format!("Pick {i}"),
+                        subtitle: "Artist".to_string(),
+                        motion_tall_video_url: Some(format!("https://example.invalid/cad_tp_{i}.m3u8")),
+                        ..Default::default()
+                    })
+                    .collect(),
+            },
+            EditorialShelf {
+                title: "Recently Played".to_string(),
+                subtitle: String::new(),
+                kind: EditorialShelfKind::SquareShelf,
+                items: (0..4)
+                    .map(|i| EditorialItem {
+                        id: format!("c_sq_{i}"),
+                        kind: "album".to_string(),
+                        play_kind: "album".to_string(),
+                        title: format!("Album {i}"),
+                        subtitle: "Artist".to_string(),
+                        motion_video_url: Some(format!("https://example.invalid/cad_sq_{i}.m3u8")),
+                        ..Default::default()
+                    })
+                    .collect(),
+            },
+        ];
+
+        // Prime 4 full frames so 3-buffer ring & settled Home baseline are initialized
+        std::thread::sleep(Duration::from_millis(95));
+        for _ in 0..4 {
+            ui.step_and_render_ex(&mut renderer, 1.0 / 60.0, false);
+            renderer.step_glass_animations(1.0);
+        }
+        // >=5 active Home motion slots -> effective_frame_pacing locks cleanly to 42ms / 24Hz!
+        assert!(ui.active_motion_slot_urls().len() >= 5);
+        assert_eq!(
+            ui.effective_frame_pacing(),
+            (0, 24, Some(42_000_000)),
+            "Settled Home with >=5 active motion covers must lock pacing to 42ms/24Hz video cadence"
+        );
+
+        // Reset counters & step 10 settled playing frames with ZERO visual changes -> 100% idle-skipped!
+        renderer.reset_frame_stats();
+        ui.reset_cadence_stats();
+        for _ in 0..10 {
+            ui.step_and_render_ex(&mut renderer, 0.0, false);
+        }
+        let st_idle = renderer.frame_stats();
+        let cad_idle = ui.cadence_stats();
+        assert_eq!(
+            st_idle.skipped_idle_frames, 10,
+            "All 10 unchanged settled Home playing frames must idle-skip (0 redraw, 0 blur)"
+        );
+        assert_eq!(cad_idle.home_non_video_playing_redraws, 0);
+        assert_eq!(cad_idle.home_full_redraw_count, 0);
+        assert_eq!(st_idle.glass_snapshot_blurs, 0);
+
+        // Advance playback position by 1.2s -> MiniPlayer progress pixel & second move -> surgical Present1 dirty frame!
+        ui.on_playback_state_changed(mk_smtc(31.2));
+        ui.step_and_render_ex(&mut renderer, 0.0, false);
+        assert!(!ui.last_dirty_plan().force_full);
+        assert!(
+            !ui.last_dirty_plan().dirty_rects_dip.is_empty(),
+            "MiniPlayer progress pixel change must produce targeted dirty rect"
+        );
+        assert!(
+            renderer.frame_stats().present1_dirty_frames >= 1,
+            "Settled Home progress tick must present via Present1 dirty rects"
+        );
+        assert!(
+            ui.cadence_stats().home_dirty_rect_frames >= 1,
+            "CadenceStats must record home_dirty_rect_frames"
+        );
+        assert_eq!(
+            renderer.frame_stats().glass_snapshot_blurs, 0,
+            "MiniPlayer progress tick must reuse cached backdrop with 0 glass blurs"
+        );
+
+        ui.motion_art_manager().set_global_enabled(false);
+        drop(ui);
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+    }
+
+    #[test]
+    fn test_bug1_apple_music_playlist_pagination_beyond_100_and_write_chunking() {
+        use am_light_lib::am_api::{
+            build_next_amp_path, build_offset_amp_path, build_offset_from_next_amp_path,
+            chunk_library_playlist_song_ids, paginate_am_pages_with_fetcher, parse_amp_limit,
+            parse_next_offset, DEFAULT_LIBRARY_WRITE_BATCH, DEFAULT_PLAYLIST_MAX_PAGES,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        assert_eq!(DEFAULT_PLAYLIST_MAX_PAGES, 100);
+        assert_eq!(DEFAULT_LIBRARY_WRITE_BATCH, 50);
+
+        let init_lib =
+            "v1/me/library/playlists/p.99/tracks?include=catalog&extend=audioTraits&limit=100&l=zh-Hans-CN";
+        assert_eq!(parse_amp_limit(init_lib), Some(100));
+        assert_eq!(parse_next_offset("/v1/me/library/playlists/p.99/tracks?offset=200"), Some(200));
+
+        // Guard against Apple's library quirk where `"next"` drops `/tracks` and query params
+        let repaired_next = build_next_amp_path(init_lib, "/v1/me/library/playlists/p.99?offset=100");
+        assert!(
+            repaired_next.starts_with("v1/me/library/playlists/p.99/tracks?"),
+            "repaired next must restore /tracks suffix: {repaired_next}"
+        );
+        assert!(repaired_next.contains("offset=100"));
+        assert!(repaired_next.contains("include=catalog"));
+        assert!(repaired_next.contains("extend=audioTraits"));
+        assert!(repaired_next.contains("limit=100"));
+        assert!(repaired_next.contains("l=zh-Hans-CN"));
+
+        // Ensure `/tracks` without explicit limit still enforces `limit=100` on page 2+
+        let enforce_limit = build_next_amp_path(
+            "v1/catalog/cn/playlists/pl.abc/tracks?l=zh-Hans-CN",
+            "/v1/catalog/cn/playlists/pl.abc/tracks?offset=100",
+        );
+        assert!(enforce_limit.contains("limit=100"));
+        assert_eq!(parse_next_offset(&build_offset_amp_path(init_lib, 300)), Some(300));
+        assert_eq!(
+            parse_next_offset(&build_offset_from_next_amp_path(
+                init_lib,
+                Some("/v1/me/library/playlists/p.99?offset=100"),
+                400,
+            )),
+            Some(400)
+        );
+
+        let make_items = |start: usize, count: usize| -> Vec<serde_json::Value> {
+            (start..start + count)
+                .map(|i| {
+                    json!({
+                        "id": format!("i.trk_{i}"),
+                        "type": "library-songs",
+                        "attributes": {
+                            "name": format!("Track {i}"),
+                            "artistName": format!("Artist {i}"),
+                            "albumName": format!("Album {i}")
+                        }
+                    })
+                })
+                .collect()
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio current_thread rt");
+
+        rt.block_on(async {
+            // 1. Library playlists > 100 tracks: 350 & 1,250 tracks via parallel offset fast-path
+            for &total in &[350usize, 1250usize] {
+                let first = make_items(0, 100);
+                let out = paginate_am_pages_with_fetcher(
+                    init_lib,
+                    first,
+                    Some("/v1/me/library/playlists/p.99/tracks?offset=100".to_string()),
+                    Some(total),
+                    DEFAULT_PLAYLIST_MAX_PAGES,
+                    false,
+                    move |path: String| async move {
+                        let off = parse_next_offset(&path).unwrap_or(0);
+                        let rem = total.saturating_sub(off).min(100);
+                        let data = (off..off + rem)
+                            .map(|i| {
+                                json!({
+                                    "id": format!("i.trk_{i}"),
+                                    "type": "library-songs",
+                                    "attributes": { "name": format!("Track {i}") }
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        let next = if off + rem < total {
+                            Some(format!("/v1/me/library/playlists/p.99/tracks?offset={}", off + rem))
+                        } else {
+                            None
+                        };
+                        Ok(json!({
+                            "data": data,
+                            "next": next,
+                            "meta": { "total": total }
+                        }))
+                    },
+                )
+                .await;
+                assert_eq!(out.len(), total, "library playlist must paginate all {total} tracks");
+                for (idx, item) in out.iter().enumerate() {
+                    assert_eq!(item.get("id").and_then(|v| v.as_str()), Some(format!("i.trk_{idx}").as_str()));
+                }
+            }
+
+            // 2. Catalog playlist inline 100 + `/tracks?offset=100` sequential cursor (no meta.total, 325 tracks)
+            let cat_init =
+                "v1/catalog/cn/playlists/pl.cat1/tracks?extend=audioTraits&limit=100&l=zh-Hans-CN";
+            let cat_out = paginate_am_pages_with_fetcher(
+                cat_init,
+                make_items(0, 100),
+                Some("/v1/catalog/cn/playlists/pl.cat1/tracks?offset=100".to_string()),
+                None,
+                DEFAULT_PLAYLIST_MAX_PAGES,
+                false,
+                move |path: String| async move {
+                    assert!(path.contains("extend=audioTraits"));
+                    assert!(path.contains("limit=100"));
+                    let off = parse_next_offset(&path).unwrap_or(0);
+                    let total = 325usize;
+                    let rem = total.saturating_sub(off).min(100);
+                    let data = (off..off + rem)
+                        .map(|i| json!({ "id": format!("i.trk_{i}"), "type": "songs" }))
+                        .collect::<Vec<_>>();
+                    let next = if off + rem < total {
+                        Some(format!("/v1/catalog/cn/playlists/pl.cat1/tracks?offset={}", off + rem))
+                    } else {
+                        None
+                    };
+                    Ok(json!({ "data": data, "next": next }))
+                },
+            )
+            .await;
+            assert_eq!(cat_out.len(), 325);
+            assert_eq!(cat_out[324].get("id").and_then(|v| v.as_str()), Some("i.trk_324"));
+
+            // 3. Partial failure in 4-way parallel batch (`offset=200` fails once with 429 while 100 & 300 succeed):
+            // must recover all 350 tracks and reuse `batch_cache` for offset=300 without re-fetching it!
+            let off200_calls = Arc::new(AtomicUsize::new(0));
+            let off300_calls = Arc::new(AtomicUsize::new(0));
+            let c200 = Arc::clone(&off200_calls);
+            let c300 = Arc::clone(&off300_calls);
+            let recovered = paginate_am_pages_with_fetcher(
+                init_lib,
+                make_items(0, 100),
+                Some("/v1/me/library/playlists/p.99/tracks?offset=100".to_string()),
+                Some(350),
+                DEFAULT_PLAYLIST_MAX_PAGES,
+                false,
+                move |path: String| {
+                    let c200 = Arc::clone(&c200);
+                    let c300 = Arc::clone(&c300);
+                    async move {
+                        let off = parse_next_offset(&path).unwrap_or(0);
+                        if off == 200 {
+                            if c200.fetch_add(1, Ordering::SeqCst) == 0 {
+                                return Err("HTTP 429 Too Many Requests".to_string());
+                            }
+                        } else if off == 300 {
+                            c300.fetch_add(1, Ordering::SeqCst);
+                        }
+                        let rem = 350usize.saturating_sub(off).min(100);
+                        let data = (off..off + rem)
+                            .map(|i| json!({ "id": format!("i.trk_{i}") }))
+                            .collect::<Vec<_>>();
+                        let next = if off + rem < 350 {
+                            Some(format!("/v1/me/library/playlists/p.99/tracks?offset={}", off + rem))
+                        } else {
+                            None
+                        };
+                        Ok(json!({ "data": data, "next": next, "meta": { "total": 350 } }))
+                    }
+                },
+            )
+            .await;
+            assert_eq!(recovered.len(), 350, "partial parallel batch failure must not truncate at 100/200");
+            assert_eq!(off200_calls.load(Ordering::SeqCst), 2, "failed offset=200 must be retried sequentially");
+            assert_eq!(off300_calls.load(Ordering::SeqCst), 1, "offset=300 must be served from batch_cache");
+            for (idx, item) in recovered.iter().enumerate() {
+                assert_eq!(item.get("id").and_then(|v| v.as_str()), Some(format!("i.trk_{idx}").as_str()));
+            }
+
+            // 4a. Omitted `"next"` and `meta.total` at 100 tracks on a 250-track playlist -> implicit offset probe
+            let probed_250 = paginate_am_pages_with_fetcher(
+                cat_init,
+                make_items(0, 100),
+                None,
+                None,
+                DEFAULT_PLAYLIST_MAX_PAGES,
+                false,
+                move |path: String| async move {
+                    let off = parse_next_offset(&path).unwrap_or(0);
+                    let rem = 250usize.saturating_sub(off).min(100);
+                    let data = (off..off + rem)
+                        .map(|i| json!({ "id": format!("i.trk_{i}") }))
+                        .collect::<Vec<_>>();
+                    Ok(json!({ "data": data }))
+                },
+            )
+            .await;
+            assert_eq!(probed_250.len(), 250, "implicit offset probe must fetch all 250 tracks when next is omitted");
+
+            // 4b. Playlist truly has 100 tracks -> probe at offset=100 gets HTTP 404 and stops cleanly at 100
+            let exact_100 = paginate_am_pages_with_fetcher(
+                cat_init,
+                make_items(0, 100),
+                None,
+                None,
+                DEFAULT_PLAYLIST_MAX_PAGES,
+                false,
+                move |_path: String| async move { Err("HTTP 404 Not Found".to_string()) },
+            )
+            .await;
+            assert_eq!(exact_100.len(), 100);
+
+            // 4c. Server ignores offset and repeats page 1 -> `page_fingerprint` stops cleanly without duplicating
+            let dup_calls = Arc::new(AtomicUsize::new(0));
+            let dup_c = Arc::clone(&dup_calls);
+            let repeat_guard = paginate_am_pages_with_fetcher(
+                cat_init,
+                make_items(0, 100),
+                None,
+                None,
+                DEFAULT_PLAYLIST_MAX_PAGES,
+                false,
+                move |_path: String| {
+                    let dup_c = Arc::clone(&dup_c);
+                    async move {
+                        dup_c.fetch_add(1, Ordering::SeqCst);
+                        let data = (0..100)
+                            .map(|i| json!({ "id": format!("i.trk_{i}") }))
+                            .collect::<Vec<_>>();
+                        Ok(json!({ "data": data }))
+                    }
+                },
+            )
+            .await;
+            assert_eq!(repeat_guard.len(), 100);
+            assert_eq!(dup_calls.load(Ordering::SeqCst), 1, "page_fingerprint must halt on first repeated page");
+
+            // 5. HTTP 400 fallback when page 2+ rejects `include=catalog`/`extend=audioTraits`
+            let fallback_400 = paginate_am_pages_with_fetcher(
+                init_lib,
+                make_items(0, 100),
+                Some("/v1/me/library/playlists/p.99?offset=100".to_string()),
+                None,
+                DEFAULT_PLAYLIST_MAX_PAGES,
+                false,
+                move |path: String| async move {
+                    if path.contains("include=catalog") || path.contains("extend=audioTraits") {
+                        return Err("HTTP 400 Bad Request".to_string());
+                    }
+                    assert!(path.starts_with("v1/me/library/playlists/p.99/tracks?"));
+                    let off = parse_next_offset(&path).unwrap_or(0);
+                    let rem = 220usize.saturating_sub(off).min(100);
+                    let data = (off..off + rem)
+                        .map(|i| json!({ "id": format!("i.trk_{i}") }))
+                        .collect::<Vec<_>>();
+                    let next = if off + rem < 220 {
+                        Some(format!("/v1/me/library/playlists/p.99?offset={}", off + rem))
+                    } else {
+                        None
+                    };
+                    Ok(json!({ "data": data, "next": next }))
+                },
+            )
+            .await;
+            assert_eq!(fallback_400.len(), 220, "HTTP 400 stripped-param fallback must paginate past 100");
+        });
+
+        // 6. Playlist transfer/write chunking: 275 valid IDs + invalid noise -> batches of 50 without 100-cap
+        let mut raw_ids: Vec<String> = (0..275)
+            .map(|i| {
+                if i % 5 == 0 {
+                    format!("  i.lib_{i}  ")
+                } else {
+                    format!("14408{:05}", i)
+                }
+            })
+            .collect();
+        raw_ids.insert(10, "   ".to_string());
+        raw_ids.insert(77, "bad id/with spaces".to_string());
+        let batches = chunk_library_playlist_song_ids(&raw_ids, DEFAULT_LIBRARY_WRITE_BATCH);
+        let lens: Vec<usize> = batches.iter().map(Vec::len).collect();
+        assert_eq!(lens, vec![50, 50, 50, 50, 50, 25]);
+        let flat: Vec<&str> = batches.iter().flatten().map(String::as_str).collect();
+        assert_eq!(flat.len(), 275);
+        assert_eq!(flat[0], "i.lib_0");
+        assert_eq!(flat[274], "1440800274");
+    }
+
+    #[test]
+    fn test_bug2_netease_playlist_sync_beyond_200_and_cover_accuracy() {
+        use am_light_lib::netease_api::{
+            build_song_detail_c_param, compute_missing_playlist_track_ids, cover_url_from_pic_id,
+            extract_playlist_track_ids, is_netease_placeholder_cover,
+            merge_playlist_tracks_in_order, order_tracks_by_ids, parse_ne_song,
+            parse_song_detail_response, plan_song_detail_chunks, NE_PLAYLIST_MAX_TRACKS,
+            NE_SONG_DETAIL_CHUNK_SIZE,
+        };
+
+        assert_eq!(NE_SONG_DETAIL_CHUNK_SIZE, 300);
+        assert_eq!(NE_PLAYLIST_MAX_TRACKS, 5000);
+
+        // 1. trackIds extraction, deduplication, and 5000 safe cap across 550, 1250, and 6000 IDs
+        let mut raw_tids_550: Vec<serde_json::Value> =
+            (1..=550i64).map(|id| json!({ "id": id })).collect();
+        raw_tids_550.push(json!({ "id": 42 })); // duplicate
+        raw_tids_550.push(json!({ "id": 0 })); // invalid
+        raw_tids_550.push(json!({ "id": -7 })); // invalid
+        let ids_550 =
+            extract_playlist_track_ids(&json!({ "trackIds": raw_tids_550 }), NE_PLAYLIST_MAX_TRACKS);
+        assert_eq!(ids_550.len(), 550);
+        assert_eq!(
+            plan_song_detail_chunks(&ids_550, NE_SONG_DETAIL_CHUNK_SIZE, NE_PLAYLIST_MAX_TRACKS)
+                .iter()
+                .map(Vec::len)
+                .collect::<Vec<_>>(),
+            vec![300, 250]
+        );
+
+        let ids_1250 = extract_playlist_track_ids(
+            &json!({ "trackIds": (1..=1250i64).map(|id| json!({ "id": id })).collect::<Vec<_>>() }),
+            NE_PLAYLIST_MAX_TRACKS,
+        );
+        assert_eq!(ids_1250.len(), 1250);
+        assert_eq!(
+            plan_song_detail_chunks(&ids_1250, NE_SONG_DETAIL_CHUNK_SIZE, NE_PLAYLIST_MAX_TRACKS)
+                .iter()
+                .map(Vec::len)
+                .collect::<Vec<_>>(),
+            vec![300, 300, 300, 300, 50]
+        );
+
+        let ids_6000 = extract_playlist_track_ids(
+            &json!({ "trackIds": (1..=6000i64).map(|id| json!({ "id": id })).collect::<Vec<_>>() }),
+            NE_PLAYLIST_MAX_TRACKS,
+        );
+        assert_eq!(ids_6000.len(), 5000, "playlist extraction must cap safely at NE_PLAYLIST_MAX_TRACKS");
+        assert_eq!(build_song_detail_c_param(&[101, 202, 303]), r#"[{"id":101},{"id":202},{"id":303}]"#);
+
+        // 2. 200 inline tracks + 650 non-monotonic `trackIds` -> hydrate remaining 450 + 3 artwork-less inline
+        // tracks across out-of-order chunks, preserving exact `trackIds` order & unique covers!
+        let ordered_650: Vec<i64> = (0..650i64)
+            .map(|i| if i % 2 == 0 { 500_000 - i } else { 100_000 + i })
+            .collect();
+        let make_ne_song_json = |id: i64, pic_url: &str| -> serde_json::Value {
+            json!({
+                "id": id,
+                "name": format!("NE Song {id}"),
+                "ar": [{ "name": format!("NE Artist {id}") }],
+                "al": { "name": format!("NE Album {id}"), "picUrl": pic_url },
+                "dt": 215000
+            })
+        };
+
+        let inline_200: Vec<_> = ordered_650[..200]
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, &id)| {
+                let pic = if matches!(idx, 5 | 55 | 155) {
+                    String::new() // missing cover inline -> must be queued for hydration!
+                } else {
+                    format!("http://p1.music.126.net/inline_{id}/{id}.jpg")
+                };
+                parse_ne_song(&make_ne_song_json(id, &pic), None)
+            })
+            .collect();
+        assert_eq!(inline_200.len(), 200);
+        assert!(inline_200[5].artwork_url.is_none());
+
+        let missing = compute_missing_playlist_track_ids(&ordered_650, &inline_200);
+        assert_eq!(
+            missing.len(),
+            453,
+            "must request all 450 unhydrated tracks + 3 inline tracks missing artwork (zero 200-cap!)"
+        );
+        assert!(missing.contains(&ordered_650[5]));
+        assert!(missing.contains(&ordered_650[55]));
+        assert!(missing.contains(&ordered_650[155]));
+        assert!(missing.contains(&ordered_650[649]));
+
+        // Simulate out-of-order `/api/v3/song/detail` batch responses (reversed chunks)
+        let mut fetched_all = Vec::new();
+        for chunk in plan_song_detail_chunks(&missing, NE_SONG_DETAIL_CHUNK_SIZE, NE_PLAYLIST_MAX_TRACKS)
+            .into_iter()
+            .rev()
+        {
+            let songs_json: Vec<serde_json::Value> = chunk
+                .iter()
+                .rev()
+                .map(|&id| make_ne_song_json(id, &format!("http://p2.music.126.net/detail_{id}/{id}.jpg")))
+                .collect();
+            fetched_all.extend(parse_song_detail_response(&json!({ "code": 200, "songs": songs_json })));
+        }
+        assert_eq!(fetched_all.len(), 453);
+
+        let merged = merge_playlist_tracks_in_order(&ordered_650, inline_200.clone(), fetched_all.clone());
+        assert_eq!(merged.len(), 650, "merged NetEase playlist must retain all 650 tracks");
+        for (idx, (tr, &want_id)) in merged.iter().zip(ordered_650.iter()).enumerate() {
+            assert_eq!(tr.id, format!("ne:{want_id}"), "exact trackIds order broken at idx {idx}");
+            let art = tr
+                .artwork_url
+                .as_deref()
+                .expect("every merged track must carry its own album cover");
+            assert!(
+                art.starts_with("https://") && art.contains(&format!("/{want_id}.jpg?param=480y480")),
+                "track {want_id} cover bleed or missing https upgrade: {art}"
+            );
+        }
+        // Inline tracks 5, 55, 155 must be upgraded from `song/detail` without altering other tracks
+        assert!(merged[5].artwork_url.as_deref().unwrap().contains("detail_"));
+        assert!(merged[0].artwork_url.as_deref().unwrap().contains("inline_"));
+
+        // 3. Partial chunk failure resilience: dropping 100 tracks from `fetched_all` still preserves 550 in exact order
+        let partial_fetched = fetched_all[100..].to_vec();
+        let partial_merged = merge_playlist_tracks_in_order(&ordered_650, inline_200, partial_fetched);
+        assert_eq!(partial_merged.len(), 550);
+        let mut last_pos = None;
+        for tr in &partial_merged {
+            let id_num: i64 = tr.id.strip_prefix("ne:").unwrap().parse().unwrap();
+            let pos = ordered_650.iter().position(|&x| x == id_num).unwrap();
+            if let Some(lp) = last_pos {
+                assert!(pos > lp, "partial failure merge must keep strictly increasing trackIds order");
+            }
+            last_pos = Some(pos);
+        }
+
+        // `order_tracks_by_ids` deduplicates and prefers entry with artwork
+        let no_art = parse_ne_song(&make_ne_song_json(777, ""), None).unwrap();
+        let with_art = parse_ne_song(&make_ne_song_json(777, "https://p1.music.126.net/ok/777.jpg"), None).unwrap();
+        let ordered_dedup = order_tracks_by_ids(&[777], vec![no_art, with_art]);
+        assert_eq!(ordered_dedup.len(), 1);
+        assert!(ordered_dedup[0].artwork_url.as_deref().is_some_and(|u| u.contains("/ok/777.jpg")));
+
+        // 4. NetEase cover URL accuracy, placeholder rejection, protocol upgrade, and pic_str derivation
+        assert!(is_netease_placeholder_cover(""));
+        assert!(is_netease_placeholder_cover("https://p1.music.126.net/abc/5639395138885805.jpg"));
+        assert!(!is_netease_placeholder_cover("https://p1.music.126.net/abc/109951166952713766.jpg"));
+
+        assert_eq!(
+            cover_url_from_pic_id("109951166952713766", 480).as_deref(),
+            Some("https://p1.music.126.net/pcYHpMkdC69VVvWiynNklA==/109951166952713766.jpg?param=480y480")
+        );
+        assert_eq!(cover_url_from_pic_id("0", 480), None);
+        assert_eq!(cover_url_from_pic_id("5639395138885805", 480), None);
+        assert_eq!(cover_url_from_pic_id("not-numeric", 480), None);
+
+        // `parse_ne_song` with `None` fallback never inherits playlist/artist cover & never returns `Some("")`
+        let bare = parse_ne_song(
+            &json!({ "id": 1001, "name": "Bare", "ar": [{"name": "A"}], "al": { "name": "Al", "picUrl": "   " } }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(bare.artwork_url, None);
+
+        // Rejects placeholder `picUrl` and falls through to `blurPicUrl`, upgrading `//` -> `https://`
+        let placeholder_fallback = parse_ne_song(
+            &json!({
+                "id": 1002,
+                "name": "PlaceholderFallthrough",
+                "ar": [{"name": "B"}],
+                "al": {
+                    "name": "Alb",
+                    "picUrl": "https://p1.music.126.net/x/5639395138885805.jpg",
+                    "blurPicUrl": "//p2.music.126.net/real/999888.jpg"
+                }
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            placeholder_fallback.artwork_url.as_deref(),
+            Some("https://p2.music.126.net/real/999888.jpg?param=480y480")
+        );
+
+        // Derives exact CDN URL from `al.pic_str` when `picUrl` & `blurPicUrl` are omitted
+        let from_pic_str = parse_ne_song(
+            &json!({
+                "id": 1003,
+                "name": "PicStrSong",
+                "ar": [{"name": "C"}],
+                "al": { "name": "AlbC", "pic_str": "109951166952713766" }
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            from_pic_str.artwork_url.as_deref(),
+            Some("https://p1.music.126.net/pcYHpMkdC69VVvWiynNklA==/109951166952713766.jpg?param=480y480")
+        );
+    }
+
+    #[test]
+    fn test_bug3_cover_artwork_accuracy_smtc_renderer_and_app_ui() {
+        use am_light_lib::am_agent::{
+            should_alias_cached_track_meta, AgentTrackInput, CachedTrackMeta,
+        };
+        use am_light_lib::am_api::{
+            artwork_canonical_stem, is_apple_catalog_numeric_id, motion_album_candidate_matches,
+        };
+        use am_light_lib::app_ui::{
+            make_smtc_artwork_key, meta_motion_cache_key, smtc_catalog_cache_key,
+            upgrade_artwork_request_url, AppUi, PLAYLIST_CACHE_SCHEMA_VERSION,
+        };
+        use am_light_lib::d2d_renderer::D2DRenderer;
+        use am_light_lib::motion_art::MotionFrameSnapshot;
+        use am_light_lib::smtc::{smtc_album_identity_key, SmtcThumbCacheState};
+        use am_light_lib::theme::{Color, RectF};
+        use std::sync::Arc;
+        use windows::core::{w, PCWSTR};
+        use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, CS_HREDRAW, CS_VREDRAW,
+            WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP, WS_POPUP,
+        };
+
+        // --- A. Apple Music stem canonicalization, numeric ID guard, motion validation & cache aliasing ---
+        assert_eq!(
+            artwork_canonical_stem("https://is1-ssl.mzstatic.com/image/thumb/Music126/v4/aa/bb/cc/240x240bb.jpg"),
+            artwork_canonical_stem("https://is1-ssl.mzstatic.com/image/thumb/Music126/v4/aa/bb/cc/600x600bb.jpg"),
+            "same mzstatic cover at different sizes must share canonical stem"
+        );
+        // Generated Apple playlist URLs with query params MUST stay distinct (never collapse to `.../gen`)
+        let gen_a = "https://is1-ssl.mzstatic.com/image/thumb/gen/1200x1200AM.PDCXS19.jpg?c1=aaa&t=1";
+        let gen_b = "https://is1-ssl.mzstatic.com/image/thumb/gen/1200x1200AM.PDCXS11.jpg?c1=bbb&t=2";
+        assert_ne!(artwork_canonical_stem(gen_a), artwork_canonical_stem(gen_b));
+        assert_eq!(artwork_canonical_stem(gen_a), gen_a);
+        // NetEase query URLs, non-dimension numeric filenames, and smtc:// keys MUST NEVER collide
+        let ne_a = "https://p1.music.126.net/hashA/109951168912345678.jpg?param=300x300";
+        let ne_b = "https://p1.music.126.net/hashB/109951168999999999.jpg?param=300x300";
+        assert_ne!(artwork_canonical_stem(ne_a), artwork_canonical_stem(ne_b));
+        assert_ne!(
+            artwork_canonical_stem("https://cdn.example.com/123456_extra.jpg"),
+            artwork_canonical_stem("https://cdn.example.com/123456_other.jpg")
+        );
+        assert_eq!(
+            artwork_canonical_stem("smtc://12345x678/song"),
+            "smtc://12345x678/song"
+        );
+
+        assert!(is_apple_catalog_numeric_id("1440818842"));
+        assert!(!is_apple_catalog_numeric_id("ne:12345"));
+        assert!(!is_apple_catalog_numeric_id("qq:001abc"));
+        assert!(!is_apple_catalog_numeric_id("i.lib123"));
+        assert!(!is_apple_catalog_numeric_id(""));
+
+        assert!(motion_album_candidate_matches(
+            "晴天",
+            "周杰伦",
+            "叶惠美",
+            "叶惠美",
+            "周杰伦"
+        ));
+        assert!(motion_album_candidate_matches(
+            "Anti-Hero",
+            "Taylor Swift",
+            "Midnights",
+            "Midnights (3am Edition)",
+            "Taylor Swift"
+        ));
+        assert!(!motion_album_candidate_matches(
+            "晴天",
+            "周杰伦",
+            "叶惠美",
+            "叶惠美",
+            "Wrong Artist"
+        ));
+        assert!(!motion_album_candidate_matches(
+            "晴天",
+            "周杰伦",
+            "叶惠美",
+            "范特西",
+            "周杰伦"
+        ));
+        assert!(!motion_album_candidate_matches(
+            "Hello",
+            "Adele",
+            "",
+            "Unrelated Greatest Hits",
+            "Adele"
+        ));
+        assert!(motion_album_candidate_matches(
+            "Hello",
+            "Adele",
+            "",
+            "Hello - Single",
+            "Adele"
+        ));
+
+        let meta_a = CachedTrackMeta {
+            title: "Song A".to_string(),
+            artist: "Artist A".to_string(),
+            album: "Album A".to_string(),
+            duration_sec: 200.0,
+            artwork_url: Some("https://is1-ssl.mzstatic.com/a/600x600bb.jpg".to_string()),
+            audio_quality: None,
+        };
+        assert!(
+            should_alias_cached_track_meta("i.lib123", "1440818842", &meta_a, Some("Song A"), Some("Artist A")),
+            "library ID -> catalog ID for same song must be allowed"
+        );
+        assert!(
+            !should_alias_cached_track_meta("111", "222", &meta_a, None, None),
+            "distinct numeric catalog IDs without title proof must NOT alias (prevents cover poisoning)"
+        );
+        assert!(
+            !should_alias_cached_track_meta("111", "222", &meta_a, Some("Song B"), Some("Artist B")),
+            "different incoming track must NEVER inherit previous track's cached cover"
+        );
+        assert!(
+            !should_alias_cached_track_meta("i.lib123", "222", &meta_a, Some("Song B"), Some("Artist B")),
+            "even library ID must NOT alias if incoming title explicitly differs"
+        );
+
+        // `parse_track_from_am_json` ignores empty `""` artwork/album and respects `None` playlist fallback
+        let am_empty_art = json!({
+            "id": "i.noart",
+            "attributes": {
+                "name": "NoArtTrack",
+                "artistName": "SomeArtist",
+                "albumName": "   ",
+                "artwork": { "url": "   " }
+            }
+        });
+        let parsed_pl_tr = parse_track_from_am_json(&am_empty_art, None, None).unwrap();
+        assert_eq!(parsed_pl_tr.artwork_url, None);
+        assert!(parsed_pl_tr.album_name.is_empty());
+
+        // --- B. SMTC cross-track stale thumbnail guard & same-album zero-flicker acceptance ---
+        assert_eq!(
+            smtc_album_identity_key("Track 1", "Artist X", "Album Z"),
+            smtc_album_identity_key("Track 2", "Artist X", "Album Z")
+        );
+        assert_ne!(
+            smtc_album_identity_key("Track 1", "Artist X", ""),
+            smtc_album_identity_key("Track 2", "Artist X", ""),
+            "empty album must fall back to track identity"
+        );
+
+        let mut tc = SmtcThumbCacheState::default();
+        let key_a = "Song A\x1fArtist A\x1fAlbA";
+        let key_b = "Song B\x1fArtist B\x1fAlbB";
+        let key_c = "Song C\x1fArtist B\x1fAlbB"; // same album as Song B
+        let key_d = "Song D\x1fArtist D\x1fAlbD"; // different album with genuinely identical bytes
+
+        assert!(tc.should_read_thumbnail(key_a, false));
+        let got_a = tc.commit_read_thumbnail(key_a, "Song A", "Artist A", "AlbA", Some("B64_A".to_string()), 1_000);
+        assert_eq!(got_a.as_deref(), Some("B64_A"));
+        assert!(!tc.is_awaiting_fresh_thumb());
+        assert!(!tc.should_read_thumbnail(key_a, false));
+
+        // Song A -> Song B (different album) returning stale `B64_A` at t + 100ms -> REJECTED!
+        let stale_b = tc.commit_read_thumbnail(key_b, "Song B", "Artist B", "AlbB", Some("B64_A".to_string()), 1_100);
+        assert_eq!(stale_b, None, "stale previous-track SMTC bytes must be rejected across album switch");
+        assert!(tc.is_awaiting_fresh_thumb());
+        assert!(tc.should_read_thumbnail(key_b, false));
+
+        // Song B receives real `B64_B` at t + 350ms -> ACCEPTED!
+        let fresh_b = tc.commit_read_thumbnail(key_b, "Song B", "Artist B", "AlbB", Some("B64_B".to_string()), 1_350);
+        assert_eq!(fresh_b.as_deref(), Some("B64_B"));
+        assert!(!tc.is_awaiting_fresh_thumb());
+        assert!(!tc.should_read_thumbnail(key_b, false));
+
+        // `MediaPropertiesChanged` (`media_dirty = true`) forces re-read and accepts upgraded `B64_B_v2`
+        assert!(tc.should_read_thumbnail(key_b, true));
+        let upgraded_b = tc.commit_read_thumbnail(key_b, "Song B", "Artist B", "AlbB", Some("B64_B_v2".to_string()), 1_600);
+        assert_eq!(upgraded_b.as_deref(), Some("B64_B_v2"));
+
+        // Song B -> Song C on SAME non-empty album (`AlbB`): identical bytes accepted IMMEDIATELY (0ms flicker)!
+        let same_alb_c = tc.commit_read_thumbnail(key_c, "Song C", "Artist B", "AlbB", Some("B64_B_v2".to_string()), 1_650);
+        assert_eq!(same_alb_c.as_deref(), Some("B64_B_v2"));
+        assert!(!tc.is_awaiting_fresh_thumb());
+
+        // Song C -> Song D (different album) with genuinely identical bytes: rejected < 2500ms, accepted >= 2500ms
+        let rej_d = tc.commit_read_thumbnail(key_d, "Song D", "Artist D", "AlbD", Some("B64_B_v2".to_string()), 2_000);
+        assert_eq!(rej_d, None);
+        assert!(tc.is_awaiting_fresh_thumb());
+        let acc_d = tc.commit_read_thumbnail(key_d, "Song D", "Artist D", "AlbD", Some("B64_B_v2".to_string()), 4_600);
+        assert_eq!(acc_d.as_deref(), Some("B64_B_v2"));
+        assert!(!tc.is_awaiting_fresh_thumb());
+
+        // --- C. app_ui schema version, cache keys, URL upgrade safety & optimistic track switch ---
+        assert_eq!(PLAYLIST_CACHE_SCHEMA_VERSION, 3, "schema v3 forces legacy truncated v2 caches to revalidate");
+        assert_ne!(
+            make_smtc_artwork_key("Song", "Artist", "Album", "B64_V1"),
+            make_smtc_artwork_key("Song", "Artist", "Album", "B64_V2")
+        );
+        assert_ne!(
+            make_smtc_artwork_key("Song", "Artist", "Album 1", "SAME"),
+            make_smtc_artwork_key("Song", "Artist", "Album 2", "SAME")
+        );
+        assert_ne!(
+            smtc_catalog_cache_key("Title", "Artist", "Single"),
+            smtc_catalog_cache_key("Title", "Artist", "Album")
+        );
+        assert_ne!(
+            meta_motion_cache_key("Title", "Artist", "Single"),
+            meta_motion_cache_key("Title", "Artist", "Album")
+        );
+
+        assert_eq!(
+            upgrade_artwork_request_url("https://is1-ssl.mzstatic.com/image/thumb/a/360x360bb.jpg", true),
+            "https://is1-ssl.mzstatic.com/image/thumb/a/720x720bb.jpg"
+        );
+        assert_eq!(
+            upgrade_artwork_request_url("https://is1-ssl.mzstatic.com/image/thumb/a/360x360bb.jpg", false),
+            "https://is1-ssl.mzstatic.com/image/thumb/a/480x480bb.jpg"
+        );
+        let gen_q = "https://is1-ssl.mzstatic.com/image/thumb/gen/360x360AM.PDCXS.jpg?c1=1";
+        let ne_u = "https://p1.music.126.net/hash/360x360_real.jpg?param=480y480";
+        let qq_u = "https://y.gtimg.cn/music/photo_new/T002R500x500M000abc.jpg";
+        assert_eq!(upgrade_artwork_request_url(gen_q, true), gen_q);
+        assert_eq!(upgrade_artwork_request_url(ne_u, true), ne_u);
+        assert_eq!(upgrade_artwork_request_url(qq_u, true), qq_u);
+
+        // `begin_optimistic_playback_loading` must clear prior track's cover & SMTC bytes even when new track has `artwork_url: None`
+        let mut ui = AppUi::new(0);
+        ui.smtc.artwork_url = Some("https://is1-ssl.mzstatic.com/old/600x600bb.jpg".to_string());
+        ui.smtc.thumbnail_base64 = Some("STALE_OLD_THUMB".to_string());
+        let tr_no_art = AgentTrackInput {
+            id: "ne:9001".to_string(),
+            catalog_id: Some("9001".to_string()),
+            kind: Some("ne-song".to_string()),
+            name: "No Cover Track".to_string(),
+            artist_name: "Artist".to_string(),
+            album_name: "Album".to_string(),
+            duration_sec: 180.0,
+            artwork_url: None,
+            audio_traits: Vec::new(),
+        };
+        ui.begin_optimistic_playback_loading(Some(&tr_no_art), None);
+        assert_eq!(ui.smtc.artwork_url, None, "switching to artwork_url=None must clear previous cover");
+        assert_eq!(ui.smtc.thumbnail_base64, None, "optimistic switch must clear stale SMTC thumbnail bytes");
+
+        let tr_with_art = AgentTrackInput {
+            artwork_url: Some("https://p1.music.126.net/new/9002.jpg?param=480y480".to_string()),
+            ..tr_no_art
+        };
+        ui.begin_optimistic_playback_loading(Some(&tr_with_art), None);
+        assert_eq!(
+            ui.smtc.artwork_url.as_deref(),
+            Some("https://p1.music.126.net/new/9002.jpg?param=480y480")
+        );
+        drop(ui);
+
+        // --- D. D2DRenderer CPU-fallback motion texture Arc::ptr_eq & invalidate_motion_texture ---
+        unsafe extern "system" fn bug3_wnd_proc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+            DefWindowProcW(h, m, w, l)
+        }
+        let hwnd = unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let hinst: HINSTANCE = GetModuleHandleW(None).unwrap_or_default().into();
+            let cls = w!("AMLightBug3UnitHost");
+            let wc = WNDCLASSW {
+                style: CS_HREDRAW | CS_VREDRAW,
+                lpfnWndProc: Some(bug3_wnd_proc),
+                hInstance: hinst,
+                lpszClassName: cls,
+                ..Default::default()
+            };
+            let _ = RegisterClassW(&wc);
+            CreateWindowExW(
+                WS_EX_NOREDIRECTIONBITMAP,
+                cls,
+                PCWSTR(w!("AM Light Bug3 Unit").as_ptr()),
+                WS_POPUP,
+                0,
+                0,
+                320,
+                320,
+                None,
+                None,
+                Some(hinst),
+                None,
+            )
+            .expect("CreateWindowExW Bug3")
+        };
+
+        let mut renderer = D2DRenderer::new(hwnd, 320, 320, 1.0).expect("D2DRenderer::new Bug3");
+        renderer.reset_frame_stats();
+        let rect = RectF::new(20.0, 20.0, 160.0, 160.0);
+        let frame_a = MotionFrameSnapshot {
+            key: "lyrics_cover".to_string(),
+            width: 64,
+            height: 64,
+            frame_seq: 1,
+            bgra: Arc::new(vec![0xAA; 64 * 64 * 4]),
+            dxgi_texture: None,
+            target_dim: 64,
+        };
+        let frame_b = MotionFrameSnapshot {
+            key: "lyrics_cover".to_string(),
+            width: 64,
+            height: 64,
+            frame_seq: 1, // identical frame_seq & dims, distinct Arc buffer (e.g. new song!)
+            bgra: Arc::new(vec![0x55; 64 * 64 * 4]),
+            dxgi_texture: None,
+            target_dim: 64,
+        };
+
+        renderer.begin_draw(Color::rgb(12, 12, 16));
+        assert!(renderer.draw_motion_artwork(&frame_a, rect, 12.0, 1.0));
+        renderer.end_window_draw_and_present(0.0, true, 0);
+        assert_eq!(renderer.frame_stats().motion_cpu_fallback_frames, 1);
+
+        // Same Arc + same frame_seq -> no redundant CPU re-upload
+        renderer.begin_draw(Color::rgb(12, 12, 16));
+        assert!(renderer.draw_motion_artwork(&frame_a, rect, 12.0, 1.0));
+        renderer.end_window_draw_and_present(0.0, true, 0);
+        assert_eq!(renderer.frame_stats().motion_cpu_fallback_frames, 1);
+
+        // Distinct Arc buffer with SAME frame_seq=1 -> MUST upload fresh pixels (no stale cover bleed!)
+        renderer.begin_draw(Color::rgb(12, 12, 16));
+        assert!(renderer.draw_motion_artwork(&frame_b, rect, 12.0, 1.0));
+        renderer.end_window_draw_and_present(0.0, true, 0);
+        assert_eq!(
+            renderer.frame_stats().motion_cpu_fallback_frames,
+            2,
+            "distinct Arc<Vec<u8>> with same frame_seq must re-upload instead of showing stale song motion cover"
+        );
+        assert_eq!(renderer.motion_texture_cache_len(), 1);
+
+        renderer.invalidate_motion_texture("lyrics_cover");
+        assert_eq!(
+            renderer.motion_texture_cache_len(),
+            0,
+            "invalidate_motion_texture must drop cached GPU texture entry"
+        );
+
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+    }
+
+    #[test]
+    fn test_phase2_perf_ui_revisions_zero_clone_idle_cadence_and_search() {
+        use am_light_lib::am_api::{EditorialItem, EditorialShelf, EditorialShelfKind};
+        use am_light_lib::app_ui::{
+            contains_ascii_icase, upgrade_artwork_request_url_dim, AppUi, CachedPlaylistDetail,
+            PageRoute, PlaylistDiskCache, SharedPlaylistDetail,
+        };
+        use am_light_lib::backends::PlaybackBackend;
+        use am_light_lib::smtc::SmtcState;
+        use std::sync::Arc;
+
+        // P0-1: O(1) revision snapshot & direct-mutation safety
+        let mut ui = AppUi::new(0);
+        let rev0 = ui.content_revision_snapshot();
+        assert_eq!(rev0, (0, 0, 0, 0));
+
+        // P0-2: active_queue_tracks_cached returns same Arc across calls without 750ms forced churn
+        let q1 = ui.active_queue_tracks_cached();
+        let q2 = ui.active_queue_tracks_cached();
+        assert!(Arc::ptr_eq(&q1, &q2), "unchanged queue cache must reuse exact Arc");
+
+        // P0-4: Non-Home settled playing cadence relaxes to 4 Hz (250ms) when idle with no visible EQ/motion
+        ui.settings.playback_backend = PlaybackBackend::AppleMusicWeb;
+        ui.settings.live_eq_icon_spectrum = false;
+        ui.settings.reduce_motion = false;
+        ui.is_window_focused = true;
+        ui.route = PageRoute::Settings;
+        ui.show_lyrics_overlay = false;
+        ui.route_trans = 1.0;
+        ui.sidebar_open_spring.snap(1.0);
+        ui.top_bar_guard_spring.snap(0.0);
+        ui.on_playback_state_changed(SmtcState {
+            active: true,
+            title: "Idle Settings Track".to_string(),
+            artist: "Artist".to_string(),
+            status: "Playing".to_string(),
+            position_sec: 42.0,
+            duration_sec: 200.0,
+            backend_mode: "web-am".to_string(),
+            adam_id: Some("123456".to_string()),
+            position_is_calibrated: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            ui.effective_frame_pacing(),
+            (0, 4, Some(250_000_000)),
+            "settled non-Home Settings page while playing idle must pace at 4 Hz (250ms)"
+        );
+
+        // P0-5: Arc-backed SharedPlaylistDetail keeps JSON schema identical and clones in O(1) via Arc
+        let mut cache = PlaylistDiskCache::default();
+        let detail = CachedPlaylistDetail {
+            id: "p.arc1".to_string(),
+            kind: "library-playlists".to_string(),
+            title: "Shared Playlist".to_string(),
+            subtitle: "Owner".to_string(),
+            description: String::new(),
+            artwork_url: Some("https://is1-ssl.mzstatic.com/a/600x600bb.jpg".to_string()),
+            tracks: Vec::new(),
+            updated_unix_sec: 1_700_000_000,
+        };
+        cache
+            .details
+            .insert("p.arc1".to_string(), SharedPlaylistDetail(Arc::new(detail)));
+        let cloned = cache.clone();
+        assert!(
+            Arc::ptr_eq(&cache.details["p.arc1"].0, &cloned.details["p.arc1"].0),
+            "cloning PlaylistDiskCache must share Arc without deep-cloning tracks"
+        );
+        let json_str = serde_json::to_string(&cache).expect("serialize PlaylistDiskCache");
+        let parsed: PlaylistDiskCache =
+            serde_json::from_str(&json_str).expect("deserialize PlaylistDiskCache");
+        assert_eq!(parsed.details["p.arc1"].title, "Shared Playlist");
+
+        // P0-6: Zero-alloc UTF-8-safe ASCII case-insensitive substring matcher
+        assert!(contains_ascii_icase("Jay Chou 周杰伦 - Sunny Day", "周杰伦"));
+        assert!(contains_ascii_icase("HELLO World", "hello"));
+        assert!(contains_ascii_icase("MixedCase123", "case123"));
+        assert!(contains_ascii_icase("anything", ""));
+        assert!(!contains_ascii_icase("abc", "abcd"));
+        assert!(!contains_ascii_icase("Sunny Day", "night"));
+
+        // P0-8 / P1-2: Tiered mzstatic artwork request sizing without corrupting NetEase/QQ/query URLs
+        let mz600 = "https://is1-ssl.mzstatic.com/image/thumb/a/600x600bb.jpg";
+        let mz360 = "https://is1-ssl.mzstatic.com/image/thumb/a/360x360bb.jpg";
+        assert_eq!(
+            upgrade_artwork_request_url_dim(mz600, 160),
+            "https://is1-ssl.mzstatic.com/image/thumb/a/240x240bb.jpg"
+        );
+        assert_eq!(
+            upgrade_artwork_request_url_dim(mz360, 384),
+            "https://is1-ssl.mzstatic.com/image/thumb/a/480x480bb.jpg"
+        );
+        assert_eq!(
+            upgrade_artwork_request_url_dim(mz360, 720),
+            "https://is1-ssl.mzstatic.com/image/thumb/a/720x720bb.jpg"
+        );
+        let ne_url = "https://p1.music.126.net/hash/600x600_id.jpg?param=480y480";
+        let qq_url = "https://y.gtimg.cn/music/photo_new/T002R500x500M000abc.jpg";
+        assert_eq!(upgrade_artwork_request_url_dim(ne_url, 160), ne_url);
+        assert_eq!(upgrade_artwork_request_url_dim(qq_url, 160), qq_url);
+
+        // Verify direct pub mutation of `home_shelves` still registers cleanly on AppUi
+        ui.home_shelves.push(EditorialShelf {
+            title: "Direct Shelf".to_string(),
+            subtitle: String::new(),
+            kind: EditorialShelfKind::SquareShelf,
+            items: vec![EditorialItem {
+                id: "s1".to_string(),
+                kind: "album".to_string(),
+                play_kind: "album".to_string(),
+                title: "Item 1".to_string(),
+                ..Default::default()
+            }],
+        });
+        assert_eq!(ui.home_shelves.len(), 1);
+        drop(ui);
+    }
+
+    #[test]
+    fn test_phase2_perf_gpu_strip_vram_true_lru_caches_and_lyrics_o1() {
+        use am_light_lib::d2d_renderer::{
+            ArtworkSizeTier, D2DRenderer, DecodedArtworkCpu, SfIcon, TextAlign,
+        };
+        use am_light_lib::lyrics::{
+            get_cached_lyrics, lyrics_cache_len, parse_lrc_lyrics, put_custom_lyrics_in_cache,
+            NonEmphasisLyricsEffect,
+        };
+        use am_light_lib::lyrics_view::LyricsViewState;
+        use am_light_lib::smtc::SmtcState;
+        use am_light_lib::theme::{Color, RectF};
+        use windows::core::{w, PCWSTR};
+        use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, CS_HREDRAW, CS_VREDRAW,
+            WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP, WS_POPUP,
+        };
+
+        // P1-2 & P1-4 pure checks
+        assert_eq!(D2DRenderer::decode_dim_for_tier(ArtworkSizeTier::SmallThumb, false), 128);
+        assert_eq!(D2DRenderer::decode_dim_for_tier(ArtworkSizeTier::Card, false), 384);
+        assert_eq!(D2DRenderer::decode_dim_for_tier(ArtworkSizeTier::Hero, false), 720);
+        assert!(!D2DRenderer::is_volatile_telemetry_mono_text("3:42"));
+        assert!(!D2DRenderer::is_volatile_telemetry_mono_text("1"));
+        assert!(!D2DRenderer::is_volatile_telemetry_mono_text("0.0s"));
+        assert!(D2DRenderer::is_volatile_telemetry_mono_text("-03:45"));
+        assert!(D2DRenderer::is_volatile_telemetry_mono_text("143.8 FPS"));
+        assert!(D2DRenderer::is_volatile_telemetry_mono_text("-12.4 dB"));
+
+        // P2-1: O(1) arithmetic queue visible range for 10,000 tracks
+        let (q_start, q_end) = LyricsViewState::compute_queue_visible_range(10_000, 6000.0, 480.0);
+        assert!(q_start >= 95 && q_start <= 105, "unexpected q_start={q_start}");
+        assert!(q_end > q_start && (q_end - q_start) <= 16, "queue slice must stay O(1) viewport-bounded: {q_start}..{q_end}");
+
+        // P2-1: O(L + T) monotonic translation alignment on 200 lines + 200 translations
+        let mut lrc_main = String::new();
+        let mut lrc_trans = String::new();
+        for i in 0..200 {
+            let sec = i * 2;
+            let mm = sec / 60;
+            let ss = sec % 60;
+            lrc_main.push_str(&format!("[{mm:02}:{ss:02}.00]Line {i}\n"));
+            lrc_trans.push_str(&format!("[{mm:02}:{ss:02}.00]Trans {i}\n"));
+        }
+        let parsed_200 =
+            parse_lrc_lyrics(&lrc_main, Some(&lrc_trans), "QA-LRC").expect("parse 200-line lrc");
+        assert_eq!(parsed_200.lines.len(), 200);
+        assert_eq!(parsed_200.lines[0].translation.as_deref(), Some("Trans 0"));
+        assert_eq!(parsed_200.lines[99].translation.as_deref(), Some("Trans 99"));
+        assert_eq!(parsed_200.lines[199].translation.as_deref(), Some("Trans 199"));
+
+        // P2-1: Bounded 48-entry true-LRU lyrics cache (touched early key survives 60 inserts)
+        for i in 0..60 {
+            if i == 30 {
+                let _ = get_cached_lyrics("qa_p2_lru_0");
+            }
+            put_custom_lyrics_in_cache(&format!("qa_p2_lru_{i}"), parsed_200.clone());
+        }
+        assert!(lyrics_cache_len() <= 48, "LYRICS_CACHE must stay bounded <= 48");
+        assert!(
+            get_cached_lyrics("qa_p2_lru_0").is_some(),
+            "touched early lyrics cache key must survive LRU eviction"
+        );
+        assert!(
+            get_cached_lyrics("qa_p2_lru_1").is_none(),
+            "untouched oldest lyrics cache key must be evicted"
+        );
+
+        // Real D2DRenderer checks at wide 2560x1440 resolution
+        unsafe extern "system" fn gpu_p2_wnd_proc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+            DefWindowProcW(h, m, w, l)
+        }
+        let hwnd = unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let hinst: HINSTANCE = GetModuleHandleW(None).unwrap_or_default().into();
+            let cls = w!("AMLightPhase2GpuHost");
+            let wc = WNDCLASSW {
+                style: CS_HREDRAW | CS_VREDRAW,
+                lpfnWndProc: Some(gpu_p2_wnd_proc),
+                hInstance: hinst,
+                lpszClassName: cls,
+                ..Default::default()
+            };
+            let _ = RegisterClassW(&wc);
+            CreateWindowExW(
+                WS_EX_NOREDIRECTIONBITMAP,
+                cls,
+                PCWSTR(w!("AM Light Phase2 GPU").as_ptr()),
+                WS_POPUP,
+                0,
+                0,
+                2560,
+                1440,
+                None,
+                None,
+                Some(hinst),
+                None,
+            )
+            .expect("CreateWindowExW Phase2 GPU")
+        };
+
+        let mut r = D2DRenderer::new(hwnd, 2560, 1440, 1.0).expect("D2DRenderer::new 2560x1440");
+
+        // P1-1: Strip-mode liquid glass VRAM allocation must be < 6 MB (vs ~20.4 MB full-window)
+        r.begin_draw(Color::rgb(12, 12, 16));
+        r.begin_glass_backdrop_snapshot_strips_ex(false, 72.0, 92.0, None, 0b11);
+        r.end_glass_backdrop_snapshot();
+        r.end_window_draw_and_present(0.0, true, 0);
+        let strip_bytes = r.glass_snapshot_allocated_bytes();
+        let (_tw, th, _bw, bh) = r.glass_strip_snapshot_dims();
+        assert!(
+            strip_bytes > 0 && strip_bytes < 6_000_000,
+            "strip-mode glass VRAM must stay < 6 MB on 2560x1440, got {strip_bytes}"
+        );
+        assert!(th > 0 && th < 300 && bh > 0 && bh < 300, "strip heights must be << 1440: th={th}, bh={bh}");
+
+        // P1-2: True LRU recency promotion on draw_rounded_artwork + no-downgrade guard
+        let mk_art = |dim: u32, px: u8| DecodedArtworkCpu {
+            pixels: vec![px; (dim * dim * 4) as usize],
+            width: dim,
+            height: dim,
+            palette: [Color::rgb(px, 60, 90); 4],
+        };
+        let url_a = "https://is1-ssl.mzstatic.com/image/thumb/lru_a/480x480bb.jpg";
+        let url_b = "https://is1-ssl.mzstatic.com/image/thumb/lru_b/480x480bb.jpg";
+        assert!(r.upload_decoded_artwork(url_a.to_string(), mk_art(384, 200), false));
+        assert!(r.upload_decoded_artwork(url_b.to_string(), mk_art(384, 100), false));
+        // Touch url_a via draw_rounded_artwork -> url_a must become MRU!
+        r.begin_draw(Color::rgb(12, 12, 16));
+        assert!(r.draw_rounded_artwork(url_a, false, RectF::new(10.0, 10.0, 120.0, 120.0), 8.0, 1.0));
+        r.end_window_draw_and_present(0.0, true, 0);
+        let recency = r.thumb_cache_keys_by_recency();
+        assert_eq!(
+            recency.last().map(String::as_str),
+            Some("https://is1-ssl.mzstatic.com/image/thumb/lru_a"),
+            "draw_rounded_artwork hit must promote stem to MRU (last in ascending recency order): {recency:?}"
+        );
+        // No-downgrade guard: attempting to upload 128x128 for url_a must NOT downgrade 384px cache!
+        let _ = r.upload_decoded_artwork(url_a.to_string(), mk_art(128, 50), false);
+        assert!(
+            r.has_artwork_min_dim(url_a, false, 384),
+            "smaller 128px decode must never downgrade cached 384px artwork"
+        );
+
+        // P1-4: Static mono cached vs volatile uncached, radial glow + icon geometry caches, 0.5x transition blur
+        r.begin_draw(Color::rgb(12, 12, 16));
+        let tl_before = r.text_layout_cache_len();
+        r.draw_mono_text(
+            "3:42",
+            RectF::new(10.0, 10.0, 80.0, 24.0),
+            12.0,
+            500,
+            Color::rgb(255, 255, 255),
+            TextAlign::Right,
+            true,
+        );
+        let tl_after_static = r.text_layout_cache_len();
+        assert!(tl_after_static > tl_before, "static duration '3:42' must be cached in text_layout_cache");
+        r.draw_mono_text_volatile(
+            "1:23",
+            RectF::new(10.0, 40.0, 80.0, 24.0),
+            12.0,
+            500,
+            Color::rgb(255, 255, 255),
+            TextAlign::Left,
+            true,
+        );
+        assert_eq!(
+            r.text_layout_cache_len(),
+            tl_after_static,
+            "draw_mono_text_volatile must bypass text_layout_cache"
+        );
+        r.fill_radial_glow(100.0, 100.0, 80.0, 80.0, Color::rgba(255, 80, 120, 0.6), Color::rgba(255, 80, 120, 0.0));
+        r.draw_icon(SfIcon::Play, RectF::new(200.0, 200.0, 24.0, 24.0), Color::rgb(255, 255, 255));
+        assert!(r.radial_glow_cache_len() > 0, "radial glow brush must populate radial_glow_cache");
+        assert!(r.icon_geom_cache_len() > 0, "static SfIcon::Play must populate icon_geom_cache");
+        if r.begin_lyrics_transition_sheet() {
+            r.end_and_composite_lyrics_transition_sheet(0.5, 10.0, 0.0, 1.0, 12.0, false);
+        }
+        r.end_window_draw_and_present(0.0, true, 0);
+        let (tr_w, tr_h) = r.lyrics_transition_blur_dims();
+        assert_eq!((tr_w, tr_h), (1280, 720), "lyrics transition blur must run at 0.5x half-resolution");
+
+        // P0-8: Wide-window adaptive lyrics blur scale & 30Hz aurora-gated lyrics glass strip reuse
+        r.set_lyrics_blur_downsample_explicit(true, true);
+        assert!(r.effective_lyrics_blur_scale() < 0.75);
+        r.set_lyrics_blur_downsample_explicit(false, true);
+        assert!((r.effective_lyrics_blur_scale() - 1.0).abs() < 1e-4);
+
+        let mut lv = LyricsViewState::default();
+        let win_rect = RectF::new(0.0, 0.0, 2560.0, 1440.0);
+        let smtc = SmtcState {
+            active: true,
+            title: "Aurora Test".to_string(),
+            artist: "Artist".to_string(),
+            status: "Playing".to_string(),
+            position_sec: 10.0,
+            duration_sec: 180.0,
+            ..Default::default()
+        };
+        // Frame 1 primes aurora + lyrics glass strips
+        r.begin_draw(Color::rgb(12, 12, 16));
+        lv.draw(
+            &mut r,
+            win_rect,
+            &smtc,
+            Some(url_a),
+            Some(&parsed_200),
+            "qa_p2_aurora",
+            false,
+            false,
+            0.0,
+            0.2,
+            false,
+            false,
+            (-10.0, -10.0),
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            NonEmphasisLyricsEffect::Both,
+            true,
+            true,
+            true,
+            1.0,
+            None,
+        );
+        r.end_window_draw_and_present(0.0, true, 0);
+
+        // Frame 2 immediately after (within 33ms aurora gate) -> 0 glass flushes, 0 glass blurs, >=1 cache hit!
+        r.reset_frame_stats();
+        r.begin_draw(Color::rgb(12, 12, 16));
+        lv.draw(
+            &mut r,
+            win_rect,
+            &smtc,
+            Some(url_a),
+            Some(&parsed_200),
+            "qa_p2_aurora",
+            false,
+            false,
+            0.0,
+            0.2,
+            false,
+            false,
+            (-10.0, -10.0),
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            NonEmphasisLyricsEffect::Both,
+            true,
+            true,
+            true,
+            1.0,
+            None,
+        );
+        r.end_window_draw_and_present(0.0, true, 0);
+        let st_lyr = r.frame_stats();
+        assert_eq!(st_lyr.glass_snapshot_flushes, 0, "non-aurora lyrics frame must incur 0 glass flushes");
+        assert_eq!(st_lyr.glass_snapshot_blurs, 0, "non-aurora lyrics frame must incur 0 glass blurs");
+        assert!(st_lyr.glass_snapshot_cache_hits >= 1, "non-aurora lyrics frame must reuse cached glass strip");
+
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+    }
+
+    #[test]
+    fn test_phase2_perf_motion_cancel_lru_cadence_and_logger() {
+        use am_light_lib::motion_art::{
+            decode_tick_stride_for_slot, parse_avc_variant_for_target_dim, MotionArtManager,
+            MotionDiskCacheLru, CORE_VIEWPORT_FULL_CADENCE_SLOTS, MAX_DECODER_OPENS_PER_TICK,
+            MOTION_CACHE_MAX_BYTES, MOTION_CACHE_MAX_FILES, MOTION_CACHE_TARGET_BYTES,
+            MOTION_CACHE_TARGET_FILES,
+        };
+
+        assert_eq!(MOTION_CACHE_MAX_FILES, 128);
+        assert_eq!(MOTION_CACHE_TARGET_FILES, 96);
+        assert_eq!(MOTION_CACHE_MAX_BYTES, 256 * 1024 * 1024);
+        assert_eq!(MOTION_CACHE_TARGET_BYTES, 200 * 1024 * 1024);
+        assert!(CORE_VIEWPORT_FULL_CADENCE_SLOTS >= 8);
+        assert!(MAX_DECODER_OPENS_PER_TICK <= 4);
+
+        // P0-3: Cancellable HLS downloads via AbortHandle
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio rt");
+        let mgr = MotionArtManager::new();
+        let cancel_url = "https://example.invalid/phase2_cancel_me.m3u8";
+        let jh = rt.spawn(async {
+            std::future::pending::<()>().await;
+        });
+        mgr.register_inflight_abort_handle_for_url(cancel_url, jh.abort_handle());
+        assert_eq!(mgr.inflight_download_count(), 1);
+        mgr.sync_prefetch_urls(&[]);
+        assert_eq!(mgr.inflight_download_count(), 0, "leaving viewport+prefetch must abort inflight download");
+        assert!(mgr.aborted_download_count() >= 1);
+        rt.block_on(async {
+            let res = jh.await;
+            assert!(res.is_err() && res.unwrap_err().is_cancelled(), "aborted download task must be cancelled");
+        });
+
+        // P0-3: Non-blocking readiness returns false immediately for uncached URL (0 disk stats)
+        assert!(!mgr.is_url_cached_ready_nonblocking("https://example.invalid/definitely_absent_p2.m3u8"));
+        mgr.set_global_enabled(false);
+
+        // P0-3: MotionDiskCacheLru hysteresis (max 6 -> target 4 files; max 10KB -> target 7KB) + true LRU touch
+        let tmp_dir = std::env::temp_dir().join("am_light_p2_motion_lru_test");
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let mut lru = MotionDiskCacheLru::new(tmp_dir.clone(), 6, 4, 10_000, 7_000);
+        for i in 0..6 {
+            let ev = lru.record_write(&format!("k{i}"), 1_000);
+            assert!(ev.is_empty());
+        }
+        assert!(lru.touch("k0").is_some(), "touching k0 must promote it to MRU");
+        let evicted = lru.record_write("k6", 1_000);
+        assert_eq!(evicted.len(), 3, "exceeding 6 files must evict down to hysteresis target 4");
+        assert_eq!(lru.len(), 4);
+        assert!(lru.contains_key("k0"), "touched k0 must survive LRU eviction");
+        assert!(!lru.contains_key("k1"), "untouched oldest k1 must be evicted");
+        // Byte-cap hysteresis: push total_bytes past 10_000 -> evict down to <= 7_000
+        let ev_bytes = lru.record_write("k_big", 6_500);
+        assert!(!ev_bytes.is_empty());
+        assert!(lru.total_bytes() <= 7_000, "byte hysteresis must prune down to <= 7000, got {}", lru.total_bytes());
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+
+        // P1-1: Avoid 960p jump on bucket 512 while preserving 720p selection when present
+        let m3u8_jump = "#EXTM3U\n\
+            #EXT-X-STREAM-INF:BANDWIDTH=1200000,CODECS=\"avc1.64001f\",RESOLUTION=486x486\n\
+            486.m3u8\n\
+            #EXT-X-STREAM-INF:BANDWIDTH=4500000,CODECS=\"avc1.640028\",RESOLUTION=960x960\n\
+            960.m3u8\n";
+        let picked_486 = parse_avc_variant_for_target_dim("https://cdn.example/master.m3u8", m3u8_jump, 512)
+            .expect("pick 486 over 960");
+        assert!(picked_486.ends_with("/486.m3u8"), "must pick 486 instead of jumping to 960p: {picked_486}");
+        let m3u8_mid = "#EXTM3U\n\
+            #EXT-X-STREAM-INF:BANDWIDTH=1200000,CODECS=\"avc1.64001f\",RESOLUTION=486x486\n\
+            486.m3u8\n\
+            #EXT-X-STREAM-INF:BANDWIDTH=2600000,CODECS=\"avc1.640020\",RESOLUTION=720x720\n\
+            720.m3u8\n";
+        let picked_720 = parse_avc_variant_for_target_dim("https://cdn.example/master.m3u8", m3u8_mid, 512)
+            .expect("pick 720 when available");
+        assert!(picked_720.ends_with("/720.m3u8"), "must still pick 720p when intermediate variant exists: {picked_720}");
+
+        // P1-1: Tiered viewport cadence
+        assert_eq!(decode_tick_stride_for_slot(0, 20), 1);
+        assert_eq!(decode_tick_stride_for_slot(CORE_VIEWPORT_FULL_CADENCE_SLOTS - 1, 20), 1);
+        assert_eq!(decode_tick_stride_for_slot(CORE_VIEWPORT_FULL_CADENCE_SLOTS, 20), 2);
+
+        // P2-3: Persistent buffered logger writer
+        am_light_lib::logger::init();
+        am_light_lib::logger::info("qa", "phase2 perf logger persistence check");
+        am_light_lib::logger::flush();
+        assert!(
+            am_light_lib::logger::is_persistent_writer_open(),
+            "logger must maintain persistent BufWriter<File> across writes"
+        );
+    }
+
+    #[test]
+    fn test_phase2_perf_network_audio_dsp_and_aux_storage() {
+        use am_light_lib::am_agent::{
+            BoundedLruMap, AGENT_LYRICS_CACHE_MAX_ENTRIES, HLS_MANIFEST_CACHE_MAX_ENTRIES,
+            TRACK_META_CACHE_MAX_ENTRIES, TRACK_TRAITS_CACHE_MAX_ENTRIES,
+        };
+        use am_light_lib::am_api::{
+            artwork_canonical_stem, artwork_canonical_stem_ref, fetch_artwork_bytes_if_current,
+            ordered_motion_probe_storefronts, prune_art_cache_dir, write_artwork_cache_file_atomic,
+            CachedDevToken, DevTokenSingleflight,
+        };
+        use am_light_lib::audio_viz::{
+            compute_unbiased_autocorr_fft, sample_live_visualizer, set_active_viz_style_inspector,
+            SharedSpectrumAnalyzer,
+        };
+        use am_light_lib::backends::{ResolvedAudioStream, WebAmStatus};
+        use am_light_lib::binaural_dsp::{
+            legacy_restore_marker_path_in_base, pop_restore_marker_in_base,
+            restore_marker_path_in_base, save_restore_marker_in_base,
+        };
+        use am_light_lib::drm_fix::{prune_old_drm_backups, MAX_DRM_BACKUPS};
+        use am_light_lib::listen_together::{
+            compute_next_poll_interval_ms, AdaptivePollState, ListenTogetherStatus,
+            POLL_INTERVAL_ACTIVE_MS, POLL_INTERVAL_IDLE_MAX_MS, POLL_INTERVAL_IDLE_STEP1_MS,
+        };
+        use am_light_lib::native_player::{
+            find_cached_stream_file, inspect_audio_file_specs_from_header,
+            is_download_cancelled_err, stable_stream_cache_key, stable_stream_cache_key_from_url,
+            strip_ephemeral_url_query,
+        };
+        use am_light_lib::visualizers::VisualizerState;
+        use am_light_lib::web_am_player::{build_edge_launch_args, status_eq};
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // P1-2 & P1-5: am_api stem_ref, epoch cancel, atomic write + prune, DevTokenSingleflight, storefront ordering
+        let sample_art = "https://is1-ssl.mzstatic.com/image/thumb/Music/v4/11/22/33/600x600bb.jpg";
+        assert_eq!(artwork_canonical_stem_ref(sample_art), artwork_canonical_stem(sample_art));
+        assert_eq!(ordered_motion_probe_storefronts("cn"), vec!["cn", "us"]);
+        assert_eq!(ordered_motion_probe_storefronts("us"), vec!["us"]);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio rt");
+        rt.block_on(async {
+            let epoch = AtomicU64::new(5);
+            let res = fetch_artwork_bytes_if_current(
+                "https://example.invalid/stale.jpg",
+                false,
+                Some((&epoch, 4)),
+            )
+            .await;
+            assert_eq!(res.unwrap_err(), "CANCELLED");
+
+            // DevTokenSingleflight: 5 concurrent cold-start callers trigger only 1 fetch
+            let sf = Arc::new(DevTokenSingleflight::new());
+            let fetch_calls = Arc::new(AtomicUsize::new(0));
+            let mut tasks = Vec::new();
+            for _ in 0..5 {
+                let sf_c = Arc::clone(&sf);
+                let fc = Arc::clone(&fetch_calls);
+                tasks.push(tokio::spawn(async move {
+                    sf_c.get_or_fetch(false, 1_000, move || {
+                        let fc = Arc::clone(&fc);
+                        async move {
+                            fc.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                            Ok(CachedDevToken {
+                                token: "singleflight_jwt".to_string(),
+                                kid: Some("kid1".to_string()),
+                                exp: Some(9_999_999),
+                            })
+                        }
+                    })
+                    .await
+                }));
+            }
+            for t in tasks {
+                let tok = t.await.unwrap().unwrap();
+                assert_eq!(tok.token, "singleflight_jwt");
+            }
+            assert_eq!(fetch_calls.load(Ordering::SeqCst), 1, "DevTokenSingleflight must coalesce 5 concurrent callers into 1 fetch");
+        });
+
+        let art_tmp = std::env::temp_dir().join("am_light_p2_art_cache_test");
+        let _ = std::fs::remove_dir_all(&art_tmp);
+        let _ = std::fs::create_dir_all(&art_tmp);
+        for i in 0..6 {
+            let p = art_tmp.join(format!("{i:016x}.img"));
+            write_artwork_cache_file_atomic(&p, &[i as u8; 512]).expect("atomic write");
+            std::thread::sleep(std::time::Duration::from_millis(12));
+        }
+        let pruned = prune_art_cache_dir(&art_tmp, 4, 2, 100_000, 100_000);
+        assert_eq!(pruned, 4, "art_cache prune must evict 6 -> 2 files");
+        let _ = std::fs::remove_dir_all(&art_tmp);
+
+        // P1-6: web_am_player Edge cache bounds + status_eq; listen_together adaptive backoff
+        let edge_args = build_edge_launch_args(
+            std::path::Path::new("C:\\Temp\\prof"),
+            9222,
+            "https://music.apple.com",
+            false,
+        );
+        assert!(edge_args.iter().any(|a| a == "--disk-cache-size=104857600"));
+        assert!(edge_args.iter().any(|a| a == "--media-cache-size=104857600"));
+        let ws1 = WebAmStatus::default();
+        let ws2 = WebAmStatus::default();
+        assert!(status_eq(&ws1, &ws2));
+
+        assert_eq!(POLL_INTERVAL_ACTIVE_MS, 750);
+        assert_eq!(POLL_INTERVAL_IDLE_STEP1_MS, 2000);
+        assert_eq!(POLL_INTERVAL_IDLE_MAX_MS, 3000);
+        assert_eq!(compute_next_poll_interval_ms(true, false, false, 10), 750);
+        assert_eq!(compute_next_poll_interval_ms(false, false, false, 1), 2000);
+        assert_eq!(compute_next_poll_interval_ms(false, false, false, 4), 3000);
+        let mut ap = AdaptivePollState::new();
+        let mut lt_st = ListenTogetherStatus {
+            remote_song_id: Some("1001".to_string()),
+            remote_play_status: "PAUSE".to_string(),
+            remote_client_seq: 1,
+            ..Default::default()
+        };
+        assert_eq!(ap.next_delay_ms(false, Some(&lt_st)), 750); // initial state_changed
+        assert_eq!(ap.next_delay_ms(false, Some(&lt_st)), 2000); // idle tick 1
+        assert_eq!(ap.next_delay_ms(false, Some(&lt_st)), 2000); // idle tick 2
+        assert_eq!(ap.next_delay_ms(false, Some(&lt_st)), 3000); // idle tick 3 -> max backoff
+        lt_st.remote_song_id = Some("1002".to_string());
+        assert_eq!(ap.next_delay_ms(false, Some(&lt_st)), 750); // instant snap back on track change
+
+        // P2-1: am_agent::BoundedLruMap
+        assert_eq!(TRACK_META_CACHE_MAX_ENTRIES, 4096);
+        assert_eq!(TRACK_TRAITS_CACHE_MAX_ENTRIES, 4096);
+        assert_eq!(HLS_MANIFEST_CACHE_MAX_ENTRIES, 2048);
+        assert_eq!(AGENT_LYRICS_CACHE_MAX_ENTRIES, 32);
+        let mut blru: BoundedLruMap<u32> = BoundedLruMap::new(3);
+        blru.insert("k0".to_string(), 10);
+        blru.insert("k1".to_string(), 20);
+        blru.insert("k2".to_string(), 30);
+        assert_eq!(blru.get_cloned_touch("k0"), Some(10));
+        blru.insert("k3".to_string(), 40);
+        assert_eq!(blru.len(), 3);
+        assert!(blru.contains_key("k0"), "touched k0 must survive BoundedLruMap eviction");
+        assert!(!blru.contains_key("k1"), "untouched oldest k1 must be evicted");
+
+        // P0-7: native_player stable stream cache key, rotating token strip, multi-ext probe & 64-byte FLAC header
+        let ne_u1 = "https://m801.music.126.net/20261128010203/0123456789abcdef0123456789abcdef/ymusic/obj/song123.flac?auth=aaa";
+        let ne_u2 = "https://m701.music.126.net/20261128095959/fedcba9876543210fedcba9876543210/ymusic/obj/song123.flac?auth=bbb";
+        assert_eq!(strip_ephemeral_url_query(ne_u1), strip_ephemeral_url_query(ne_u2));
+        assert_eq!(
+            stable_stream_cache_key_from_url(ne_u1, "FLAC", false),
+            stable_stream_cache_key_from_url(ne_u2, "FLAC", false)
+        );
+        let skey = stable_stream_cache_key("netease", "ne:98765", "hires");
+        assert_eq!(skey, stable_stream_cache_key("NetEase", "98765", "HIRES"));
+        assert!(is_download_cancelled_err("cancelled: superseded"));
+        assert!(!is_download_cancelled_err("HTTP 404"));
+
+        let st_tmp = std::env::temp_dir().join("am_light_p2_stream_cache_test");
+        let _ = std::fs::remove_dir_all(&st_tmp);
+        let _ = std::fs::create_dir_all(&st_tmp);
+        let cached_flac = st_tmp.join(format!("trk_{skey:016x}.flac"));
+        std::fs::write(&cached_flac, vec![0x66u8; 16_384]).expect("write cached flac");
+        assert_eq!(find_cached_stream_file(&st_tmp, skey), Some(cached_flac));
+        let _ = std::fs::remove_dir_all(&st_tmp);
+
+        // Synthetic 64-byte FLAC STREAMINFO header: 48,000 Hz, 2ch, 24-bit
+        let mut flac_head = vec![0u8; 64];
+        flac_head[0..4].copy_from_slice(b"fLaC");
+        flac_head[4] = 0x80; // last metadata block, type 0 (STREAMINFO)
+        flac_head[5..8].copy_from_slice(&[0, 0, 34]); // length 34
+        // Bytes 18..22 pack: sample_rate (20 bits) | (channels-1) (3 bits) | (bps-1) (5 bits) | total_samples_hi (4 bits)
+        let packed: u32 = (48_000u32 << 12) | (1u32 << 9) | (23u32 << 4);
+        flac_head[18..22].copy_from_slice(&packed.to_be_bytes());
+        let dummy_stream = ResolvedAudioStream {
+            url: ne_u1.to_string(),
+            referer: String::new(),
+            cookie: None,
+            file_ext: "flac".to_string(),
+            quality_label: "FLAC".to_string(),
+            nominal_bitrate_kbps: 1411,
+            is_trial: false,
+        };
+        let specs = inspect_audio_file_specs_from_header(40_000_000, &flac_head, &dummy_stream, 44_100, 2, 240.0);
+        assert_eq!(specs.codec, "FLAC");
+        assert_eq!(specs.sample_rate_hz, 48_000);
+        assert_eq!(specs.bit_depth, Some(24));
+
+        // P1-3: Exact O(M log M) unbiased autocorr parity vs naive O(M^2), SharedSpectrumAnalyzer, Inspector DSP gate & Visualizer draw-call caps
+        let sig: Vec<f32> = (0..192)
+            .map(|i| (2.0 * PI * (i as f32) / 16.0).sin() + 0.35 * (2.0 * PI * (i as f32) / 7.0).cos())
+            .collect();
+        let fast_ac = compute_unbiased_autocorr_fft(&sig, 20, 60);
+        assert_eq!(fast_ac.len(), 62);
+        for lag in 10..=60 {
+            let mut dot = 0.0f32;
+            let mut e1 = 0.0f32;
+            let mut e2 = 0.0f32;
+            for i in 0..(sig.len() - lag) {
+                dot += sig[i] * sig[i + lag];
+                e1 += sig[i] * sig[i];
+                e2 += sig[i + lag] * sig[i + lag];
+            }
+            let naive = if e1 > 1e-6 && e2 > 1e-6 {
+                (dot / (e1 * e2).sqrt()).clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
+            assert!(
+                (fast_ac[lag] - naive).abs() < 1e-4,
+                "FFT autocorr mismatch at lag={lag}: fast={} naive={naive}",
+                fast_ac[lag]
+            );
+        }
+
+        let mut analyzer = SharedSpectrumAnalyzer::new();
+        let sr = 48_000u32;
+        let sine_2048: Vec<f32> = (0..2048)
+            .map(|n| 0.85 * (2.0 * PI * 1000.0 * (n as f32) / (sr as f32)).sin())
+            .collect();
+        let (b32, b64, b120) = analyzer.compute_raw_bands(&sine_2048, sr);
+        assert!(b32.iter().copied().fold(0.0f32, f32::max) > 0.5);
+        assert!(b64.iter().copied().fold(0.0f32, f32::max) > 0.5);
+        assert!(b120.iter().copied().fold(0.0f32, f32::max) > 0.5);
+        let fast32 = analyzer.compute_raw_32_fast(&sine_2048[..512], sr);
+        assert!(fast32.iter().copied().fold(0.0f32, f32::max) > 0.5);
+
+        set_active_viz_style_inspector(false);
+        let gated_snap = sample_live_visualizer(0.016);
+        assert!(gated_snap.soundstage_lr.is_empty());
+        assert!(gated_snap.soundstage_band_pts.iter().all(|v| v.is_empty()));
+        set_active_viz_style_inspector(true);
+
+        let viz = VisualizerState::default();
+        assert_eq!(viz.matrix_pillar_count(), 1369);
+        assert!(
+            viz.matrix_render_active_count() <= 361,
+            "stride-2 ChernobylRods render count must stay <= 361, got {}",
+            viz.matrix_render_active_count()
+        );
+        assert!(viz.soundstage_stats().0 <= 420);
+
+        // P1-6: Binaural marker migration & DRM backup pruning (keep latest 3)
+        let bin_tmp = std::env::temp_dir().join("am_light_p2_binaural_marker_test");
+        let _ = std::fs::remove_dir_all(&bin_tmp);
+        let legacy_path = legacy_restore_marker_path_in_base(&bin_tmp);
+        let primary_path = restore_marker_path_in_base(&bin_tmp);
+        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        std::fs::write(&legacy_path, "legacy-dev-1").unwrap();
+        // `pop_restore_marker_in_base` migrates legacy-only marker and removes it
+        assert_eq!(pop_restore_marker_in_base(&bin_tmp).as_deref(), Some("legacy-dev-1"));
+        assert!(!legacy_path.exists());
+        // `save_restore_marker_in_base` writes under AMLight\ and removes legacy file
+        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        std::fs::write(&legacy_path, "stale-legacy").unwrap();
+        save_restore_marker_in_base(&bin_tmp, "new-dev-2");
+        assert!(primary_path.exists());
+        assert!(!legacy_path.exists());
+        assert_eq!(pop_restore_marker_in_base(&bin_tmp).as_deref(), Some("new-dev-2"));
+        let _ = std::fs::remove_dir_all(&bin_tmp);
+
+        let drm_tmp = std::env::temp_dir().join("am_light_p2_drm_prune_test");
+        let _ = std::fs::remove_dir_all(&drm_tmp);
+        let _ = std::fs::create_dir_all(&drm_tmp);
+        assert_eq!(MAX_DRM_BACKUPS, 3);
+        for i in 1..=5 {
+            std::fs::create_dir_all(drm_tmp.join(format!("amfix-backup-2026112{i}-000000"))).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        std::fs::create_dir_all(drm_tmp.join("unrelated-dir")).unwrap();
+        let removed_drm = prune_old_drm_backups(&drm_tmp, MAX_DRM_BACKUPS);
+        assert_eq!(removed_drm, 2);
+        assert!(drm_tmp.join("unrelated-dir").exists());
+        assert!(!drm_tmp.join("amfix-backup-20261121-000000").exists());
+        assert!(drm_tmp.join("amfix-backup-20261125-000000").exists());
+        let _ = std::fs::remove_dir_all(&drm_tmp);
     }
 }

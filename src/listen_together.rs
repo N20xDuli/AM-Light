@@ -1488,3 +1488,113 @@ pub fn evaluate_remote_sync_action(
 
     RemoteSyncAction::Noop
 }
+
+// ============================================================================
+// Adaptive Idle/Paused Polling Backoff Scheduler (P1-6)
+// ============================================================================
+
+/// Active low-latency sync cadence (750 ms) whenever playback is running or state changed.
+pub const POLL_INTERVAL_ACTIVE_MS: u64 = 750;
+/// Intermediate idle/paused backoff cadence (2,000 ms).
+pub const POLL_INTERVAL_IDLE_STEP1_MS: u64 = 2000;
+/// Steady-state idle/paused backoff cadence (3,000 ms — ~75% fewer EAPI POSTs while paused!).
+pub const POLL_INTERVAL_IDLE_MAX_MS: u64 = 3000;
+
+/// Pure backoff policy: preserves `750 ms` whenever either side is playing or state changed,
+/// backing off smoothly to `2000 ms` -> `3000 ms` when paused/idle and unchanged.
+#[inline]
+pub fn compute_next_poll_interval_ms(
+    local_is_playing: bool,
+    remote_is_playing: bool,
+    state_changed: bool,
+    unchanged_idle_ticks: u32,
+) -> u64 {
+    if local_is_playing || remote_is_playing || state_changed {
+        return POLL_INTERVAL_ACTIVE_MS;
+    }
+    match unchanged_idle_ticks {
+        0 => POLL_INTERVAL_ACTIVE_MS,
+        1..=2 => POLL_INTERVAL_IDLE_STEP1_MS,
+        _ => POLL_INTERVAL_IDLE_MAX_MS,
+    }
+}
+
+/// Stateful adaptive polling scheduler for NetEase Listen Together rooms.
+#[derive(Clone, Debug, Default)]
+pub struct AdaptivePollState {
+    unchanged_idle_ticks: u32,
+    initialized: bool,
+    last_song_id: Option<String>,
+    last_play_status: String,
+    last_client_seq: i64,
+    last_list_version: i64,
+    last_user_count: usize,
+}
+
+impl AdaptivePollState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[inline]
+    pub fn unchanged_idle_ticks(&self) -> u32 {
+        self.unchanged_idle_ticks
+    }
+
+    /// Computes the next sleep delay in milliseconds based on local playback state and the
+    /// latest polled room status, immediately snapping back to `750 ms` on any play/change!
+    pub fn next_delay_ms(
+        &mut self,
+        local_is_playing: bool,
+        polled: Option<&ListenTogetherStatus>,
+    ) -> u64 {
+        let Some(st) = polled else {
+            // Network/transient error: back off gently when idle, stay responsive when playing.
+            if local_is_playing {
+                self.unchanged_idle_ticks = 0;
+                return POLL_INTERVAL_ACTIVE_MS;
+            }
+            self.unchanged_idle_ticks = self.unchanged_idle_ticks.saturating_add(1);
+            return compute_next_poll_interval_ms(false, false, false, self.unchanged_idle_ticks);
+        };
+
+        let remote_is_playing = st.remote_play_status.eq_ignore_ascii_case("PLAY");
+        let user_count = if st.users.is_empty() {
+            self.last_user_count
+        } else {
+            st.users.len()
+        };
+        let state_changed = !self.initialized
+            || st.remote_song_id != self.last_song_id
+            || st.remote_play_status != self.last_play_status
+            || st.remote_client_seq != self.last_client_seq
+            || st.remote_list_version != self.last_list_version
+            || user_count != self.last_user_count;
+
+        self.initialized = true;
+        self.last_song_id = st.remote_song_id.clone();
+        self.last_play_status = st.remote_play_status.clone();
+        self.last_client_seq = st.remote_client_seq;
+        self.last_list_version = st.remote_list_version;
+        self.last_user_count = user_count;
+
+        if local_is_playing || remote_is_playing || state_changed {
+            self.unchanged_idle_ticks = 0;
+            POLL_INTERVAL_ACTIVE_MS
+        } else {
+            self.unchanged_idle_ticks = self.unchanged_idle_ticks.saturating_add(1);
+            compute_next_poll_interval_ms(false, false, false, self.unchanged_idle_ticks)
+        }
+    }
+
+    /// Determines whether the current poll tick should also query `status/get` for room users:
+    /// every 3rd tick (~2.25s) while active, every 2nd tick (~4-6s) when backed off in idle.
+    #[inline]
+    pub fn should_fetch_users(&self, tick: u64, local_is_playing: bool) -> bool {
+        if local_is_playing || self.unchanged_idle_ticks == 0 {
+            tick % 3 == 0
+        } else {
+            tick % 2 == 0
+        }
+    }
+}

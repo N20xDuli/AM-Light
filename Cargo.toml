@@ -1,6 +1,6 @@
 [package]
 name = "am-light"
-version = "0.2.11"
+version = "0.2.12"
 description = "Apple Music desktop client with native Direct2D UI, synced lyrics, and audio visualizer"
 authors = ["N20xDuli"]
 license = "MIT"
@@ -21,7 +21,7 @@ embed-resource = "3.0"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "gzip", "brotli", "http2", "native-tls-alpn"] }
 tokio = { version = "1", features = ["time", "rt-multi-thread", "sync", "net", "io-util", "macros"] }
 regex = "1"
 base64 = "0.22"
@@ -58,12 +58,16 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_DataExchange",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Ole",
+    "Win32_System_SystemInformation",
     "Win32_System_SystemServices",
     "Win32_System_Threading",
     "Win32_System_Variant",
+    "Win32_System_WinRT",
     "Win32_UI_Controls_Dialogs",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_Ime",

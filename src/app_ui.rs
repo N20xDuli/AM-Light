@@ -8,7 +8,10 @@ use crate::am_api::{self, AuthVerifyResult, EditorialShelf, EditorialShelfKind};
 use crate::audio_viz::{self, AudioOutputDevice, LiveVisualizerSnapshot};
 use crate::backends::{NetEaseQrState, NetEaseQuality, PlaybackBackend, QQQuality, WebAmStatus};
 use crate::binaural_dsp::{self, BinauralConfig, BinauralStatus};
-use crate::d2d_renderer::{D2DRenderer, GlassBtnVariant, SfIcon, TextAlign};
+use crate::d2d_renderer::{
+    D2DRenderer, DirtyFramePlan, GlassBtnVariant, SfIcon, TextAlign, BACKDROP_DIRTY_ALL,
+    BACKDROP_DIRTY_BOTTOM, BACKDROP_DIRTY_TOP,
+};
 use crate::downloads::{self, DownloadsOverview};
 use crate::drm_fix::{self, DrmDiagReport};
 use crate::i18n::{self, AppLanguage};
@@ -18,7 +21,9 @@ use crate::listen_together::{
 };
 use crate::lyrics::{self, NonEmphasisLyricsEffect, ParsedLyrics};
 use crate::lyrics_view::{LyricsHitAction, LyricsViewState};
-use crate::motion_art::MotionArtManager;
+use crate::motion_art::{MotionArtManager, MotionTelemetry, MAX_VIEWPORT_SLOTS};
+use windows::Win32::Graphics::Direct3D11::ID3D11Device;
+use windows::Win32::Media::MediaFoundation::IMFDXGIDeviceManager;
 use crate::native_player;
 use crate::netease_api;
 use crate::qq_api;
@@ -280,6 +285,8 @@ pub struct AppSettings {
     pub user_token: String,
     pub token_cleared_by_user: bool,
     pub use_builtin_service: bool,
+    #[serde(default = "default_true")]
+    pub smtc_publish_enabled: bool,
     #[serde(default)]
     pub playback_backend: PlaybackBackend,
     #[serde(default)]
@@ -366,6 +373,7 @@ impl Default for AppSettings {
             user_token: String::new(),
             token_cleared_by_user: false,
             use_builtin_service: true,
+            smtc_publish_enabled: true,
             playback_backend: PlaybackBackend::AppleMusicNative,
             web_am_hide_window: false,
             netease_cookie: String::new(),
@@ -539,6 +547,33 @@ impl AppSettings {
         }
     }
 
+    /// Fast non-blocking startup loader: reads `settings_v2.json` immediately without scanning
+    /// `%LOCALAPPDATA%\...\INetCache` on the UI thread (official client detection runs asynchronously).
+    pub fn load_fast() -> Self {
+        let mut s = Self::load_from_paths_raw(&Self::config_paths()).unwrap_or_default();
+        s.window_corner_radius = s.window_corner_radius.clamp(0.0, 28.0);
+        s.viz_custom_fps = s.viz_custom_fps.clamp(30, 360);
+        s.lyrics_custom_fps = s.lyrics_custom_fps.clamp(30, 360);
+        s.playback_volume = if s.playback_volume.is_finite() {
+            s.playback_volume.clamp(0.0, 1.0)
+        } else {
+            default_playback_volume()
+        };
+        let mut dirty = false;
+        if !s.liquid_glass_v2_migrated {
+            s.liquid_glass_enabled = true;
+            s.liquid_glass_v2_migrated = true;
+            dirty = true;
+        }
+        am_agent::set_active_storefront(&s.storefront);
+        i18n::set_active_language(s.language);
+        sync_backend_runtime_globals(&s);
+        if dirty {
+            s.save();
+        }
+        s
+    }
+
     pub fn load_with_official() -> (Self, am_api::OfficialClientAccountInfo) {
         let mut s = Self::load_from_paths_raw(&Self::config_paths()).unwrap_or_default();
         s.window_corner_radius = s.window_corner_radius.clamp(0.0, 28.0);
@@ -666,7 +701,7 @@ pub enum ContextMenuTarget {
         title: String,
         subtitle: String,
         artwork_url: Option<String>,
-        tracks: Vec<AgentTrackInput>,
+        tracks: std::sync::Arc<[AgentTrackInput]>,
     },
     NowPlaying,
 }
@@ -703,11 +738,15 @@ pub enum AsyncMsg {
         songs: Vec<AgentTrackInput>,
     },
     RadioLoaded(Vec<MediaCardItem>),
-    SearchResults {
+    SearchDebounceDue {
+        gen: u64,
+    },
+    SearchCompleted {
+        seq: u64,
+        backend: PlaybackBackend,
+        cache_key: String,
         query: String,
-        albums: Vec<MediaCardItem>,
-        playlists: Vec<MediaCardItem>,
-        songs: Vec<AgentTrackInput>,
+        res: Result<SearchCatalogPayload, String>,
     },
     LibraryCardsLoaded {
         backend: PlaybackBackend,
@@ -744,10 +783,20 @@ pub enum AsyncMsg {
         req_key: String,
         url: String,
         hero: bool,
+        req_epoch: u64,
         decoded: crate::d2d_renderer::DecodedArtworkCpu,
     },
     ArtworkFailed {
         req_key: String,
+    },
+    ArtworkCancelled {
+        req_key: String,
+    },
+    OfficialAccountDetected {
+        official: am_api::OfficialClientAccountInfo,
+        legacy_token: Option<String>,
+        legacy_storefront: Option<String>,
+        show_banner: bool,
     },
     SmtcCatalogEnriched {
         meta_key: String,
@@ -756,6 +805,10 @@ pub enum AsyncMsg {
         audio_quality: Option<String>,
         stream_specs: Option<audio_viz::StreamAudioSpecs>,
         validated_with_dur: bool,
+    },
+    SmtcThumbnailBytesReady {
+        track_key: String,
+        bytes: Vec<u8>,
     },
     LyricsFetched {
         key: String,
@@ -793,13 +846,6 @@ pub enum AsyncMsg {
         backend: PlaybackBackend,
         shelves: Vec<EditorialShelf>,
         cards: Vec<MediaCardItem>,
-    },
-    BackendSearchLoaded {
-        backend: PlaybackBackend,
-        query: String,
-        albums: Vec<MediaCardItem>,
-        playlists: Vec<MediaCardItem>,
-        songs: Vec<AgentTrackInput>,
     },
     NetEaseAccountVerified(netease_api::NetEaseAccountInfo),
     NetEaseQrStarted(NetEaseQrState),
@@ -898,6 +944,8 @@ pub enum UiAction {
     FocusSearch,
     ClearSearch,
     SetSearchFilter(u8),
+    RunSearchQuery(String),
+    ClearRecentSearches,
     PlayContainer {
         kind: String,
         id: String,
@@ -933,6 +981,7 @@ pub enum UiAction {
     RefreshCurrentView,
     // Downloads actions
     OpenDownloadsFolder,
+    OpenLogsFolder,
     TogglePauseDownloads(bool),
     RevealDownload(String),
     DeleteDownload(String),
@@ -972,6 +1021,7 @@ pub enum UiAction {
     SetAtmosMode(i64),
     ToggleSoundCheck,
     ToggleCrossfade,
+    ToggleSmtcPublish,
     SelectOutputDevice(String),
     SetVizFpsCap(FpsCap),
     SetLyricsFpsCap(FpsCap),
@@ -1066,10 +1116,26 @@ pub enum UiAction {
     DismissBanner,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct SearchCatalogPayload {
+    pub artists: Vec<MediaCardItem>,
+    pub albums: Vec<MediaCardItem>,
+    pub playlists: Vec<MediaCardItem>,
+    pub songs: Vec<AgentTrackInput>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CachedSearchEntry {
+    pub payload: SearchCatalogPayload,
+    pub fetched_at: Instant,
+    pub last_used: Instant,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum TrackListSource {
     HomeSongs,
     SearchSongs,
+    SearchLocalSongs,
     LibrarySongs,
     DetailTracks,
 }
@@ -1080,9 +1146,35 @@ pub struct HitRegion {
     pub action: UiAction,
 }
 
+/// Tokio runtime wrapper whose `Drop` uses a bounded shutdown timeout (`450ms`) so blocked
+/// background `spawn_blocking` I/O or COM calls can never leave zombie processes on exit.
+pub struct ManagedRuntime(Option<tokio::runtime::Runtime>);
+
+impl ManagedRuntime {
+    pub fn new(rt: tokio::runtime::Runtime) -> Self {
+        Self(Some(rt))
+    }
+}
+
+impl std::ops::Deref for ManagedRuntime {
+    type Target = tokio::runtime::Runtime;
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("ManagedRuntime active before drop")
+    }
+}
+
+impl Drop for ManagedRuntime {
+    fn drop(&mut self) {
+        if let Some(rt) = self.0.take() {
+            rt.shutdown_timeout(std::time::Duration::from_millis(450));
+        }
+    }
+}
+
 pub struct AppUi {
     pub settings: AppSettings,
-    pub rt: tokio::runtime::Runtime,
+    pub rt: ManagedRuntime,
     pub tx: Sender<AsyncMsg>,
     pub rx: Receiver<AsyncMsg>,
     pub wake_hwnd: usize,
@@ -1123,10 +1215,21 @@ pub struct AppUi {
     pub search_sel_anchor: Option<usize>,
     pub search_scroll_x: f32,
     pub search_char_xs: Vec<(usize, f32)>,
+    pub search_char_xs_query: String,
+    pub search_caret_screen_x: f32,
     pub search_last_click_at: Option<Instant>,
-    pub search_filter: u8, // 0=All, 1=Songs, 2=Albums, 3=Playlists
+    pub search_filter: u8, // 0=All, 1=Songs, 2=Artists, 3=Albums, 4=Playlists
     pub last_search_typed: Option<Instant>,
     pub last_dispatched_query: String,
+    pub search_loading: bool,
+    pub search_error: Option<String>,
+    pub search_req_seq: u64,
+    pub search_completed_query: String,
+    pub search_recent_queries: Vec<String>,
+    pub search_cache: HashMap<String, CachedSearchEntry>,
+    search_debounce_gen: u64,
+    search_debounce_abort: Option<tokio::task::AbortHandle>,
+    search_task_abort: Option<tokio::task::AbortHandle>,
 
     // Data Caches
     pub home_albums: Vec<MediaCardItem>,
@@ -1136,19 +1239,34 @@ pub struct AppUi {
     pub home_shelves: Vec<EditorialShelf>,
     pub browse_shelves: Vec<EditorialShelf>,
     pub radio_shelves: Vec<EditorialShelf>,
+    pub search_artists: Vec<MediaCardItem>,
     pub search_albums: Vec<MediaCardItem>,
     pub search_playlists: Vec<MediaCardItem>,
     pub search_songs: Vec<AgentTrackInput>,
+    pub search_local_cards: Vec<MediaCardItem>,
+    pub search_local_songs: Vec<AgentTrackInput>,
     pub lib_cards: HashMap<String, Vec<MediaCardItem>>,
     pub lib_songs: Vec<AgentTrackInput>,
     pub sidebar_playlists: Vec<MediaCardItem>,
     pub detail_data: Option<ContainerDetailData>,
     pub detail_loading: bool,
+    home_shelves_rev: u64,
+    browse_shelves_rev: u64,
+    radio_shelves_rev: u64,
+    home_fallback_rev: u64,
+    radio_cards_rev: u64,
+    detail_data_rev: u64,
+    lib_cards_rev: u64,
+    lib_songs_rev: u64,
+    search_results_rev: u64,
+    downloads_rev: u64,
+    detail_task_abort: Option<tokio::task::AbortHandle>,
+    track_motion_task_abort: Option<(String, tokio::task::AbortHandle)>,
     home_in_flight: std::sync::Arc<std::sync::atomic::AtomicU32>,
     browse_in_flight: std::sync::Arc<std::sync::atomic::AtomicU32>,
     radio_in_flight: std::sync::Arc<std::sync::atomic::AtomicU32>,
     lib_in_flight: HashMap<&'static str, std::sync::Arc<std::sync::atomic::AtomicU32>>,
-    pub detail_mem_cache: HashMap<String, (ContainerDetailData, Instant)>,
+    pub detail_mem_cache: HashMap<String, (std::sync::Arc<ContainerDetailData>, Instant)>,
     pub lib_route_fetched_at: HashMap<String, Instant>,
     detail_mem_lru: HashMap<String, u64>,
     detail_mem_lru_seq: u64,
@@ -1191,9 +1309,31 @@ pub struct AppUi {
     // Pending artwork downloads & catalog enrichment caches
     pending_art: HashSet<String>,
     failed_art: HashSet<String>,
+    art_attempted_dims: HashMap<String, u32>,
     art_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pending_art_uploads: std::collections::VecDeque<(
+        String,
+        String,
+        bool,
+        u64,
+        crate::d2d_renderer::DecodedArtworkCpu,
+    )>,
     enriched_adam_ids: HashSet<String>,
     smtc_catalog_cache: HashMap<String, CachedSmtcEnrichment>,
+
+    // Debounced async disk writers (eliminates blocking FlushFileBuffers on UI thread & 17x startup write storm!)
+    settings_save_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    settings_dirty: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pending_settings_disk: std::sync::Arc<std::sync::Mutex<Option<AppSettings>>>,
+    playlist_cache_save_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    playlist_cache_dirty: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pending_playlist_cache_disk: std::sync::Arc<std::sync::Mutex<Option<PlaylistDiskCache>>>,
+
+    // Cached active queue slice (O(1) Arc clone instead of per-frame Vec<AgentTrackInput> deep clone!)
+    play_next_queue_ver: u64,
+    cached_queue_sig: (u8, u64, u64, usize, u64),
+    cached_queue_tracks: std::sync::Arc<[AgentTrackInput]>,
+    last_home_scroll_at: Instant,
 
     // Transient feedback banner & click-to-play buffering state
     pub banner_text: Option<(String, bool, Instant)>,
@@ -1205,6 +1345,7 @@ pub struct AppUi {
     pub last_agent_seq: u64,
     last_smtc_event_seq: u64,
     smtc_event_pull_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    smtc_pub_thumb_key: String,
     pub spinner_phase: f32,
     pub is_window_maximized: bool,
     pub is_window_focused: bool,
@@ -1240,8 +1381,31 @@ pub struct AppUi {
     pub last_win_w: f32,
     motion_art: MotionArtManager,
     visible_home_motion_urls: Vec<String>,
+    visible_home_motion_targets: Vec<(String, u32)>,
+    prefetch_home_motion_targets: Vec<(String, u32)>,
+    rendered_home_motion_urls: Vec<String>,
+    rendered_home_motion_cards: Vec<(String, RectF)>,
+    motion_fade_alphas: HashMap<String, f32>,
+    visited_motion_fade_urls: HashSet<String>,
+    detail_motion_fade: (String, f32),
+    has_settling_motion_fade: bool,
     track_motion_urls: HashMap<String, Option<String>>,
     pending_motion_tracks: HashSet<String>,
+    last_lyrics_motion_url: Option<String>,
+    last_detail_motion_url: Option<String>,
+    last_rendered_motion_seq: u64,
+    last_card_motion_seqs: HashMap<String, u64>,
+    drawn_home_motion_seqs: HashMap<String, u64>,
+    last_progress_pixel_bucket: i32,
+    last_progress_sec_bucket: i32,
+    home_eq_cadence_accum_sec: f32,
+    last_sidebar_eq_rect: Option<RectF>,
+    last_visible_playing_row_rect: Option<RectF>,
+    last_detail_hero_rect: Option<RectF>,
+    last_home_scene_fp: u64,
+    settled_home_baseline_valid: bool,
+    last_dirty_plan: DirtyFramePlan,
+    cadence_stats: CadenceStats,
     pub update_checking: bool,
     pub update_status_msg: Option<String>,
     pub update_latest_url: Option<String>,
@@ -1250,7 +1414,7 @@ pub struct AppUi {
     pub playlist_cache: PlaylistDiskCache,
     pub playlist_diff_anim: Option<PlaylistDiffAnimState>,
     pub top_bar_guard_spring: lyrics::Spring1D,
-    playlist_sync_in_flight: bool,
+    playlist_sync_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub drm_diag: DrmDiagReport,
     pub drm_repair_running: bool,
     pub detail_req_seq: u64,
@@ -1283,6 +1447,34 @@ pub struct AppUi {
     queue_popover_open_spring: lyrics::Spring1D,
     more_popover_open_spring: lyrics::Spring1D,
     lt_modal_open_spring: lyrics::Spring1D,
+    backdrop_fp: BackdropFingerprint,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CadenceStats {
+    pub home_full_redraw_count: u64,
+    pub home_video_frame_present_count: u64,
+    pub home_non_video_playing_redraws: u64,
+    pub home_dirty_rect_frames: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+struct BackdropFingerprint {
+    valid: bool,
+    width_px: u32,
+    height_px: u32,
+    dpi_bits: u32,
+    route_hash: u64,
+    scroll_y_bits: u32,
+    sb_layout_w_bits: u32,
+    trans_dy_bits: u32,
+    tb_guard_bits: u32,
+    content_hash: u64,
+    hover_hash: u64,
+    motion_top_hash: u64,
+    motion_bottom_hash: u64,
+    eq_top_hash: u64,
+    eq_bottom_hash: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -1435,10 +1627,41 @@ impl CachedPlaylistDetail {
     }
 }
 
+/// `Arc`-backed serde-transparent wrapper around `CachedPlaylistDetail` so cloning
+/// `PlaylistDiskCache` for debounced async disk writes bumps at most 64 refcounts (<20 µs)
+/// instead of deep-cloning tens of thousands of `AgentTrackInput`s on the UI thread, while
+/// keeping `playlists_cache_v1.json` 100% backwards-compatible.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SharedPlaylistDetail(pub std::sync::Arc<CachedPlaylistDetail>);
+
+impl std::ops::Deref for SharedPlaylistDetail {
+    type Target = CachedPlaylistDetail;
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Serialize for SharedPlaylistDetail {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.as_ref().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SharedPlaylistDetail {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        CachedPlaylistDetail::deserialize(deserializer).map(|d| Self(std::sync::Arc::new(d)))
+    }
+}
+
+pub const PLAYLIST_CACHE_SCHEMA_VERSION: u32 = 3;
+
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
 pub struct PlaylistDiskCache {
+    #[serde(default)]
+    pub schema_version: u32,
     pub sidebar_playlists: Vec<CachedPlaylistSummary>,
-    pub details: HashMap<String, CachedPlaylistDetail>,
+    pub details: HashMap<String, SharedPlaylistDetail>,
     pub last_sync_unix_sec: u64,
 }
 
@@ -1472,7 +1695,9 @@ impl PlaylistDiskCache {
     pub fn upsert_detail(&mut self, detail: &ContainerDetailData, now_unix: u64) {
         self.details.insert(
             detail.id.clone(),
-            CachedPlaylistDetail::from_detail(detail, now_unix),
+            SharedPlaylistDetail(std::sync::Arc::new(CachedPlaylistDetail::from_detail(
+                detail, now_unix,
+            ))),
         );
         if self.details.len() > 64 {
             let mut ages: Vec<(String, u64)> = self
@@ -1486,6 +1711,7 @@ impl PlaylistDiskCache {
                 self.details.remove(&old_k);
             }
         }
+        self.schema_version = PLAYLIST_CACHE_SCHEMA_VERSION;
         self.last_sync_unix_sec = now_unix;
     }
 
@@ -1494,6 +1720,7 @@ impl PlaylistDiskCache {
             .iter()
             .map(CachedPlaylistSummary::from_card)
             .collect();
+        self.schema_version = PLAYLIST_CACHE_SCHEMA_VERSION;
         self.last_sync_unix_sec = now_unix;
     }
 }
@@ -1651,18 +1878,24 @@ impl AppUi {
                 am_api::OfficialClientAccountInfo::default(),
             )
         } else {
-            AppSettings::load_with_official()
+            (
+                AppSettings::load_fast(),
+                am_api::OfficialClientAccountInfo::default(),
+            )
         };
         // Avoid auto-connecting AMPLibraryAgent on External SMTC lookups unless built-in playback is active/loading
         lyrics::set_builtin_agent_lyrics_enabled(false);
-        // Compact 2-worker + max-4 blocking pool with 512 KB stacks keeps thread memory minimal!
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .max_blocking_threads(4)
-            .thread_stack_size(512 * 1024)
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
+        // 2-worker + max-16 blocking pool with 2 MB virtual stacks (Windows lazily commits stack pages
+        // on demand -> zero extra RAM unless needed, while preventing WIC/SMTC/COM/TLS pool starvation!)
+        let rt = ManagedRuntime::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .max_blocking_threads(16)
+                .thread_stack_size(2 * 1024 * 1024)
+                .enable_all()
+                .build()
+                .expect("tokio runtime"),
+        );
         let (tx, rx) = mpsc::channel();
 
         let mut viz_state = VisualizerState::default();
@@ -1761,10 +1994,21 @@ impl AppUi {
             search_sel_anchor: None,
             search_scroll_x: 0.0,
             search_char_xs: vec![(0, 0.0)],
+            search_char_xs_query: String::new(),
+            search_caret_screen_x: 0.0,
             search_last_click_at: None,
             search_filter: 0,
             last_search_typed: None,
             last_dispatched_query: String::new(),
+            search_loading: false,
+            search_error: None,
+            search_req_seq: 0,
+            search_completed_query: String::new(),
+            search_recent_queries: Vec::new(),
+            search_cache: HashMap::with_capacity(32),
+            search_debounce_gen: 0,
+            search_debounce_abort: None,
+            search_task_abort: None,
             home_albums: Vec::new(),
             home_playlists: Vec::new(),
             home_songs: Vec::new(),
@@ -1772,14 +2016,29 @@ impl AppUi {
             home_shelves: Vec::new(),
             browse_shelves: Vec::new(),
             radio_shelves: Vec::new(),
+            search_artists: Vec::new(),
             search_albums: Vec::new(),
             search_playlists: Vec::new(),
             search_songs: Vec::new(),
+            search_local_cards: Vec::new(),
+            search_local_songs: Vec::new(),
             lib_cards: HashMap::new(),
             lib_songs: Vec::new(),
             sidebar_playlists: initial_sidebar_pls,
             detail_data: None,
             detail_loading: false,
+            home_shelves_rev: 0,
+            browse_shelves_rev: 0,
+            radio_shelves_rev: 0,
+            home_fallback_rev: 0,
+            radio_cards_rev: 0,
+            detail_data_rev: 0,
+            lib_cards_rev: 0,
+            lib_songs_rev: 0,
+            search_results_rev: 0,
+            downloads_rev: 0,
+            detail_task_abort: None,
+            track_motion_task_abort: None,
             home_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             browse_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             radio_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -1833,9 +2092,21 @@ impl AppUi {
             token_box_rect: RectF::default(),
             pending_art: HashSet::new(),
             failed_art: HashSet::new(),
+            art_attempted_dims: HashMap::with_capacity(64),
             art_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            pending_art_uploads: std::collections::VecDeque::with_capacity(16),
             enriched_adam_ids: HashSet::new(),
             smtc_catalog_cache: HashMap::new(),
+            settings_save_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            settings_dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            pending_settings_disk: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            playlist_cache_save_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            playlist_cache_dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            pending_playlist_cache_disk: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            play_next_queue_ver: 0,
+            cached_queue_sig: (u8::MAX, 0, 0, 0, 0),
+            cached_queue_tracks: std::sync::Arc::from(Vec::<AgentTrackInput>::new()),
+            last_home_scroll_at: now - std::time::Duration::from_secs(10),
             banner_text: None,
             playback_loading: false,
             playback_loading_started: None,
@@ -1847,6 +2118,7 @@ impl AppUi {
             smtc_event_pull_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 false,
             )),
+            smtc_pub_thumb_key: String::new(),
             spinner_phase: 0.0,
             is_window_maximized: false,
             is_window_focused: true,
@@ -1877,9 +2149,32 @@ impl AppUi {
             narrow_sidebar_overlay_open: false,
             last_win_w: 1280.0,
             motion_art: MotionArtManager::new(),
-            visible_home_motion_urls: Vec::with_capacity(4),
+            visible_home_motion_urls: Vec::with_capacity(MAX_VIEWPORT_SLOTS),
+            visible_home_motion_targets: Vec::with_capacity(MAX_VIEWPORT_SLOTS),
+            prefetch_home_motion_targets: Vec::with_capacity(32),
+            rendered_home_motion_urls: Vec::with_capacity(MAX_VIEWPORT_SLOTS),
+            rendered_home_motion_cards: Vec::with_capacity(MAX_VIEWPORT_SLOTS),
+            motion_fade_alphas: HashMap::with_capacity(28),
+            visited_motion_fade_urls: HashSet::with_capacity(28),
+            detail_motion_fade: (String::new(), 0.0),
+            has_settling_motion_fade: false,
             track_motion_urls: HashMap::with_capacity(16),
             pending_motion_tracks: HashSet::with_capacity(16),
+            last_lyrics_motion_url: None,
+            last_detail_motion_url: None,
+            last_rendered_motion_seq: 0,
+            last_card_motion_seqs: HashMap::with_capacity(28),
+            drawn_home_motion_seqs: HashMap::with_capacity(28),
+            last_progress_pixel_bucket: -1,
+            last_progress_sec_bucket: -1,
+            home_eq_cadence_accum_sec: 0.0,
+            last_sidebar_eq_rect: None,
+            last_visible_playing_row_rect: None,
+            last_detail_hero_rect: None,
+            last_home_scene_fp: 0,
+            settled_home_baseline_valid: false,
+            last_dirty_plan: DirtyFramePlan::default(),
+            cadence_stats: CadenceStats::default(),
             update_checking: false,
             update_status_msg: None,
             update_latest_url: None,
@@ -1888,7 +2183,7 @@ impl AppUi {
             playlist_cache,
             playlist_diff_anim: None,
             top_bar_guard_spring: lyrics::Spring1D::new(0.0, 1.0, 210.0, 29.0),
-            playlist_sync_in_flight: false,
+            playlist_sync_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             drm_diag: DrmDiagReport::default(),
             drm_repair_running: false,
             detail_req_seq: 0,
@@ -1919,6 +2214,7 @@ impl AppUi {
             queue_popover_open_spring: lyrics::Spring1D::new(1.0, 1.0, 340.0, 27.0),
             more_popover_open_spring: lyrics::Spring1D::new(1.0, 1.0, 340.0, 27.0),
             lt_modal_open_spring: lyrics::Spring1D::new(1.0, 1.0, 320.0, 26.5),
+            backdrop_fp: BackdropFingerprint::default(),
         };
 
         if wake_hwnd != 0 {
@@ -1939,7 +2235,9 @@ impl AppUi {
                             let _ = tx_i.send(AsyncMsg::PlaybackUpdated(st));
                         }
                         Err(e) => {
-                            let _ = tx_i.send(AsyncMsg::BannerError(e));
+                            if !native_player::is_download_cancelled_err(&e) {
+                                let _ = tx_i.send(AsyncMsg::BannerError(e));
+                            }
                         }
                     }
                     Self::post_ui_wake(hwnd_i);
@@ -1974,18 +2272,110 @@ impl AppUi {
     }
 
     /// Updates active runtime globals immediately and persists `settings_v2.json` atomically to disk
-    /// (guarded on `wake_hwnd != 0` so unit tests running with `AppUi::new(0)` NEVER overwrite or wipe
-    /// the real user's saved NetEase/QQ/Apple credentials in `%APPDATA%\AMLight\settings_v2.json`!).
+    /// via a coalesced 250ms background debounce (eliminates ~7ms synchronous `FlushFileBuffers` UI
+    /// stalls on clicks & volume drags!). Guarded on `wake_hwnd != 0` so unit tests NEVER overwrite
+    /// the real user's saved NetEase/QQ/Apple credentials in `%APPDATA%\AMLight\settings_v2.json`!
     pub fn save_settings(&self) {
         am_agent::set_active_storefront(&self.settings.storefront);
         i18n::set_active_language(self.settings.language);
         sync_backend_runtime_globals(&self.settings);
-        if self.wake_hwnd != 0 {
-            self.settings.save();
+        if self.wake_hwnd == 0 {
+            return;
+        }
+        let gen = self
+            .settings_save_gen
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1;
+        if let Ok(mut guard) = self.pending_settings_disk.lock() {
+            *guard = Some(self.settings.clone());
+        }
+        self.settings_dirty
+            .store(true, std::sync::atomic::Ordering::Release);
+        let gen_arc = std::sync::Arc::clone(&self.settings_save_gen);
+        let dirty_arc = std::sync::Arc::clone(&self.settings_dirty);
+        let snap_arc = std::sync::Arc::clone(&self.pending_settings_disk);
+        self.rt.spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            if gen_arc.load(std::sync::atomic::Ordering::Acquire) != gen {
+                return;
+            }
+            if !dirty_arc.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                return;
+            }
+            let to_write = snap_arc.lock().ok().and_then(|mut g| g.take());
+            if let Some(cfg) = to_write {
+                let _ = tokio::task::spawn_blocking(move || {
+                    cfg.save();
+                })
+                .await;
+            }
+        });
+    }
+
+    /// Synchronously flushes any debounced `settings_v2.json` and `playlist_cache` writes before window exit
+    /// so closing the app immediately after changing a setting or signing in NEVER loses data!
+    pub fn flush_pending_disk_writes_sync(&self) {
+        if self.wake_hwnd == 0 {
+            return;
+        }
+        if self
+            .settings_dirty
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            let to_write = self
+                .pending_settings_disk
+                .lock()
+                .ok()
+                .and_then(|mut g| g.take())
+                .unwrap_or_else(|| self.settings.clone());
+            to_write.save();
+        }
+        if self
+            .playlist_cache_dirty
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            if let Some(path) = PlaylistDiskCache::cache_path() {
+                let to_write = self
+                    .pending_playlist_cache_disk
+                    .lock()
+                    .ok()
+                    .and_then(|mut g| g.take())
+                    .unwrap_or_else(|| self.playlist_cache.clone());
+                to_write.save_to_path(&path);
+            }
         }
     }
 
     pub fn fetch_initial_data(&mut self) {
+        // Detect official Apple Music desktop account & legacy credentials asynchronously
+        // off the UI thread so cold start never blocks on `%LOCALAPPDATA%\...\INetCache` walks!
+        if self.wake_hwnd != 0 {
+            let need_legacy = self.settings.user_token.is_empty() && !self.settings.token_cleared_by_user;
+            let tx_off = self.tx.clone();
+            let hwnd_off = self.wake_hwnd;
+            self.rt.spawn(async move {
+                let (official, legacy_token, legacy_storefront) =
+                    tokio::task::spawn_blocking(move || {
+                        let off = am_api::detect_official_am_account();
+                        let (ltok, lsf) = if need_legacy {
+                            let leg = am_api::import_legacy_amlight_credentials();
+                            (leg.user_token, leg.storefront)
+                        } else {
+                            (None, None)
+                        };
+                        (off, ltok, lsf)
+                    })
+                    .await
+                    .unwrap_or_default();
+                let _ = tx_off.send(AsyncMsg::OfficialAccountDetected {
+                    official,
+                    legacy_token,
+                    legacy_storefront,
+                    show_banner: false,
+                });
+                Self::post_ui_wake(hwnd_off);
+            });
+        }
         self.fetch_home_charts();
         self.refresh_devices_and_prefs(false);
         self.refresh_drm_health_async(false);
@@ -2036,7 +2426,9 @@ impl AppUi {
                     let polled = web_am_player::poll_playback_state()
                         .await
                         .unwrap_or_else(|_| web_am_player::get_playback_state());
-                    let _ = tx.send(AsyncMsg::WebAmStatusUpdated(web_am_player::get_status()));
+                    if let Some(ws) = web_am_player::take_status_if_changed() {
+                        let _ = tx.send(AsyncMsg::WebAmStatusUpdated(ws));
+                    }
                     polled
                 } else {
                     tokio::task::spawn_blocking(unified_playback_snapshot)
@@ -2057,14 +2449,23 @@ impl AppUi {
     }
 
     pub fn update_viz_subscription(&self) {
-        // Subscribe WASAPI loopback when on the Visualizer page OR when playing with
-        // real-time 5-bar spectrum icon enabled (ultra-lightweight 512-pt FFT, stops immediately on pause!).
+        // 3-tier WASAPI loopback subscription:
+        // - FullVisualizer (2): on Visualizer page (full forensic FFT + TempoTracker + audio sessions).
+        // - MiniBars5 (1): playing on browsing pages with 5-bar spectrum icon enabled (ring buffer only, 90x-135x lighter!).
+        // - Off (0): paused or Lyrics overlay open (0% CPU Condvar sleep).
         let on_viz = self.route == PageRoute::Visualizer && !self.show_lyrics_overlay;
         let want_icon_fft = self.settings.live_eq_icon_spectrum
             && !self.settings.reduce_motion
             && self.smtc.status == "Playing"
             && !self.show_lyrics_overlay;
-        audio_viz::set_viz_subscribed(on_viz || want_icon_fft);
+        let mode = if on_viz {
+            audio_viz::VizSubMode::FullVisualizer
+        } else if want_icon_fft {
+            audio_viz::VizSubMode::MiniBars5
+        } else {
+            audio_viz::VizSubMode::Off
+        };
+        audio_viz::set_viz_sub_mode(mode);
     }
 
     pub fn on_window_maximize_toggled(&mut self, going_maximized: bool) {
@@ -2164,6 +2565,731 @@ impl AppUi {
             || (self.route == PageRoute::Settings && !self.show_lyrics_overlay)
     }
 
+    pub fn attach_dxgi_device_manager(
+        &mut self,
+        mgr: Option<IMFDXGIDeviceManager>,
+        d3d_dev: Option<ID3D11Device>,
+    ) {
+        self.motion_art.set_dxgi_device_manager(mgr, d3d_dev);
+    }
+
+    pub fn cadence_stats(&self) -> CadenceStats {
+        self.cadence_stats
+    }
+
+    pub fn reset_cadence_stats(&mut self) {
+        self.cadence_stats = CadenceStats::default();
+    }
+
+    pub fn motion_telemetry(&self) -> MotionTelemetry {
+        self.motion_art.telemetry_snapshot()
+    }
+
+    /// Returns `true` when Apple Music editorial motion cover artwork may be fetched/shown
+    /// for the currently playing track (Apple Music backends, or External SMTC with a
+    /// verified numeric Apple Music catalog `adam_id` — NEVER for NetEase or QQ Music!).
+    fn can_use_track_motion_artwork(&self) -> bool {
+        if self.settings.playback_backend.supports_motion_artwork() {
+            return true;
+        }
+        self.settings.playback_backend == PlaybackBackend::ExternalSmtc
+            && self
+                .smtc
+                .adam_id
+                .as_deref()
+                .is_some_and(|a| !a.is_empty() && a.chars().all(|c| c.is_ascii_digit()))
+    }
+
+    pub fn motion_art_manager(&self) -> &MotionArtManager {
+        &self.motion_art
+    }
+
+    pub fn visible_home_motion_urls(&self) -> &[String] {
+        &self.visible_home_motion_urls
+    }
+
+    pub fn visible_home_motion_targets(&self) -> &[(String, u32)] {
+        &self.visible_home_motion_targets
+    }
+
+    pub fn prefetch_home_motion_targets(&self) -> &[(String, u32)] {
+        &self.prefetch_home_motion_targets
+    }
+
+    pub fn active_motion_slot_urls(&self) -> Vec<String> {
+        self.motion_art.active_slot_urls()
+    }
+
+    pub fn motion_crossfade_alpha(&self, url: &str) -> f32 {
+        let raw = self.motion_fade_alphas.get(url).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+        raw * raw * (3.0 - 2.0 * raw)
+    }
+
+    pub fn last_dirty_plan(&self) -> &DirtyFramePlan {
+        &self.last_dirty_plan
+    }
+
+    pub fn rendered_home_motion_urls(&self) -> &[String] {
+        &self.rendered_home_motion_urls
+    }
+
+    pub fn rendered_home_motion_cards(&self) -> &[(String, RectF)] {
+        &self.rendered_home_motion_cards
+    }
+
+    /// Advances a Home motion cover's 180 ms opacity crossfade (`0.0 -> 1.0`) and returns smoothstep alpha.
+    fn advance_motion_crossfade(&mut self, url: &str) -> f32 {
+        self.visited_motion_fade_urls.insert(url.to_string());
+        if self.settings.reduce_motion {
+            self.motion_fade_alphas.insert(url.to_string(), 1.0);
+            return 1.0;
+        }
+        let step = (self.frame_dt / 0.18).clamp(0.005, 1.0);
+        let next = if let Some(v) = self.motion_fade_alphas.get_mut(url) {
+            *v = (*v + step).min(1.0);
+            *v
+        } else {
+            self.motion_fade_alphas.insert(url.to_string(), step);
+            step
+        };
+        if next < 0.995 {
+            self.has_settling_motion_fade = true;
+        }
+        next * next * (3.0 - 2.0 * next)
+    }
+
+    /// Advances the Container Detail hero motion cover's 180 ms opacity crossfade (`0.0 -> 1.0`).
+    fn advance_detail_motion_crossfade(&mut self, url: &str) -> f32 {
+        if self.settings.reduce_motion {
+            self.detail_motion_fade = (url.to_string(), 1.0);
+            return 1.0;
+        }
+        let step = (self.frame_dt / 0.18).clamp(0.005, 1.0);
+        let next = if self.detail_motion_fade.0 == url {
+            self.detail_motion_fade.1 = (self.detail_motion_fade.1 + step).min(1.0);
+            self.detail_motion_fade.1
+        } else {
+            self.detail_motion_fade = (url.to_string(), step);
+            step
+        };
+        if next < 0.995 {
+            self.has_settling_motion_fade = true;
+        }
+        next * next * (3.0 - 2.0 * next)
+    }
+
+    #[inline]
+    fn hash_shelves_o1<H: std::hash::Hasher>(shelves: &[EditorialShelf], rev: u64, h: &mut H) {
+        use std::hash::Hash;
+        rev.hash(h);
+        shelves.len().hash(h);
+        (shelves.as_ptr() as usize).hash(h);
+        if let Some(first) = shelves.first() {
+            first.title.len().hash(h);
+            (first.title.as_ptr() as usize).hash(h);
+            first.subtitle.len().hash(h);
+            std::mem::discriminant(&first.kind).hash(h);
+            first.items.len().hash(h);
+            (first.items.as_ptr() as usize).hash(h);
+            if let Some(it) = first.items.first() {
+                it.id.len().hash(h);
+                (it.id.as_ptr() as usize).hash(h);
+                it.title.len().hash(h);
+                it.motion_video_url.is_some().hash(h);
+                it.motion_tall_video_url.is_some().hash(h);
+            }
+            if let Some(it) = first.items.last() {
+                it.id.len().hash(h);
+                (it.id.as_ptr() as usize).hash(h);
+                it.title.len().hash(h);
+            }
+        }
+        if shelves.len() > 1 {
+            if let Some(last) = shelves.last() {
+                last.title.len().hash(h);
+                (last.title.as_ptr() as usize).hash(h);
+                std::mem::discriminant(&last.kind).hash(h);
+                last.items.len().hash(h);
+                (last.items.as_ptr() as usize).hash(h);
+                if let Some(it) = last.items.last() {
+                    it.id.len().hash(h);
+                    (it.id.as_ptr() as usize).hash(h);
+                    it.title.len().hash(h);
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn hash_track_meta_o1<H: std::hash::Hasher>(t: &AgentTrackInput, h: &mut H) {
+        use std::hash::Hash;
+        (t.id.as_ptr() as usize).hash(h);
+        t.id.len().hash(h);
+        (t.name.as_ptr() as usize).hash(h);
+        t.name.len().hash(h);
+        t.name.as_bytes().first().copied().hash(h);
+        t.name.as_bytes().last().copied().hash(h);
+        (t.artist_name.as_ptr() as usize).hash(h);
+        t.artist_name.len().hash(h);
+        t.artwork_url
+            .as_ref()
+            .map(|s| (s.as_ptr() as usize, s.len()))
+            .hash(h);
+    }
+
+    #[inline]
+    fn hash_tracks_o1<H: std::hash::Hasher>(
+        tracks: &[AgentTrackInput],
+        rev: u64,
+        scroll_y: f32,
+        win_h: f32,
+        h: &mut H,
+    ) {
+        use std::hash::Hash;
+        rev.hash(h);
+        tracks.len().hash(h);
+        (tracks.as_ptr() as usize).hash(h);
+        if let Some(first) = tracks.first() {
+            Self::hash_track_meta_o1(first, h);
+        }
+        if tracks.len() > 1 {
+            if let Some(last) = tracks.last() {
+                Self::hash_track_meta_o1(last, h);
+            }
+        }
+        if !tracks.is_empty() {
+            // Bounded visible viewport window (<= 36 rows, strictly O(1) even on 10,000-track playlists,
+            // zero full-string SipHash!) so in-place mutations of visible tracks always refresh glass!
+            let row_h = Theme::TRACK_ROW_HEIGHT.max(1.0);
+            let lo = ((scroll_y - 420.0) / row_h).floor().max(0.0) as usize;
+            let raw_hi = (((scroll_y + win_h + 220.0) / row_h).ceil().max(0.0) as usize)
+                .min(tracks.len());
+            let start = lo.min(tracks.len());
+            let end = raw_hi.min(start.saturating_add(36));
+            for t in &tracks[start..end] {
+                Self::hash_track_meta_o1(t, h);
+            }
+        }
+    }
+
+    #[inline]
+    fn hash_card_meta_o1<H: std::hash::Hasher>(c: &MediaCardItem, h: &mut H) {
+        use std::hash::Hash;
+        (c.id.as_ptr() as usize).hash(h);
+        c.id.len().hash(h);
+        (c.title.as_ptr() as usize).hash(h);
+        c.title.len().hash(h);
+        c.artwork_url
+            .as_ref()
+            .map(|s| (s.as_ptr() as usize, s.len()))
+            .hash(h);
+    }
+
+    #[inline]
+    fn hash_cards_o1<H: std::hash::Hasher>(
+        cards: &[MediaCardItem],
+        rev: u64,
+        scroll_y: f32,
+        win_h: f32,
+        h: &mut H,
+    ) {
+        use std::hash::Hash;
+        rev.hash(h);
+        cards.len().hash(h);
+        (cards.as_ptr() as usize).hash(h);
+        if let Some(first) = cards.first() {
+            Self::hash_card_meta_o1(first, h);
+        }
+        if cards.len() > 1 {
+            if let Some(last) = cards.last() {
+                Self::hash_card_meta_o1(last, h);
+            }
+        }
+        if !cards.is_empty() {
+            let lo = (((scroll_y - 480.0) / 240.0).floor().max(0.0) as usize * 2)
+                .min(cards.len());
+            let raw_hi = ((((scroll_y + win_h + 320.0) / 180.0).ceil().max(0.0) as usize) * 5)
+                .min(cards.len());
+            let end = raw_hi.min(lo.saturating_add(28));
+            for c in &cards[lo..end] {
+                Self::hash_card_meta_o1(c, h);
+            }
+        }
+    }
+
+    /// Exposes O(1) content revision counters `(home_shelves_rev, detail_data_rev, lib_cards_rev, search_results_rev)`
+    /// for performance regression verification.
+    pub fn content_revision_snapshot(&self) -> (u64, u64, u64, u64) {
+        (
+            self.home_shelves_rev,
+            self.detail_data_rev,
+            self.lib_cards_rev,
+            self.search_results_rev,
+        )
+    }
+
+    /// Fast O(1) pre-draw fingerprint of Home UI state excluding motion video frame sequences,
+    /// MiniPlayer playback progress position, and EQ bar amplitudes.
+    fn compute_home_settled_scene_fp(
+        &self,
+        r: &D2DRenderer,
+        sb_layout_w: f32,
+        tb_guard_a: f32,
+    ) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut h = DefaultHasher::new();
+        r.width_px.hash(&mut h);
+        r.height_px.hash(&mut h);
+        r.dpi_scale.to_bits().hash(&mut h);
+        self.is_window_maximized.hash(&mut h);
+        self.is_window_focused.hash(&mut h);
+        self.scroll_y.to_bits().hash(&mut h);
+        self.sidebar_scroll_y.to_bits().hash(&mut h);
+        sb_layout_w.to_bits().hash(&mut h);
+        ((tb_guard_a.clamp(0.0, 1.0) * 255.0).round() as u32).hash(&mut h);
+        self.mouse_pos.0.to_bits().hash(&mut h);
+        self.mouse_pos.1.to_bits().hash(&mut h);
+        self.mouse_down.hash(&mut h);
+        let mut hover_fold = self.hover_alphas.len() as u64;
+        for (&k, &v) in &self.hover_alphas {
+            let q = (v.clamp(0.0, 1.0) * 255.0).round() as u64;
+            hover_fold ^= k.rotate_left((q & 31) as u32) ^ (q << 40);
+        }
+        hover_fold.hash(&mut h);
+        self.smtc.status.hash(&mut h);
+        self.smtc.title.hash(&mut h);
+        self.smtc.artist.hash(&mut h);
+        self.smtc.artwork_url.hash(&mut h);
+        self.smtc.adam_id.hash(&mut h);
+        self.smtc.duration_sec.to_bits().hash(&mut h);
+        self.shuffle_on.hash(&mut h);
+        self.repeat_on.hash(&mut h);
+        self.search_focused.hash(&mut h);
+        self.search_query.hash(&mut h);
+        self.search_cursor.hash(&mut h);
+        self.search_sel_anchor.hash(&mut h);
+        self.sidebar_edit_mode.hash(&mut h);
+        self.sec_library_open.hash(&mut h);
+        self.sec_playlists_open.hash(&mut h);
+        self.sidebar_playlists.len().hash(&mut h);
+        self.settings.hidden_sidebar_keys.hash(&mut h);
+        self.settings.liquid_glass_enabled.hash(&mut h);
+        self.settings.reduce_transparency.hash(&mut h);
+        self.settings.reduce_motion.hash(&mut h);
+        self.settings.motion_artwork_enabled.hash(&mut h);
+        self.settings.live_eq_icon_spectrum.hash(&mut h);
+        self.settings.window_corner_radius.to_bits().hash(&mut h);
+        self.settings.language.hash(&mut h);
+        backend_to_u8(self.settings.playback_backend).hash(&mut h);
+        self.nav_history.is_empty().hash(&mut h);
+        self.listen_together.in_room.hash(&mut h);
+        self.listen_together.room_id.hash(&mut h);
+        self.listen_together.users.len().hash(&mut h);
+        for c in &self.lyrics_view.smooth_palette[..2] {
+            c.r.to_bits().hash(&mut h);
+            c.g.to_bits().hash(&mut h);
+            c.b.to_bits().hash(&mut h);
+        }
+        Self::hash_shelves_o1(&self.home_shelves, self.home_shelves_rev, &mut h);
+        self.home_fallback_rev.hash(&mut h);
+        self.home_playlists.len().hash(&mut h);
+        self.home_albums.len().hash(&mut h);
+        self.home_songs.len().hash(&mut h);
+        h.finish()
+    }
+
+    fn compute_backdrop_dirty_mask(
+        &mut self,
+        r: &D2DRenderer,
+        sb_layout_w: f32,
+        tb_guard_a: f32,
+        trans_dy: f32,
+        max_trans_active: bool,
+        lyr_open_t: f32,
+        top_bar_solid_bg_active: bool,
+    ) -> u32 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let dynamic_dirty = r.has_active_artwork_fade()
+            || !self.pending_art_uploads.is_empty()
+            || self.art_fading_until.is_some_and(|t| Instant::now() < t)
+            || (!self.settings.reduce_motion && self.is_showing_loading_skeleton())
+            || self.playlist_diff_anim.is_some()
+            || self.cover_launch_anim.is_some()
+            || self.route == PageRoute::Visualizer
+            || lyr_open_t > 0.004
+            || max_trans_active;
+
+        if dynamic_dirty {
+            self.backdrop_fp.valid = false;
+            return BACKDROP_DIRTY_ALL;
+        }
+
+        let mut rh = DefaultHasher::new();
+        std::mem::discriminant(&self.route).hash(&mut rh);
+        match &self.route {
+            PageRoute::ContainerDetail {
+                id,
+                kind,
+                title_hint,
+            } => {
+                id.hash(&mut rh);
+                kind.hash(&mut rh);
+                title_hint.hash(&mut rh);
+            }
+            PageRoute::Search => {
+                self.search_query.hash(&mut rh);
+                self.search_completed_query.hash(&mut rh);
+                self.search_filter.hash(&mut rh);
+                self.last_search_typed.is_some().hash(&mut rh);
+            }
+            PageRoute::LibAlbums => {
+                self.albums_cover_flow.hash(&mut rh);
+                self.cover_flow_index.to_bits().hash(&mut rh);
+            }
+            _ => {}
+        }
+        self.detail_loading.hash(&mut rh);
+        self.search_loading.hash(&mut rh);
+        top_bar_solid_bg_active.hash(&mut rh);
+        let route_hash = rh.finish();
+
+        let win_h = r.logical_height();
+        let scroll_y = self.scroll_y;
+        let mut ch = DefaultHasher::new();
+        match &self.route {
+            PageRoute::Home => {
+                if !self.home_shelves.is_empty() {
+                    Self::hash_shelves_o1(&self.home_shelves, self.home_shelves_rev, &mut ch);
+                } else {
+                    Self::is_counter_active(&self.home_in_flight).hash(&mut ch);
+                    Self::hash_cards_o1(&self.home_playlists, self.home_fallback_rev, scroll_y, win_h, &mut ch);
+                    Self::hash_cards_o1(&self.home_albums, self.home_fallback_rev, scroll_y, win_h, &mut ch);
+                    Self::hash_tracks_o1(&self.home_songs, self.home_fallback_rev, scroll_y, win_h, &mut ch);
+                }
+            }
+            PageRoute::Browse => {
+                if !self.browse_shelves.is_empty() {
+                    Self::hash_shelves_o1(&self.browse_shelves, self.browse_shelves_rev, &mut ch);
+                } else if !self.home_shelves.is_empty() {
+                    Self::hash_shelves_o1(&self.home_shelves, self.home_shelves_rev, &mut ch);
+                } else {
+                    (Self::is_counter_active(&self.browse_in_flight)
+                        || Self::is_counter_active(&self.home_in_flight))
+                    .hash(&mut ch);
+                    Self::hash_cards_o1(&self.home_playlists, self.home_fallback_rev, scroll_y, win_h, &mut ch);
+                    Self::hash_cards_o1(&self.home_albums, self.home_fallback_rev, scroll_y, win_h, &mut ch);
+                    Self::hash_tracks_o1(&self.home_songs, self.home_fallback_rev, scroll_y, win_h, &mut ch);
+                }
+            }
+            PageRoute::Radio => {
+                if !self.radio_shelves.is_empty() {
+                    Self::hash_shelves_o1(&self.radio_shelves, self.radio_shelves_rev, &mut ch);
+                } else {
+                    Self::is_counter_active(&self.radio_in_flight).hash(&mut ch);
+                    Self::hash_cards_o1(&self.radio_cards, self.radio_cards_rev, scroll_y, win_h, &mut ch);
+                }
+            }
+            PageRoute::ContainerDetail { .. } => {
+                self.detail_data_rev.hash(&mut ch);
+                if self.detail_loading {
+                    self.pending_detail_id.hash(&mut ch);
+                    self.pending_detail_title.hash(&mut ch);
+                    self.pending_detail_artwork.hash(&mut ch);
+                    self.pending_detail_motion_url.hash(&mut ch);
+                } else if let Some(ref d) = self.detail_data {
+                    d.id.hash(&mut ch);
+                    d.kind.hash(&mut ch);
+                    d.title.len().hash(&mut ch);
+                    d.artwork_url.as_ref().map(|s| s.len()).hash(&mut ch);
+                    d.motion_video_url.as_ref().map(|s| s.len()).hash(&mut ch);
+                    Self::hash_tracks_o1(&d.tracks, self.detail_data_rev, scroll_y, win_h, &mut ch);
+                    Self::hash_cards_o1(&d.related_albums, self.detail_data_rev, scroll_y, win_h, &mut ch);
+                }
+            }
+            PageRoute::Search => {
+                self.search_results_rev.hash(&mut ch);
+                self.search_error.hash(&mut ch);
+                self.search_recent_queries.len().hash(&mut ch);
+                Self::hash_tracks_o1(&self.search_local_songs, self.search_results_rev, scroll_y, win_h, &mut ch);
+                Self::hash_cards_o1(&self.search_local_cards, self.search_results_rev, scroll_y, win_h, &mut ch);
+                Self::hash_tracks_o1(&self.search_songs, self.search_results_rev, scroll_y, win_h, &mut ch);
+                Self::hash_cards_o1(&self.search_albums, self.search_results_rev, scroll_y, win_h, &mut ch);
+                Self::hash_cards_o1(&self.search_playlists, self.search_results_rev, scroll_y, win_h, &mut ch);
+                Self::hash_cards_o1(&self.search_artists, self.search_results_rev, scroll_y, win_h, &mut ch);
+            }
+            PageRoute::LibSongs => {
+                self.netease_account.logged_in.hash(&mut ch);
+                self.settings.user_token.is_empty().hash(&mut ch);
+                self.lib_in_flight
+                    .get("songs")
+                    .is_some_and(|c| Self::is_counter_active(c))
+                    .hash(&mut ch);
+                Self::hash_tracks_o1(&self.lib_songs, self.lib_songs_rev, scroll_y, win_h, &mut ch);
+            }
+            PageRoute::LibDownloads => {
+                self.downloads_rev.hash(&mut ch);
+                self.downloads_paused.hash(&mut ch);
+                self.downloads_info.folder_exists.hash(&mut ch);
+                self.downloads_info.total_bytes.hash(&mut ch);
+                self.downloads_info.complete_count.hash(&mut ch);
+                self.downloads_info.partial_count.hash(&mut ch);
+                let items = &self.downloads_info.items;
+                items.len().hash(&mut ch);
+                (items.as_ptr() as usize).hash(&mut ch);
+                if !items.is_empty() {
+                    let row_h = Theme::TRACK_ROW_HEIGHT.max(1.0);
+                    let lo = ((scroll_y - 420.0) / row_h).floor().max(0.0) as usize;
+                    let raw_hi = (((scroll_y + win_h + 220.0) / row_h).ceil().max(0.0) as usize)
+                        .min(items.len());
+                    let start = lo.min(items.len());
+                    let end = raw_hi.min(start.saturating_add(36));
+                    for it in &items[start..end] {
+                        (it.title.as_ptr() as usize).hash(&mut ch);
+                        it.title.len().hash(&mut ch);
+                        it.size_bytes.hash(&mut ch);
+                        it.complete.hash(&mut ch);
+                    }
+                }
+            }
+            PageRoute::LibRecent
+            | PageRoute::LibAlbums
+            | PageRoute::LibArtists
+            | PageRoute::LibPlaylists
+            | PageRoute::LibForYou => {
+                self.settings.user_token.is_empty().hash(&mut ch);
+                if let Some(rkey) = Self::route_to_lib_key(&self.route) {
+                    self.lib_in_flight
+                        .get(rkey)
+                        .is_some_and(|c| Self::is_counter_active(c))
+                        .hash(&mut ch);
+                    if let Some(cards) = self.lib_cards.get(rkey) {
+                        Self::hash_cards_o1(cards, self.lib_cards_rev, scroll_y, win_h, &mut ch);
+                    }
+                }
+            }
+            PageRoute::Settings | PageRoute::Visualizer => {}
+        }
+        self.smtc.status.hash(&mut ch);
+        self.smtc.title.hash(&mut ch);
+        self.smtc.adam_id.hash(&mut ch);
+        backend_to_u8(self.settings.playback_backend).hash(&mut ch);
+        self.settings.language.hash(&mut ch);
+        self.settings.motion_artwork_enabled.hash(&mut ch);
+        self.settings.reduce_motion.hash(&mut ch);
+        self.playback_loading.hash(&mut ch);
+        self.playback_loading_track_id.hash(&mut ch);
+        self.playback_loading_container_id.hash(&mut ch);
+        if self.playback_loading || (self.route == PageRoute::Search && self.search_loading) {
+            ((self.spinner_phase * 256.0).round() as u32).hash(&mut ch);
+        }
+        let content_hash = ch.finish();
+
+        let mut hover_hash = self.hover_alphas.len() as u64;
+        for (&k, &v) in &self.hover_alphas {
+            let q = (v.clamp(0.0, 1.0) * 255.0).round() as u64;
+            hover_hash ^= k.rotate_left((q & 31) as u32) ^ (q << 40);
+        }
+
+        let top_overlap_y = 78.0f32;
+        let bot_overlap_y = (win_h - 106.0).max(0.0);
+        let motion_on = self.settings.motion_artwork_enabled && !self.settings.reduce_motion;
+        let (motion_top_hash, motion_bottom_hash) = if motion_on && !self.show_lyrics_overlay {
+            if self.route == PageRoute::Home {
+                // Only invalidate top (< 78 DIP) or bottom (> win_h - 106 DIP) glass strips when
+                // a motion cover ACTUALLY overlaps that strip (including during 180ms crossfade).
+                let mut th = DefaultHasher::new();
+                let mut bh = DefaultHasher::new();
+                let mut top_cnt = 0usize;
+                let mut bot_cnt = 0usize;
+                for (u, rect) in &self.rendered_home_motion_cards {
+                    let touches_top = rect.y < top_overlap_y && rect.bottom() > 0.0;
+                    let touches_bot = rect.bottom() > bot_overlap_y && rect.y < win_h;
+                    if !touches_top && !touches_bot {
+                        continue;
+                    }
+                    let seq = self
+                        .drawn_home_motion_seqs
+                        .get(u)
+                        .copied()
+                        .unwrap_or_else(|| {
+                            self.motion_art
+                                .latest_frame_for_url(u)
+                                .map(|f| f.frame_seq)
+                                .unwrap_or(0)
+                        });
+                    let fade_q = (self
+                        .motion_fade_alphas
+                        .get(u)
+                        .copied()
+                        .unwrap_or(0.0)
+                        .clamp(0.0, 1.0)
+                        * 255.0)
+                        .round() as u16;
+                    if touches_top {
+                        top_cnt += 1;
+                        u.hash(&mut th);
+                        seq.hash(&mut th);
+                        fade_q.hash(&mut th);
+                    }
+                    if touches_bot {
+                        bot_cnt += 1;
+                        u.hash(&mut bh);
+                        seq.hash(&mut bh);
+                        fade_q.hash(&mut bh);
+                    }
+                }
+                top_cnt.hash(&mut th);
+                bot_cnt.hash(&mut bh);
+                (
+                    if top_cnt > 0 { th.finish() } else { 0 },
+                    if bot_cnt > 0 { bh.finish() } else { 0 },
+                )
+            } else if matches!(self.route, PageRoute::ContainerDetail { .. }) {
+                // Only dirty top/bottom glass strips when the detail hero cover ACTUALLY overlaps
+                // the top (< 78 DIP) or bottom (> win_h - 106 DIP) glass bands!
+                let hero_rect = self.last_detail_hero_rect.unwrap_or_else(|| {
+                    RectF::new(0.0, 62.0 - self.scroll_y + trans_dy, 228.0, 228.0)
+                });
+                let touches_top = hero_rect.y < top_overlap_y && hero_rect.bottom() > 0.0;
+                let touches_bot = hero_rect.bottom() > bot_overlap_y && hero_rect.y < win_h;
+                if (touches_top || touches_bot)
+                    && self
+                        .detail_data
+                        .as_ref()
+                        .and_then(|d| d.motion_video_url.as_deref())
+                        .or(self.pending_detail_motion_url.as_deref())
+                        .is_some()
+                {
+                    let u = self
+                        .detail_data
+                        .as_ref()
+                        .and_then(|d| d.motion_video_url.as_deref())
+                        .or(self.pending_detail_motion_url.as_deref())
+                        .unwrap_or("");
+                    let mut dh = DefaultHasher::new();
+                    u.hash(&mut dh);
+                    let seq = self
+                        .motion_art
+                        .latest_frame("detail_hero", Some(u))
+                        .map(|f| f.frame_seq)
+                        .unwrap_or(0);
+                    seq.hash(&mut dh);
+                    let fade_q = if self.detail_motion_fade.0 == u {
+                        (self.detail_motion_fade.1.clamp(0.0, 1.0) * 255.0).round() as u16
+                    } else {
+                        0
+                    };
+                    fade_q.hash(&mut dh);
+                    let h = dh.finish();
+                    (
+                        if touches_top { h } else { 0 },
+                        if touches_bot { h } else { 0 },
+                    )
+                } else {
+                    (0, 0)
+                }
+            } else {
+                (0, 0)
+            }
+        } else {
+            (0, 0)
+        };
+
+        // Only dirty the specific top/bottom glass strip that the visible playing track row overlaps!
+        let (eq_top_hash, eq_bottom_hash) = if let Some(eq_row) = self.last_visible_playing_row_rect
+        {
+            if self.eq_bars_smooth.iter().any(|&v| v > 0.02) {
+                let touches_top = eq_row.y < top_overlap_y && eq_row.bottom() > 0.0;
+                let touches_bot = eq_row.bottom() > bot_overlap_y && eq_row.y < win_h;
+                if touches_top || touches_bot {
+                    let mut eh = DefaultHasher::new();
+                    for b in self.eq_bars_smooth {
+                        ((b.clamp(0.0, 1.0) * 255.0).round() as u8).hash(&mut eh);
+                    }
+                    let h = eh.finish();
+                    (
+                        if touches_top { h } else { 0 },
+                        if touches_bot { h } else { 0 },
+                    )
+                } else {
+                    (0, 0)
+                }
+            } else {
+                (0, 0)
+            }
+        } else {
+            (0, 0)
+        };
+
+        let next = BackdropFingerprint {
+            valid: true,
+            width_px: r.width_px,
+            height_px: r.height_px,
+            dpi_bits: r.dpi_scale.to_bits(),
+            route_hash,
+            scroll_y_bits: if self.scroll_y == 0.0 {
+                0
+            } else {
+                self.scroll_y.to_bits()
+            },
+            sb_layout_w_bits: if sb_layout_w == 0.0 {
+                0
+            } else {
+                sb_layout_w.to_bits()
+            },
+            trans_dy_bits: if trans_dy.abs() < 0.001 {
+                0
+            } else {
+                trans_dy.to_bits()
+            },
+            tb_guard_bits: if tb_guard_a <= 0.006 {
+                0
+            } else {
+                (tb_guard_a * 255.0).round() as u32
+            },
+            content_hash,
+            hover_hash,
+            motion_top_hash,
+            motion_bottom_hash,
+            eq_top_hash,
+            eq_bottom_hash,
+        };
+
+        let prev = self.backdrop_fp;
+        self.backdrop_fp = next;
+
+        if !prev.valid
+            || prev.width_px != next.width_px
+            || prev.height_px != next.height_px
+            || prev.dpi_bits != next.dpi_bits
+            || prev.route_hash != next.route_hash
+            || prev.scroll_y_bits != next.scroll_y_bits
+            || prev.sb_layout_w_bits != next.sb_layout_w_bits
+            || prev.trans_dy_bits != next.trans_dy_bits
+            || prev.content_hash != next.content_hash
+            || prev.hover_hash != next.hover_hash
+        {
+            return BACKDROP_DIRTY_ALL;
+        }
+        let mut mask = 0u32;
+        if prev.tb_guard_bits != next.tb_guard_bits
+            || prev.motion_top_hash != next.motion_top_hash
+            || prev.eq_top_hash != next.eq_top_hash
+        {
+            mask |= BACKDROP_DIRTY_TOP;
+        }
+        if prev.motion_bottom_hash != next.motion_bottom_hash
+            || prev.eq_bottom_hash != next.eq_bottom_hash
+        {
+            mask |= BACKDROP_DIRTY_BOTTOM;
+        }
+        mask
+    }
+
     #[inline]
     fn trigger_open_spring(spring: &mut lyrics::Spring1D, reduce_motion: bool) {
         if reduce_motion {
@@ -2220,6 +3346,16 @@ impl AppUi {
         key_id: &str,
         data: ContainerDetailData,
     ) {
+        self.put_detail_mem_cache_arc(backend, key_kind, key_id, std::sync::Arc::new(data));
+    }
+
+    fn put_detail_mem_cache_arc(
+        &mut self,
+        backend: PlaybackBackend,
+        key_kind: &str,
+        key_id: &str,
+        data: std::sync::Arc<ContainerDetailData>,
+    ) {
         if !self.settings.page_cache_enabled {
             return;
         }
@@ -2252,7 +3388,7 @@ impl AppUi {
         if let Some((data, ts)) = self.detail_mem_cache.get(&k) {
             self.detail_mem_lru_seq = self.detail_mem_lru_seq.wrapping_add(1);
             let seq = self.detail_mem_lru_seq;
-            let out = (data.clone(), *ts);
+            let out = (data.as_ref().clone(), *ts);
             self.detail_mem_lru.insert(k, seq);
             return Some(out);
         }
@@ -2337,6 +3473,13 @@ impl AppUi {
                         .get(rkey)
                         .is_some_and(|c| Self::is_counter_active(c))
             }
+            PageRoute::Search => {
+                self.search_loading
+                    && self.search_songs.is_empty()
+                    && self.search_artists.is_empty()
+                    && self.search_albums.is_empty()
+                    && self.search_playlists.is_empty()
+            }
             _ => false,
         }
     }
@@ -2366,23 +3509,26 @@ impl AppUi {
                 PlaybackBackend::AppleMusicNative | PlaybackBackend::AppleMusicWeb => {
                     let radio_fut = am_api::fetch_official_radio_shelves(&sf, utok.clone());
                     if let Some(tok) = utok {
-                        let pl_fut = am_api::fetch_am_api(
-                            "v1/me/library/playlists?limit=40&l=zh-Hans-CN".to_string(),
+                        let pl_fut = am_api::fetch_am_paginated_data(
+                            "v1/me/library/playlists?limit=100&l=zh-Hans-CN",
                             Some(tok.clone()),
-                            None,
                             Some(sf.clone()),
+                            20,
+                            true,
                         );
-                        let alb_fut = am_api::fetch_am_api(
-                            "v1/me/library/albums?limit=40&l=zh-Hans-CN".to_string(),
+                        let alb_fut = am_api::fetch_am_paginated_data(
+                            "v1/me/library/albums?limit=100&l=zh-Hans-CN",
                             Some(tok.clone()),
-                            None,
                             Some(sf.clone()),
+                            15,
+                            true,
                         );
-                        let rec_fut = am_api::fetch_am_api(
-                            "v1/me/library/recently-added?limit=25&l=zh-Hans-CN".to_string(),
+                        let rec_fut = am_api::fetch_am_paginated_data(
+                            "v1/me/library/recently-added?limit=25&l=zh-Hans-CN",
                             Some(tok.clone()),
-                            None,
                             Some(sf.clone()),
+                            4,
+                            true,
                         );
                         let (r_res, pl_res, alb_res, rec_res) =
                             tokio::join!(radio_fut, pl_fut, alb_fut, rec_fut);
@@ -2392,27 +3538,25 @@ impl AppUi {
                         if let Ok(rshelves) = r_res {
                             let _ = tx.send(AsyncMsg::RadioShelvesLoaded(rshelves));
                         }
-                        if let Ok(json) = pl_res {
-                            let cards =
-                                parse_media_cards_array(json.get("data"), "library-playlists");
+                        if let Ok(items) = pl_res {
+                            let cards = parse_media_cards_slice(&items, "library-playlists");
+                            let _ = tx.send(AsyncMsg::SidebarPlaylistsLoaded(cards.clone()));
                             let _ = tx.send(AsyncMsg::LibraryCardsLoaded {
                                 backend,
                                 route_key: "playlists".to_string(),
                                 cards,
                             });
                         }
-                        if let Ok(json) = alb_res {
-                            let cards =
-                                parse_media_cards_array(json.get("data"), "library-albums");
+                        if let Ok(items) = alb_res {
+                            let cards = parse_media_cards_slice(&items, "library-albums");
                             let _ = tx.send(AsyncMsg::LibraryCardsLoaded {
                                 backend,
                                 route_key: "albums".to_string(),
                                 cards,
                             });
                         }
-                        if let Ok(json) = rec_res {
-                            let cards =
-                                parse_media_cards_array(json.get("data"), "library-albums");
+                        if let Ok(items) = rec_res {
+                            let cards = parse_media_cards_slice(&items, "library-albums");
                             let _ = tx.send(AsyncMsg::LibraryCardsLoaded {
                                 backend,
                                 route_key: "recent".to_string(),
@@ -2421,43 +3565,38 @@ impl AppUi {
                         }
                         Self::post_ui_wake(hwnd);
 
-                        // Second calm wave: Library Songs & Artists
+                        // Second calm wave: Library Songs & Artists (paginated!)
                         tokio::time::sleep(std::time::Duration::from_millis(280)).await;
                         if get_active_playback_backend() != backend {
                             return;
                         }
-                        let songs_fut = am_api::fetch_am_api(
-                            "v1/me/library/songs?include=catalog&extend=audioTraits&limit=80&l=zh-Hans-CN"
-                                .to_string(),
+                        let songs_fut = am_api::fetch_am_paginated_data(
+                            "v1/me/library/songs?include=catalog&extend=audioTraits&limit=100&l=zh-Hans-CN",
                             Some(tok.clone()),
-                            None,
                             Some(sf.clone()),
+                            50,
+                            true,
                         );
-                        let art_fut = am_api::fetch_am_api(
-                            "v1/me/library/artists?limit=40&l=zh-Hans-CN".to_string(),
+                        let art_fut = am_api::fetch_am_paginated_data(
+                            "v1/me/library/artists?limit=100&l=zh-Hans-CN",
                             Some(tok),
-                            None,
                             Some(sf),
+                            15,
+                            true,
                         );
                         let (s_res, a_res) = tokio::join!(songs_fut, art_fut);
                         if get_active_playback_backend() != backend {
                             return;
                         }
-                        if let Ok(json) = s_res {
-                            let songs = json
-                                .get("data")
-                                .and_then(Value::as_array)
-                                .map(|arr| {
-                                    arr.iter()
-                                        .filter_map(|v| parse_track_from_am_json(v, None, None))
-                                        .collect()
-                                })
-                                .unwrap_or_default();
+                        if let Ok(items) = s_res {
+                            let songs = items
+                                .iter()
+                                .filter_map(|v| parse_track_from_am_json(v, None, None))
+                                .collect();
                             let _ = tx.send(AsyncMsg::LibrarySongsLoaded { backend, songs });
                         }
-                        if let Ok(json) = a_res {
-                            let cards =
-                                parse_media_cards_array(json.get("data"), "library-artists");
+                        if let Ok(items) = a_res {
+                            let cards = parse_media_cards_slice(&items, "library-artists");
                             let _ = tx.send(AsyncMsg::LibraryCardsLoaded {
                                 backend,
                                 route_key: "artists".to_string(),
@@ -2631,6 +3770,10 @@ impl AppUi {
 
     /// Returns `true` when any high-refresh interactive animation, spring, scroll, Lyrics, or Visualizer is active.
     pub fn has_active_ui_motion(&self) -> bool {
+        self.has_settling_motion_fade || self.has_active_ui_motion_excluding_motion_fade()
+    }
+
+    fn has_active_ui_motion_excluding_motion_fade(&self) -> bool {
         if self.playback_loading
             || self.active_drag.is_some()
             || self.playlist_diff_anim.is_some()
@@ -2672,7 +3815,10 @@ impl AppUi {
         {
             return true;
         }
-        if self.has_settling_hover || self.has_settling_toggle || self.has_active_glass_motion {
+        if self.has_settling_hover
+            || self.has_settling_toggle
+            || self.has_active_glass_motion
+        {
             return true;
         }
         if (self.context_menu.is_some() && !self.context_menu_open_spring.is_settled_norm())
@@ -2685,6 +3831,13 @@ impl AppUi {
         if self
             .art_fading_until
             .is_some_and(|t| Instant::now() < t)
+            || !self.pending_art_uploads.is_empty()
+        {
+            return true;
+        }
+        if self.route == PageRoute::LibAlbums
+            && self.albums_cover_flow
+            && (self.cover_flow_index - (self.cover_flow_target as f32)).abs() > 0.004
         {
             return true;
         }
@@ -2711,6 +3864,10 @@ impl AppUi {
             return focused;
         }
         if self.route == PageRoute::Visualizer {
+            if !self.is_window_focused && self.settings.viz_fps_cap == FpsCap::VSync && mon > 72 {
+                let adap_hz = resolve_adaptive_60_72_hz(mon);
+                return resolve_cap_sync_and_hz(FpsCap::Adaptive60_72, mon, adap_hz);
+            }
             return resolve_cap_sync_and_hz(
                 self.settings.viz_fps_cap,
                 mon,
@@ -2719,6 +3876,67 @@ impl AppUi {
         }
         if self.has_active_ui_motion() {
             return resolve_cap_sync_and_hz(FpsCap::VSync, mon, 120);
+        }
+        // R4 Cadence Alignment: align settled Home playback tick to `motion_art.active_cadence_ms()`
+        // (`42ms` / 24 Hz when >=5 motion slots active, `33ms` / 30 Hz when <=4 slots active)
+        // instead of decoupled 30 Hz spinning against 23.8 Hz video!
+        if self.route == PageRoute::Home && !self.show_lyrics_overlay {
+            let motion_active = self.settings.motion_artwork_enabled
+                && !self.settings.reduce_motion
+                && self.is_window_focused
+                && self.motion_art.has_active_playing_slots();
+            if motion_active {
+                let cad_ms = self.motion_art.active_cadence_ms().clamp(16, 100);
+                let hz = ((1000.0 / (cad_ms as f32)).round() as u32).clamp(15, 60);
+                return (0, hz, Some(cad_ms * 1_000_000));
+            }
+            if self.smtc.status == "Playing" {
+                if self.settings.live_eq_icon_spectrum
+                    && !self.settings.reduce_motion
+                    && self.last_sidebar_eq_rect.is_some()
+                {
+                    let cad_ms = self.motion_art.active_cadence_ms().clamp(33, 60);
+                    let hz = ((1000.0 / (cad_ms as f32)).round() as u32).clamp(15, 60);
+                    return (0, hz, Some(cad_ms * 1_000_000));
+                }
+                return (0, 8, Some(125_000_000));
+            }
+        }
+        // P0-4: Non-Home settled playback cadence — avoid locked 30 FPS full-screen redraws on idle
+        // Settings / Library / scrolled ContainerDetail pages when no motion video, spinner, or visible
+        // animated EQ icon is active!
+        if !self.show_lyrics_overlay && self.route != PageRoute::Home {
+            let needs_spinner_or_fx = self.playback_loading
+                || self.playlist_diff_anim.is_some()
+                || self.cover_launch_anim.is_some()
+                || (self.route == PageRoute::Search
+                    && self.search_loading
+                    && !self.settings.reduce_motion);
+            if needs_spinner_or_fx {
+                return (0, 30, Some(33_000_000));
+            }
+            let detail_motion_visible = matches!(self.route, PageRoute::ContainerDetail { .. })
+                && self.is_window_focused
+                && self.settings.motion_artwork_enabled
+                && !self.settings.reduce_motion
+                && self.last_detail_motion_url.is_some()
+                && self
+                    .last_detail_hero_rect
+                    .is_some_and(|hr| hr.bottom() > 0.0);
+            if detail_motion_visible {
+                return (0, 24, Some(42_000_000));
+            }
+            if self.smtc.status == "Playing" {
+                let eq_visible = self.is_window_focused
+                    && !self.settings.reduce_motion
+                    && ((self.settings.live_eq_icon_spectrum
+                        && self.last_sidebar_eq_rect.is_some())
+                        || self.last_visible_playing_row_rect.is_some());
+                if eq_visible {
+                    return (0, 24, Some(42_000_000));
+                }
+                return (0, 4, Some(250_000_000));
+            }
         }
         (0, 30, Some(33_000_000))
     }
@@ -2760,7 +3978,21 @@ impl AppUi {
         {
             return true;
         }
-        if self.has_settling_hover || self.has_settling_toggle || self.has_active_glass_motion {
+        if self.has_settling_hover
+            || self.has_settling_toggle
+            || self.has_active_glass_motion
+            || self.has_settling_motion_fade
+        {
+            return true;
+        }
+        if self.route == PageRoute::Home
+            && !self.show_lyrics_overlay
+            && self.is_window_focused
+            && self.settings.motion_artwork_enabled
+            && !self.settings.reduce_motion
+            && !self.visible_home_motion_targets.is_empty()
+            && self.last_home_scroll_at.elapsed() < std::time::Duration::from_millis(90)
+        {
             return true;
         }
         if (self.context_menu.is_some() && !self.context_menu_open_spring.is_settled_norm())
@@ -2773,10 +4005,15 @@ impl AppUi {
         if self
             .art_fading_until
             .is_some_and(|t| Instant::now() < t)
+            || !self.pending_art_uploads.is_empty()
         {
             return true;
         }
-        if self.last_search_typed.is_some() {
+        if !self.show_lyrics_overlay
+            && self.route == PageRoute::Search
+            && self.search_loading
+            && !self.settings.reduce_motion
+        {
             return true;
         }
         if self.smtc.status == "Playing" || self.eq_bars_smooth.iter().any(|&v| v > 0.015) {
@@ -2948,6 +4185,50 @@ impl AppUi {
             }
         }
 
+        // Handle incoming Windows SMTC media button / seek commands (Win+A card, keyboard keys, Bluetooth headsets, Lyricify)
+        let smtc_cmds = smtc::drain_published_commands();
+        if !smtc_cmds.is_empty()
+            && self.settings.smtc_publish_enabled
+            && self.settings.playback_backend != PlaybackBackend::ExternalSmtc
+            && self.smtc.backend_mode != "smtc"
+        {
+            changed = true;
+            for cmd in smtc_cmds {
+                match cmd {
+                    smtc::SmtcPublishedCommand::Play => {
+                        if self.smtc.status != "Playing" {
+                            self.control_player("play", None);
+                        }
+                    }
+                    smtc::SmtcPublishedCommand::Pause => {
+                        if self.smtc.status == "Playing" {
+                            self.control_player("pause", None);
+                        }
+                    }
+                    smtc::SmtcPublishedCommand::Stop => {
+                        if self.smtc.status == "Playing" {
+                            self.control_player("pause", None);
+                        }
+                    }
+                    smtc::SmtcPublishedCommand::Next => {
+                        self.control_player("next", None);
+                    }
+                    smtc::SmtcPublishedCommand::Previous => {
+                        self.control_player("prev", None);
+                    }
+                    smtc::SmtcPublishedCommand::SeekSec(sec) => {
+                        let clamped = if self.smtc.duration_sec > 0.5 {
+                            sec.clamp(0.0, self.smtc.duration_sec)
+                        } else {
+                            sec.max(0.0)
+                        };
+                        self.smtc.position_sec = clamped;
+                        self.control_player("seek", Some(clamped));
+                    }
+                }
+            }
+        }
+
         while let Ok(msg) = self.rx.try_recv() {
             changed = true;
             match msg {
@@ -2963,6 +4244,7 @@ impl AppUi {
                         self.home_albums = albums;
                         self.home_playlists = playlists;
                         self.home_songs = songs;
+                        self.home_fallback_rev = self.home_fallback_rev.wrapping_add(1);
                         self.lib_route_fetched_at.insert(
                             Self::lib_route_cache_key(self.settings.playback_backend, "home"),
                             Instant::now(),
@@ -2975,6 +4257,7 @@ impl AppUi {
                         PlaybackBackend::NetEase | PlaybackBackend::QQMusic
                     ) {
                         self.radio_cards = cards;
+                        self.radio_cards_rev = self.radio_cards_rev.wrapping_add(1);
                         self.lib_route_fetched_at.insert(
                             Self::lib_route_cache_key(self.settings.playback_backend, "radio"),
                             Instant::now(),
@@ -2987,6 +4270,7 @@ impl AppUi {
                         PlaybackBackend::NetEase | PlaybackBackend::QQMusic
                     ) {
                         self.home_shelves = shelves;
+                        self.home_shelves_rev = self.home_shelves_rev.wrapping_add(1);
                         self.lib_route_fetched_at.insert(
                             Self::lib_route_cache_key(self.settings.playback_backend, "home"),
                             Instant::now(),
@@ -2999,6 +4283,7 @@ impl AppUi {
                         PlaybackBackend::NetEase | PlaybackBackend::QQMusic
                     ) {
                         self.browse_shelves = shelves;
+                        self.browse_shelves_rev = self.browse_shelves_rev.wrapping_add(1);
                         self.lib_route_fetched_at.insert(
                             Self::lib_route_cache_key(self.settings.playback_backend, "browse"),
                             Instant::now(),
@@ -3011,6 +4296,7 @@ impl AppUi {
                         PlaybackBackend::NetEase | PlaybackBackend::QQMusic
                     ) {
                         self.radio_shelves = shelves;
+                        self.radio_shelves_rev = self.radio_shelves_rev.wrapping_add(1);
                         self.lib_route_fetched_at.insert(
                             Self::lib_route_cache_key(self.settings.playback_backend, "radio"),
                             Instant::now(),
@@ -3022,11 +4308,24 @@ impl AppUi {
                     video_url,
                 } => {
                     self.pending_motion_tracks.remove(&track_key);
+                    if self
+                        .track_motion_task_abort
+                        .as_ref()
+                        .is_some_and(|(k, _)| k == &track_key)
+                    {
+                        self.track_motion_task_abort = None;
+                    }
+                    if !self.can_use_track_motion_artwork() {
+                        continue;
+                    }
+                    if self.track_motion_urls.len() >= 1024 {
+                        self.track_motion_urls.clear();
+                    }
                     if !self.smtc.title.trim().is_empty() && track_key == self.current_lyrics_key {
-                        let meta_fallback = format!(
-                            "meta_motion:{}|{}",
-                            self.smtc.title.trim().to_lowercase(),
-                            self.smtc.artist.trim().to_lowercase()
+                        let meta_fallback = meta_motion_cache_key(
+                            &self.smtc.title,
+                            &self.smtc.artist,
+                            &self.smtc.album,
                         );
                         self.track_motion_urls
                             .insert(meta_fallback, video_url.clone());
@@ -3058,11 +4357,13 @@ impl AppUi {
                             if !albums.is_empty() {
                                 if self.lib_cards.get("albums").map(|v| v.is_empty()).unwrap_or(true) {
                                     self.lib_cards.insert("albums".to_string(), albums.clone());
+                                    self.lib_cards_rev = self.lib_cards_rev.wrapping_add(1);
                                     self.lib_route_fetched_at
                                         .insert(Self::lib_route_cache_key(backend, "albums"), now_ts);
                                 }
                                 if self.lib_cards.get("artists").map(|v| v.is_empty()).unwrap_or(true) {
                                     self.lib_cards.insert("artists".to_string(), albums.clone());
+                                    self.lib_cards_rev = self.lib_cards_rev.wrapping_add(1);
                                     self.lib_route_fetched_at
                                         .insert(Self::lib_route_cache_key(backend, "artists"), now_ts);
                                 }
@@ -3071,6 +4372,7 @@ impl AppUi {
                                 for rkey in ["foryou", "recent"] {
                                     if self.lib_cards.get(rkey).map(|v| v.is_empty()).unwrap_or(true) {
                                         self.lib_cards.insert(rkey.to_string(), playlists.clone());
+                                        self.lib_cards_rev = self.lib_cards_rev.wrapping_add(1);
                                         self.lib_route_fetched_at
                                             .insert(Self::lib_route_cache_key(backend, rkey), now_ts);
                                     }
@@ -3082,6 +4384,9 @@ impl AppUi {
                         self.home_albums = albums;
                         self.home_playlists = playlists;
                         self.home_songs = songs;
+                        self.home_shelves_rev = self.home_shelves_rev.wrapping_add(1);
+                        self.browse_shelves_rev = self.browse_shelves_rev.wrapping_add(1);
+                        self.home_fallback_rev = self.home_fallback_rev.wrapping_add(1);
                         self.lib_route_fetched_at
                             .insert(Self::lib_route_cache_key(backend, "home"), now_ts);
                         self.lib_route_fetched_at
@@ -3096,25 +4401,53 @@ impl AppUi {
                     if backend == self.settings.playback_backend {
                         self.radio_shelves = shelves;
                         self.radio_cards = cards;
+                        self.radio_shelves_rev = self.radio_shelves_rev.wrapping_add(1);
+                        self.radio_cards_rev = self.radio_cards_rev.wrapping_add(1);
                         self.lib_route_fetched_at.insert(
                             Self::lib_route_cache_key(backend, "radio"),
                             Instant::now(),
                         );
                     }
                 }
-                AsyncMsg::BackendSearchLoaded {
-                    backend,
-                    query,
-                    albums,
-                    playlists,
-                    songs,
-                } => {
-                    if backend == self.settings.playback_backend && query == self.search_query.trim() {
-                        self.search_albums = albums;
-                        self.search_playlists = playlists;
-                        self.search_songs = songs;
+                AsyncMsg::SearchDebounceDue { gen } => {
+                    if gen == self.search_debounce_gen {
+                        self.last_search_typed = None;
+                        self.search_debounce_abort = None;
+                        let q = self.search_query.trim().to_string();
+                        if !q.is_empty() && q != self.last_dispatched_query {
+                            self.dispatch_search(q);
+                        }
                     }
                 }
+                AsyncMsg::SearchCompleted {
+                    seq,
+                    backend,
+                    cache_key,
+                    query,
+                    res,
+                } => match res {
+                    Ok(payload) => {
+                        self.put_search_cache(cache_key, payload.clone());
+                        if seq == self.search_req_seq && backend == self.settings.playback_backend {
+                            self.search_loading = false;
+                            self.search_error = None;
+                            self.search_task_abort = None;
+                            self.search_completed_query = query;
+                            self.search_artists = payload.artists;
+                            self.search_albums = payload.albums;
+                            self.search_playlists = payload.playlists;
+                            self.search_songs = payload.songs;
+                            self.search_results_rev = self.search_results_rev.wrapping_add(1);
+                        }
+                    }
+                    Err(e) => {
+                        if seq == self.search_req_seq && backend == self.settings.playback_backend {
+                            self.search_loading = false;
+                            self.search_task_abort = None;
+                            self.search_error = Some(e);
+                        }
+                    }
+                },
                 AsyncMsg::NetEaseAccountVerified(info) => {
                     if info.logged_in {
                         self.settings.netease_uid = info.uid;
@@ -3199,18 +4532,6 @@ impl AppUi {
                     }
                     self.web_am_status = st;
                 }
-                AsyncMsg::SearchResults {
-                    query,
-                    albums,
-                    playlists,
-                    songs,
-                } => {
-                    if query == self.search_query.trim() {
-                        self.search_albums = albums;
-                        self.search_playlists = playlists;
-                        self.search_songs = songs;
-                    }
-                }
                 AsyncMsg::LibraryCardsLoaded {
                     backend,
                     route_key,
@@ -3221,7 +4542,17 @@ impl AppUi {
                             Self::lib_route_cache_key(backend, &route_key),
                             Instant::now(),
                         );
+                        if route_key == "playlists" && !cards.is_empty() {
+                            self.playlist_cache
+                                .upsert_sidebar(&cards, current_unix_sec());
+                            self.save_playlist_cache_async();
+                            self.sidebar_playlists = cards.clone();
+                        }
                         self.lib_cards.insert(route_key, cards);
+                        self.lib_cards_rev = self.lib_cards_rev.wrapping_add(1);
+                        if !self.search_query.trim().is_empty() {
+                            self.refresh_local_search_matches();
+                        }
                     }
                 }
                 AsyncMsg::LibrarySongsLoaded { backend, songs } => {
@@ -3231,27 +4562,28 @@ impl AppUi {
                             Instant::now(),
                         );
                         self.lib_songs = songs;
+                        self.lib_songs_rev = self.lib_songs_rev.wrapping_add(1);
+                        if !self.search_query.trim().is_empty() {
+                            self.refresh_local_search_matches();
+                        }
                     }
                 }
                 AsyncMsg::SidebarPlaylistsLoaded(pls) => {
                     self.playlist_cache
                         .upsert_sidebar(&pls, current_unix_sec());
                     self.save_playlist_cache_async();
-                    if self.settings.page_cache_enabled
-                        && !pls.is_empty()
-                        && self
-                            .lib_cards
-                            .get("playlists")
-                            .map(|v| v.is_empty())
-                            .unwrap_or(true)
-                    {
+                    if !pls.is_empty() {
                         self.lib_cards.insert("playlists".to_string(), pls.clone());
+                        self.lib_cards_rev = self.lib_cards_rev.wrapping_add(1);
                         self.lib_route_fetched_at.insert(
                             Self::lib_route_cache_key(self.settings.playback_backend, "playlists"),
                             Instant::now(),
                         );
                     }
                     self.sidebar_playlists = pls;
+                    if !self.search_query.trim().is_empty() {
+                        self.refresh_local_search_matches();
+                    }
                 }
                 AsyncMsg::ContainerLoaded {
                     seq,
@@ -3260,6 +4592,9 @@ impl AppUi {
                     expected_id,
                     res,
                 } => {
+                    if seq == self.detail_req_seq {
+                        self.detail_task_abort = None;
+                    }
                     let is_current = seq == self.detail_req_seq
                         && backend == self.settings.playback_backend
                         && matches!(
@@ -3270,29 +4605,29 @@ impl AppUi {
                         Ok(data) => {
                             if backend == self.settings.playback_backend {
                                 if self.settings.page_cache_enabled {
-                                    self.put_detail_mem_cache(
+                                    let shared = std::sync::Arc::new(data.clone());
+                                    self.put_detail_mem_cache_arc(
                                         backend,
                                         &data.kind,
                                         &data.id,
-                                        data.clone(),
+                                        std::sync::Arc::clone(&shared),
                                     );
                                     if req_kind != data.kind || expected_id != data.id {
-                                        self.put_detail_mem_cache(
+                                        self.put_detail_mem_cache_arc(
                                             backend,
                                             &req_kind,
                                             &expected_id,
-                                            data.clone(),
+                                            shared,
                                         );
                                     }
-                                }
-                                if data.kind.contains("playlist") {
-                                    self.playlist_cache
-                                        .upsert_detail(&data, current_unix_sec());
-                                    self.save_playlist_cache_async();
                                 }
                                 if is_current {
                                     self.detail_loading = false;
                                     self.apply_loaded_container_detail(data);
+                                } else if data.kind.contains("playlist") {
+                                    self.playlist_cache
+                                        .upsert_detail(&data, current_unix_sec());
+                                    self.save_playlist_cache_async();
                                 }
                             }
                         }
@@ -3327,13 +4662,17 @@ impl AppUi {
                     }
                 }
                 AsyncMsg::PeriodicPlaylistSyncDue => {
-                    self.playlist_sync_in_flight = false;
+                    self.playlist_sync_in_flight
+                        .store(false, std::sync::atomic::Ordering::Release);
                     if !self.settings.user_token.is_empty() {
                         self.dispatch_background_playlist_sync();
                     }
                 }
                 AsyncMsg::DownloadsLoaded(res) => match res {
-                    Ok(info) => self.downloads_info = info,
+                    Ok(info) => {
+                        self.downloads_info = info;
+                        self.downloads_rev = self.downloads_rev.wrapping_add(1);
+                    }
                     Err(e) => self.set_banner(e, true),
                 },
                 AsyncMsg::PlaybackUpdated(mut st) => {
@@ -3345,7 +4684,8 @@ impl AppUi {
                         .unwrap_or_default();
                     if st.artwork_url.is_none() {
                         if let Some(ref b64) = st.thumbnail_base64 {
-                            let smtc_key = format!("smtc://{}\x1f{}", st.title, st.artist);
+                            let smtc_key =
+                                make_smtc_artwork_key(&st.title, &st.artist, &st.album, b64);
                             if !renderer.has_artwork(&smtc_key, true) {
                                 use base64::{engine::general_purpose, Engine as _};
                                 if let Ok(raw) = general_purpose::STANDARD.decode(b64) {
@@ -3440,14 +4780,21 @@ impl AppUi {
                     req_key,
                     url,
                     hero,
+                    req_epoch,
                     decoded,
                 } => {
                     self.pending_art.remove(&req_key);
-                    if renderer.upload_decoded_artwork(url, decoded, hero)
-                        && renderer.has_fading_artwork()
-                    {
-                        self.art_fading_until =
-                            Some(Instant::now() + std::time::Duration::from_millis(210));
+                    let cur_epoch = self.art_epoch.load(std::sync::atomic::Ordering::Acquire);
+                    if !hero && req_epoch != cur_epoch {
+                        continue;
+                    }
+                    // Queue GPU texture upload so drain_messages budgets max 4 uploads/frame (eliminates 6-25ms upload spikes!)
+                    if hero {
+                        self.pending_art_uploads
+                            .push_front((req_key, url, hero, req_epoch, decoded));
+                    } else {
+                        self.pending_art_uploads
+                            .push_back((req_key, url, hero, req_epoch, decoded));
                     }
                 }
                 AsyncMsg::ArtworkFailed { req_key } => {
@@ -3456,6 +4803,94 @@ impl AppUi {
                         self.failed_art.clear();
                     }
                     self.failed_art.insert(req_key);
+                }
+                AsyncMsg::ArtworkCancelled { req_key } => {
+                    self.pending_art.remove(&req_key);
+                }
+                AsyncMsg::OfficialAccountDetected {
+                    official,
+                    legacy_token,
+                    legacy_storefront,
+                    show_banner,
+                } => {
+                    self.official_account = official;
+                    let mut dirty = false;
+                    let mut sf_changed = false;
+                    let mut tok_restored = false;
+                    let mut synced_parts = Vec::new();
+                    if let Some(ref off_sf) = self.official_account.storefront {
+                        if !off_sf.is_empty() {
+                            if show_banner {
+                                if self.settings.storefront != *off_sf {
+                                    sf_changed = true;
+                                }
+                                self.settings.storefront = off_sf.clone();
+                                self.settings.storefront_customized = false;
+                                dirty = true;
+                                synced_parts.push(format!("地区 {}", off_sf.to_uppercase()));
+                            } else if !self.settings.storefront_customized
+                                && self.settings.storefront != *off_sf
+                            {
+                                self.settings.storefront = off_sf.clone();
+                                sf_changed = true;
+                                dirty = true;
+                            }
+                        }
+                    }
+                    if show_banner {
+                        if let Some(ref name) = self.official_account.display_name {
+                            synced_parts.push(format!("账号 {name}"));
+                        }
+                    }
+                    if self.settings.user_token.is_empty()
+                        && (show_banner || !self.settings.token_cleared_by_user)
+                    {
+                        if let Some(tok) = legacy_token {
+                            if !tok.is_empty() {
+                                self.settings.user_token = tok;
+                                self.settings.token_cleared_by_user = false;
+                                tok_restored = true;
+                                dirty = true;
+                                synced_parts.push("已恢复资料库授权 Token".to_string());
+                            }
+                        }
+                        if !show_banner
+                            && !self.settings.storefront_customized
+                            && self.official_account.storefront.is_none()
+                        {
+                            if let Some(leg_sf) = legacy_storefront {
+                                if !leg_sf.is_empty() && self.settings.storefront != leg_sf {
+                                    self.settings.storefront = leg_sf;
+                                    sf_changed = true;
+                                    dirty = true;
+                                }
+                            }
+                        }
+                    }
+                    if dirty {
+                        self.save_settings();
+                    }
+                    if show_banner || sf_changed {
+                        self.fetch_home_charts();
+                    }
+                    if (show_banner || tok_restored)
+                        && !self.settings.user_token.is_empty()
+                        && self.settings.playback_backend.is_apple_music()
+                    {
+                        self.dispatch_background_playlist_sync();
+                    }
+                    if show_banner {
+                        if synced_parts.is_empty() && !self.official_account.signed_in {
+                            self.set_banner("未检测到桌面版 Apple Music 登录记录".to_string(), true);
+                        } else {
+                            let detail = if synced_parts.is_empty() {
+                                "原装客户端播放服务就绪".to_string()
+                            } else {
+                                synced_parts.join(" · ")
+                            };
+                            self.set_banner(format!("已同步原装端信息：{detail}"), false);
+                        }
+                    }
                 }
                 AsyncMsg::SmtcCatalogEnriched {
                     meta_key,
@@ -3478,8 +4913,14 @@ impl AppUi {
                             validated_with_dur,
                         },
                     );
-                    let cur_mk = smtc_meta_key(&self.smtc.title, &self.smtc.artist);
-                    if cur_mk == meta_key {
+                    let cur_mk = smtc_catalog_cache_key(
+                        &self.smtc.title,
+                        &self.smtc.artist,
+                        &self.smtc.album,
+                    );
+                    let allow_am_enrich = self.settings.playback_backend.is_apple_music()
+                        || self.settings.playback_backend == PlaybackBackend::ExternalSmtc;
+                    if allow_am_enrich && cur_mk == meta_key {
                         let mut updated = self.smtc.clone();
                         if !adam_id.is_empty() && (updated.adam_id.is_none() || validated_with_dur) {
                             updated.adam_id = Some(adam_id);
@@ -3504,6 +4945,11 @@ impl AppUi {
                             }
                         }
                         self.on_playback_state_changed(updated);
+                    }
+                }
+                AsyncMsg::SmtcThumbnailBytesReady { track_key, bytes } => {
+                    if self.should_publish_smtc() {
+                        let _ = smtc::set_publisher_thumbnail_bytes(&track_key, &bytes);
                     }
                 }
                 AsyncMsg::LyricsFetched { key, seq, lyrics } => {
@@ -3686,7 +5132,7 @@ impl AppUi {
                         Ok((st, room_tracks)) => {
                             for u in &st.users {
                                 if let Some(ref av) = u.avatar_url {
-                                    self.request_artwork(renderer, av, false);
+                                    self.request_artwork_sized(renderer, av, false, 160);
                                 }
                             }
                             let inviter_id = if st.creator_id != 0 {
@@ -3786,7 +5232,7 @@ impl AppUi {
                         Ok(invites) => {
                             for inv in &invites {
                                 if let Some(ref av) = inv.inviter_avatar {
-                                    self.request_artwork(renderer, av, false);
+                                    self.request_artwork_sized(renderer, av, false, 160);
                                 }
                             }
                             let n = invites.len();
@@ -3811,7 +5257,7 @@ impl AppUi {
                         Ok(friends) => {
                             for f in &friends {
                                 if let Some(ref av) = f.avatar_url {
-                                    self.request_artwork(renderer, av, false);
+                                    self.request_artwork_sized(renderer, av, false, 160);
                                 }
                             }
                             self.listen_together.mutual_friends = friends;
@@ -3919,10 +5365,51 @@ impl AppUi {
             }
         }
 
-        // Debounced live search dispatch
+        // Budget GPU artwork texture uploads to max 4/frame (hero prioritized at front of deque)
+        // and discard stale off-route non-hero decodes before wasting GPU upload bandwidth!
+        let cur_art_epoch = self.art_epoch.load(std::sync::atomic::Ordering::Acquire);
+        let mut uploads_this_frame = 0usize;
+        while uploads_this_frame < 4 {
+            let Some((req_key, url, hero, req_epoch, decoded)) =
+                self.pending_art_uploads.pop_front()
+            else {
+                break;
+            };
+            if !hero && req_epoch != cur_art_epoch {
+                continue;
+            }
+            uploads_this_frame += 1;
+            changed = true;
+            // Record requested tier dim so natively smaller JPEGs never re-fetch in a loop
+            if let Some(dim_str) = req_key.split(':').nth(1) {
+                if let Ok(req_dim) = dim_str.parse::<u32>() {
+                    if self.art_attempted_dims.len() >= 2048 {
+                        self.art_attempted_dims.clear();
+                    }
+                    let stem = am_api::artwork_canonical_stem_ref(&url);
+                    let entry = self
+                        .art_attempted_dims
+                        .entry(stem.to_string())
+                        .or_insert(0);
+                    if req_dim > *entry {
+                        *entry = req_dim;
+                    }
+                }
+            }
+            if renderer.upload_decoded_artwork(url, decoded, hero) && renderer.has_fading_artwork() {
+                self.art_fading_until =
+                    Some(Instant::now() + std::time::Duration::from_millis(210));
+            }
+        }
+        if !self.pending_art_uploads.is_empty() && self.wake_hwnd != 0 {
+            Self::post_ui_wake(self.wake_hwnd);
+        }
+
+        // Fallback debounced live search check (primary trigger is async `SearchDebounceDue` timer with 0% idle redraws)
         if let Some(typed_at) = self.last_search_typed {
-            if typed_at.elapsed() >= std::time::Duration::from_millis(380) {
+            if typed_at.elapsed() >= std::time::Duration::from_millis(220) {
                 self.last_search_typed = None;
+                self.search_debounce_abort = None;
                 let q = self.search_query.trim().to_string();
                 if !q.is_empty() && q != self.last_dispatched_query {
                     self.dispatch_search(q);
@@ -3970,9 +5457,11 @@ impl AppUi {
             self.smtc.title = tr.name.clone();
             self.smtc.artist = tr.artist_name.clone();
             self.smtc.album = tr.album_name.clone();
-            if tr.artwork_url.is_some() {
-                self.smtc.artwork_url = tr.artwork_url.clone();
-            }
+            // Always replace cover & clear stale SMTC thumbnail bytes immediately on optimistic switch
+            // so a new track lacking artwork NEVER displays the outgoing song's cover!
+            self.smtc.artwork_url = tr.artwork_url.clone();
+            self.smtc.thumbnail_base64 = None;
+            self.smtc_pub_thumb_key.clear();
             self.smtc.duration_sec = tr.duration_sec;
             self.smtc.position_sec = 0.0;
             self.smtc.status = "Paused".to_string();
@@ -4104,6 +5593,7 @@ impl AppUi {
             && (self.smtc.position_sec >= self.smtc.duration_sec - 2.4 || st.position_sec <= 1.2)
         {
             if let Some(next_tr) = self.play_next_queue.pop_front() {
+            self.play_next_queue_ver = self.play_next_queue_ver.wrapping_add(1);
                 self.play_tracks_async(vec![next_tr], 0);
                 return;
             }
@@ -4198,29 +5688,40 @@ impl AppUi {
             st.sampled_at = None;
         }
 
-        // Enrich HLS stream specs & high-res artwork automatically when playing via built-in service
+        // Enrich HLS stream specs & high-res artwork automatically when playing via built-in AM service
+        // (strictly gated to numeric Apple Music catalog adam IDs so NetEase/QQ IDs never hit AM catalog!)
+        let allow_am_catalog_enrich =
+            active_be.is_apple_music() || active_be == PlaybackBackend::ExternalSmtc;
         if let Some(ref aid) = st.adam_id {
-            if !aid.is_empty()
+            let is_numeric_am_id =
+                !aid.is_empty() && aid.chars().all(|c| c.is_ascii_digit());
+            if active_be.is_apple_music()
+                && st.backend_mode == "agent"
+                && is_numeric_am_id
                 && (st.stream_specs.is_none() || st.artwork_url.is_none())
-                && self.enriched_adam_ids.insert(aid.clone())
             {
-                let aid_c = aid.clone();
-                let sf = self.settings.storefront.clone();
-                let tx = self.tx.clone();
-                let hwnd = self.wake_hwnd;
-                self.rt.spawn(async move {
-                    enrich_track_hls_and_meta(&aid_c, &sf).await;
-                    let snap = tokio::task::spawn_blocking(unified_playback_snapshot)
-                        .await
-                        .unwrap_or_default();
-                    let _ = tx.send(AsyncMsg::PlaybackUpdated(snap));
-                    Self::post_ui_wake(hwnd);
-                });
+                if self.enriched_adam_ids.len() >= 2048 {
+                    self.enriched_adam_ids.clear();
+                }
+                if self.enriched_adam_ids.insert(aid.clone()) {
+                    let aid_c = aid.clone();
+                    let sf = self.settings.storefront.clone();
+                    let tx = self.tx.clone();
+                    let hwnd = self.wake_hwnd;
+                    self.rt.spawn(async move {
+                        enrich_track_hls_and_meta(&aid_c, &sf).await;
+                        let snap = tokio::task::spawn_blocking(unified_playback_snapshot)
+                            .await
+                            .unwrap_or_default();
+                        let _ = tx.send(AsyncMsg::PlaybackUpdated(snap));
+                        Self::post_ui_wake(hwnd);
+                    });
+                }
             }
-        } else if !st.title.is_empty() {
+        } else if allow_am_catalog_enrich && !st.title.is_empty() {
             // External SMTC session (e.g. Apple Music desktop app): enrich adam_id + Enhanced HLS specs from catalog
             // strictly gated by `lyrics::strict_catalog_match_score` (and re-verified once real `duration_sec > 5.0` arrives!)
-            let mk = cur_mk.clone();
+            let mk = smtc_catalog_cache_key(&st.title, &st.artist, &st.album);
             let has_real_dur = st.duration_sec > 5.0;
             let mut need_dur_reverify = false;
             if let Some(cached) = self.smtc_catalog_cache.get(&mk) {
@@ -4247,36 +5748,38 @@ impl AppUi {
             } else {
                 format!("smtc:{mk}:init")
             };
-            if (st.adam_id.is_none() || need_dur_reverify)
-                && self.wake_hwnd != 0
-                && self.enriched_adam_ids.insert(enrich_tag)
-            {
-                let title_q = st.title.clone();
-                let artist_q = st.artist.clone();
-                let album_q = st.album.clone();
-                let dur_q = st.duration_sec;
-                let sf = self.settings.storefront.clone();
-                let utok = non_empty_opt(&self.settings.user_token);
-                let prefs = self.audio_prefs.clone();
-                let tx = self.tx.clone();
-                let hwnd = self.wake_hwnd;
-                self.rt.spawn(async move {
-                    if let Some((aid, art, badge, specs)) = lookup_smtc_track_in_catalog(
-                        &title_q, &artist_q, &album_q, dur_q, &sf, utok, &prefs,
-                    )
-                    .await
-                    {
-                        let _ = tx.send(AsyncMsg::SmtcCatalogEnriched {
-                            meta_key: mk,
-                            adam_id: aid,
-                            artwork_url: art,
-                            audio_quality: badge,
-                            stream_specs: specs,
-                            validated_with_dur: dur_q > 5.0,
-                        });
-                        Self::post_ui_wake(hwnd);
-                    }
-                });
+            if (st.adam_id.is_none() || need_dur_reverify) && self.wake_hwnd != 0 {
+                if self.enriched_adam_ids.len() >= 2048 {
+                    self.enriched_adam_ids.clear();
+                }
+                if self.enriched_adam_ids.insert(enrich_tag) {
+                    let title_q = st.title.clone();
+                    let artist_q = st.artist.clone();
+                    let album_q = st.album.clone();
+                    let dur_q = st.duration_sec;
+                    let sf = self.settings.storefront.clone();
+                    let utok = non_empty_opt(&self.settings.user_token);
+                    let prefs = self.audio_prefs.clone();
+                    let tx = self.tx.clone();
+                    let hwnd = self.wake_hwnd;
+                    self.rt.spawn(async move {
+                        if let Some((aid, art, badge, specs)) = lookup_smtc_track_in_catalog(
+                            &title_q, &artist_q, &album_q, dur_q, &sf, utok, &prefs,
+                        )
+                        .await
+                        {
+                            let _ = tx.send(AsyncMsg::SmtcCatalogEnriched {
+                                meta_key: mk,
+                                adam_id: aid,
+                                artwork_url: art,
+                                audio_quality: badge,
+                                stream_specs: specs,
+                                validated_with_dur: dur_q > 5.0,
+                            });
+                            Self::post_ui_wake(hwnd);
+                        }
+                    });
+                }
             }
         }
 
@@ -4312,19 +5815,32 @@ impl AppUi {
                 st.duration_sec,
                 false,
             );
+            self.abort_pending_track_motion_probe();
+            let allow_track_motion = active_be.supports_motion_artwork()
+                || (active_be == PlaybackBackend::ExternalSmtc
+                    && st
+                        .adam_id
+                        .as_deref()
+                        .is_some_and(|a| !a.is_empty() && a.chars().all(|c| c.is_ascii_digit())));
             if self.settings.motion_artwork_enabled
+                && allow_track_motion
                 && self.wake_hwnd != 0
                 && !self.track_motion_urls.contains_key(&new_key)
                 && self.pending_motion_tracks.insert(new_key.clone())
             {
                 let sf = self.settings.storefront.clone();
-                let aid = st.adam_id.clone();
+                let aid = st
+                    .adam_id
+                    .as_deref()
+                    .filter(|a| !a.is_empty() && a.chars().all(|c| c.is_ascii_digit()))
+                    .map(|s| s.to_string());
                 let tt = st.title.clone();
                 let ar = st.artist.clone();
                 let al = st.album.clone();
                 let tx = self.tx.clone();
                 let hwnd = self.wake_hwnd;
-                self.rt.spawn(async move {
+                let probe_key = new_key.clone();
+                let handle = self.rt.spawn(async move {
                     let vurl = am_api::fetch_track_motion_video_url(
                         &sf,
                         aid.as_deref(),
@@ -4339,6 +5855,7 @@ impl AppUi {
                     });
                     Self::post_ui_wake(hwnd);
                 });
+                self.track_motion_task_abort = Some((probe_key, handle.abort_handle()));
             }
             if let Some(existing) = saved_same_song_lyrics {
                 if self.current_lyrics.is_none() {
@@ -4576,6 +6093,116 @@ impl AppUi {
 
         self.smtc = st;
         self.update_viz_subscription();
+        self.sync_smtc_publisher(false);
+    }
+
+    /// Returns `true` when AM-Light should publish its own playback session to Windows SMTC.
+    /// Automatically disabled in `ExternalSmtc` mode and passive `"smtc"` mirror mode to prevent
+    /// self-looping or duplicate Windows media cards.
+    pub fn should_publish_smtc(&self) -> bool {
+        if !self.settings.smtc_publish_enabled
+            || self.settings.playback_backend == PlaybackBackend::ExternalSmtc
+        {
+            return false;
+        }
+        if self.smtc.backend_mode == "smtc" {
+            return false;
+        }
+        !self.smtc.title.trim().is_empty()
+            && matches!(self.smtc.status.as_str(), "Playing" | "Paused")
+    }
+
+    /// Synchronizes current built-in playback metadata, status, sub-ms timeline, and album art
+    /// to Windows System Media Transport Controls (for `Win + A`, lockscreen, headsets, and Lyricify).
+    pub fn sync_smtc_publisher(&mut self, force_timeline: bool) {
+        if !self.should_publish_smtc() {
+            if smtc::is_publisher_enabled() {
+                smtc::disable_publisher();
+                self.smtc_pub_thumb_key.clear();
+            }
+            return;
+        }
+
+        let dur = self.smtc.duration_sec.max(0.0);
+        let live_pos = if self.smtc.status == "Playing" {
+            let p = self.playhead_anchor_sec + self.playhead_anchor_inst.elapsed().as_secs_f64();
+            if dur > 0.0 {
+                p.clamp(0.0, dur)
+            } else {
+                p.max(0.0)
+            }
+        } else if dur > 0.0 {
+            self.smtc.position_sec.clamp(0.0, dur)
+        } else {
+            self.smtc.position_sec.max(0.0)
+        };
+
+        let track_key = format!(
+            "{}\x1f{}\x1f{}",
+            self.smtc.title, self.smtc.artist, self.smtc.album
+        );
+        let payload = smtc::SmtcPublishPayload {
+            title: self.smtc.title.clone(),
+            artist: self.smtc.artist.clone(),
+            album: self.smtc.album.clone(),
+            status: self.smtc.status.clone(),
+            position_sec: live_pos,
+            duration_sec: dur,
+            track_key: track_key.clone(),
+        };
+        let need_thumb = smtc::sync_publisher_state(&payload, force_timeline);
+
+        if need_thumb && self.wake_hwnd != 0 {
+            let art_url_opt = self
+                .smtc
+                .artwork_url
+                .as_deref()
+                .filter(|u| !u.is_empty() && !u.starts_with("smtc://"))
+                .map(|u| u.to_string());
+            let thumb_b64_opt = self
+                .smtc
+                .thumbnail_base64
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            let dispatch_tag = if let Some(ref u) = art_url_opt {
+                format!("{track_key}|url:{u}")
+            } else if let Some(ref b64) = thumb_b64_opt {
+                format!(
+                    "{track_key}|b64:{:016x}:{}",
+                    fnv1a_64_bytes(b64.as_bytes()),
+                    b64.len()
+                )
+            } else {
+                String::new()
+            };
+            if !dispatch_tag.is_empty() && self.smtc_pub_thumb_key != dispatch_tag {
+                self.smtc_pub_thumb_key = dispatch_tag;
+                let tx = self.tx.clone();
+                let hwnd = self.wake_hwnd;
+                if let Some(url) = art_url_opt {
+                    let target_url = upgrade_artwork_request_url(&url, false);
+                    self.rt.spawn(async move {
+                        if let Ok(bytes) = am_api::fetch_artwork_bytes(&target_url, false).await {
+                            let _ = tx.send(AsyncMsg::SmtcThumbnailBytesReady { track_key, bytes });
+                            Self::post_ui_wake(hwnd);
+                        }
+                    });
+                } else if let Some(b64) = thumb_b64_opt {
+                    self.rt.spawn(async move {
+                        if let Ok(Some(bytes)) = tokio::task::spawn_blocking(move || {
+                            use base64::{engine::general_purpose, Engine as _};
+                            general_purpose::STANDARD.decode(&b64).ok()
+                        })
+                        .await
+                        {
+                            let _ = tx.send(AsyncMsg::SmtcThumbnailBytesReady { track_key, bytes });
+                            Self::post_ui_wake(hwnd);
+                        }
+                    });
+                }
+            }
+        }
     }
 
     fn dispatch_lyrics_fetch(
@@ -4647,41 +6274,91 @@ impl AppUi {
         });
     }
 
+    fn abort_pending_track_motion_probe(&mut self) {
+        if let Some((key, handle)) = self.track_motion_task_abort.take() {
+            handle.abort();
+            self.pending_motion_tracks.remove(&key);
+        }
+    }
+
+    fn abort_pending_detail_fetch(&mut self) {
+        if let Some(handle) = self.detail_task_abort.take() {
+            handle.abort();
+        }
+    }
+
     pub fn request_artwork(&mut self, renderer: &D2DRenderer, url: &str, hero: bool) {
-        if url.is_empty() || url.starts_with("smtc://") || renderer.has_artwork(url, hero) {
+        let max_dim = if hero {
+            if self.settings.aggressive_memory_release { 512u32 } else { 720u32 }
+        } else if self.settings.aggressive_memory_release {
+            256u32
+        } else {
+            384u32
+        };
+        self.request_artwork_sized(renderer, url, hero, max_dim);
+    }
+
+    pub fn request_artwork_sized(
+        &mut self,
+        renderer: &D2DRenderer,
+        url: &str,
+        hero: bool,
+        target_dim: u32,
+    ) {
+        if url.is_empty() || url.starts_with("smtc://") {
             return;
         }
-        let stem = am_api::artwork_canonical_stem(url);
-        let req_key = format!("{hero}:{stem}");
+        let max_dim = if hero {
+            let cap = if self.settings.aggressive_memory_release { 512u32 } else { 720u32 };
+            target_dim.clamp(256, cap)
+        } else {
+            let cap = if self.settings.aggressive_memory_release { 256u32 } else { 384u32 };
+            target_dim.clamp(128, cap)
+        };
+        let stem = am_api::artwork_canonical_stem_ref(url);
+        if renderer.has_artwork(url, hero)
+            && (renderer.has_artwork_min_dim(url, hero, max_dim)
+                || self.art_attempted_dims.get(stem).copied().unwrap_or(0) >= max_dim)
+        {
+            return;
+        }
+        if !hero {
+            let hero_dim = if self.settings.aggressive_memory_release { 512u32 } else { 720u32 };
+            if self.pending_art.contains(&format!("true:{hero_dim}:{stem}")) {
+                return;
+            }
+        }
+        let req_key = format!("{hero}:{max_dim}:{stem}");
         if self.failed_art.contains(&req_key)
             || (!hero && self.pending_art.len() > 140)
             || !self.pending_art.insert(req_key.clone())
         {
             return;
         }
-        let target_url = if hero {
-            url.replace("360x360", "720x720")
-                .replace("240x240", "720x720")
-                .replace("120x120", "720x720")
-                .replace("480x480", "720x720")
-        } else {
-            url.replace("120x120", "480x480")
-                .replace("240x240", "480x480")
-                .replace("360x360", "480x480")
-        };
+        let target_url = upgrade_artwork_request_url_dim(url, max_dim);
         let key_url = url.to_string();
         let tx = self.tx.clone();
         let hwnd = self.wake_hwnd;
-        let max_dim = if hero {
-            if self.settings.aggressive_memory_release { 512u32 } else { 768u32 }
-        } else if self.settings.aggressive_memory_release {
-            256u32
-        } else {
-            384u32
-        };
+        let epoch_arc = std::sync::Arc::clone(&self.art_epoch);
+        let req_epoch = epoch_arc.load(std::sync::atomic::Ordering::Acquire);
         self.rt.spawn(async move {
-            match am_api::fetch_artwork_bytes(&target_url, hero).await {
+            // Drop stale off-route thumbnail requests immediately before network/disk/WIC work!
+            if !hero && epoch_arc.load(std::sync::atomic::Ordering::Acquire) != req_epoch {
+                let _ = tx.send(AsyncMsg::ArtworkCancelled { req_key });
+                return;
+            }
+            match am_api::fetch_artwork_bytes_if_current(
+                &target_url,
+                hero,
+                (!hero).then_some((epoch_arc.as_ref(), req_epoch)),
+            )
+            .await
+            {
                 Ok(bytes) => {
+                    if !hero && epoch_arc.load(std::sync::atomic::Ordering::Acquire) != req_epoch {
+                        let _ = tx.send(AsyncMsg::ArtworkCancelled { req_key });
+                        return;
+                    }
                     // Decode & scale WIC pixels off the UI thread so fast scrolling never stalls D2D!
                     let decoded_opt = tokio::task::spawn_blocking(move || {
                         D2DRenderer::decode_artwork_pixels_cpu(&bytes, max_dim)
@@ -4689,17 +6366,25 @@ impl AppUi {
                     .await
                     .ok()
                     .flatten();
+                    if !hero && epoch_arc.load(std::sync::atomic::Ordering::Acquire) != req_epoch {
+                        let _ = tx.send(AsyncMsg::ArtworkCancelled { req_key });
+                        return;
+                    }
                     if let Some(decoded) = decoded_opt {
                         let _ = tx.send(AsyncMsg::ArtworkDecoded {
                             req_key,
                             url: key_url,
                             hero,
+                            req_epoch,
                             decoded,
                         });
                         Self::post_ui_wake(hwnd);
                     } else {
                         let _ = tx.send(AsyncMsg::ArtworkFailed { req_key });
                     }
+                }
+                Err(e) if e == "CANCELLED" => {
+                    let _ = tx.send(AsyncMsg::ArtworkCancelled { req_key });
                 }
                 Err(_) => {
                     let _ = tx.send(AsyncMsg::ArtworkFailed { req_key });
@@ -4711,6 +6396,33 @@ impl AppUi {
     // ========================================================================
     // Multi-Backend Data Fetchers & Account Helpers
     // ========================================================================
+
+    /// Returns a zero-copy `Arc<[AgentTrackInput]>` snapshot of the active queue,
+    /// refreshing strictly when backend/engine `state_seq()`, `play_next_queue`, or
+    /// `lyrics_queue_version` changes (zero periodic 750ms expiry clones!).
+    pub fn active_queue_tracks_cached(&mut self) -> std::sync::Arc<[AgentTrackInput]> {
+        let (be_tag, seq) = match self.settings.playback_backend {
+            PlaybackBackend::AppleMusicNative => (0u8, am_agent::state_seq()),
+            PlaybackBackend::AppleMusicWeb => (1u8, web_am_player::state_seq()),
+            PlaybackBackend::NetEase => (2u8, native_player::state_seq()),
+            PlaybackBackend::QQMusic => (3u8, native_player::state_seq()),
+            PlaybackBackend::ExternalSmtc => (4u8, 0),
+        };
+        let sig = (
+            be_tag,
+            seq,
+            self.play_next_queue_ver,
+            self.play_next_queue.len(),
+            self.lyrics_queue_version,
+        );
+        if self.cached_queue_sig == sig {
+            return std::sync::Arc::clone(&self.cached_queue_tracks);
+        }
+        let fresh: std::sync::Arc<[AgentTrackInput]> = std::sync::Arc::from(self.active_queue_tracks());
+        self.cached_queue_sig = sig;
+        self.cached_queue_tracks = std::sync::Arc::clone(&fresh);
+        fresh
+    }
 
     pub fn active_queue_tracks(&self) -> Vec<AgentTrackInput> {
         let mut base = match self.settings.playback_backend {
@@ -4785,6 +6497,8 @@ impl AppUi {
             volume: Some(saved_vol),
             ..Default::default()
         };
+        smtc::disable_publisher();
+        self.smtc_pub_thumb_key.clear();
         self.playhead_anchor_sec = 0.0;
         self.playhead_anchor_inst = Instant::now();
         self.smtc_optimistic_seek = None;
@@ -4797,6 +6511,7 @@ impl AppUi {
         self.show_more_popover = false;
         self.show_queue_popover = false;
         self.play_next_queue.clear();
+        self.play_next_queue_ver = self.play_next_queue_ver.wrapping_add(1);
 
         // Clear catalog caches so pages cleanly reload with the new backend's content
         self.home_shelves.clear();
@@ -4806,20 +6521,56 @@ impl AppUi {
         self.home_playlists.clear();
         self.home_songs.clear();
         self.radio_cards.clear();
+        self.home_shelves_rev = self.home_shelves_rev.wrapping_add(1);
+        self.browse_shelves_rev = self.browse_shelves_rev.wrapping_add(1);
+        self.radio_shelves_rev = self.radio_shelves_rev.wrapping_add(1);
+        self.home_fallback_rev = self.home_fallback_rev.wrapping_add(1);
+        self.radio_cards_rev = self.radio_cards_rev.wrapping_add(1);
+        self.cancel_in_flight_search();
+        self.abort_pending_detail_fetch();
+        self.abort_pending_track_motion_probe();
+        self.search_artists.clear();
         self.search_albums.clear();
         self.search_playlists.clear();
         self.search_songs.clear();
+        self.search_local_cards.clear();
+        self.search_local_songs.clear();
+        self.search_results_rev = self.search_results_rev.wrapping_add(1);
+        self.search_completed_query.clear();
+        self.search_error = None;
+        self.last_dispatched_query.clear();
         self.lib_cards.clear();
         self.lib_songs.clear();
+        self.lib_cards_rev = self.lib_cards_rev.wrapping_add(1);
+        self.lib_songs_rev = self.lib_songs_rev.wrapping_add(1);
         self.sidebar_playlists.clear();
         self.clear_page_mem_cache();
         self.lyrics_queue_version = self.lyrics_queue_version.wrapping_add(1);
         self.detail_data = None;
+        self.detail_data_rev = self.detail_data_rev.wrapping_add(1);
         self.detail_loading = false;
         self.pending_detail_artwork = None;
         self.pending_detail_motion_url = None;
+        self.failed_art.clear();
+        self.art_attempted_dims.clear();
+        self.pending_art_uploads.clear();
+        self.smtc_catalog_cache.clear();
+        self.enriched_adam_ids.clear();
+        self.track_motion_urls.clear();
+        self.pending_motion_tracks.clear();
+        self.last_lyrics_motion_url = None;
+        self.last_detail_motion_url = None;
         self.visible_home_motion_urls.clear();
+        self.visible_home_motion_targets.clear();
+        self.prefetch_home_motion_targets.clear();
+        self.rendered_home_motion_urls.clear();
+        self.rendered_home_motion_cards.clear();
+        self.motion_fade_alphas.clear();
+        self.last_card_motion_seqs.clear();
+        self.settled_home_baseline_valid = false;
         self.motion_art.sync_visible_urls(&[]);
+        self.motion_art.sync_prefetch_urls(&[]);
+        self.motion_art.set_slot("lyrics_cover", None, false);
         self.motion_art.set_slot("detail_hero", None, false);
         if !next.supports_motion_artwork() {
             self.motion_art.set_global_enabled(false);
@@ -5198,14 +6949,246 @@ impl AppUi {
         });
     }
 
-    pub fn dispatch_search(&mut self, query: String) {
-        if query.trim().is_empty() {
+    const SEARCH_CACHE_TTL_SECS: u64 = 300;
+    const SEARCH_CACHE_MAX_ENTRIES: usize = 48;
+
+    fn search_cache_key(&self, query: &str) -> String {
+        format!(
+            "{:?}:{}:{}",
+            self.settings.playback_backend,
+            self.settings.storefront.trim().to_ascii_lowercase(),
+            query.trim().to_ascii_lowercase()
+        )
+    }
+
+    pub fn cancel_in_flight_search(&mut self) {
+        if let Some(h) = self.search_task_abort.take() {
+            h.abort();
+        }
+        self.search_req_seq = self.search_req_seq.wrapping_add(1);
+        self.search_loading = false;
+    }
+
+    pub fn put_search_cache(&mut self, key: String, payload: SearchCatalogPayload) {
+        let now = Instant::now();
+        self.search_cache.insert(
+            key,
+            CachedSearchEntry {
+                payload,
+                fetched_at: now,
+                last_used: now,
+            },
+        );
+        while self.search_cache.len() > Self::SEARCH_CACHE_MAX_ENTRIES {
+            if let Some(oldest_k) = self
+                .search_cache
+                .iter()
+                .min_by_key(|(_, v)| v.last_used)
+                .map(|(k, _)| k.clone())
+            {
+                self.search_cache.remove(&oldest_k);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn try_apply_cached_search(&mut self, trimmed_query: &str) -> bool {
+        let key = self.search_cache_key(trimmed_query);
+        let hit = self.search_cache.get_mut(&key).and_then(|entry| {
+            if entry.fetched_at.elapsed().as_secs() < Self::SEARCH_CACHE_TTL_SECS {
+                entry.last_used = Instant::now();
+                Some(entry.payload.clone())
+            } else {
+                None
+            }
+        });
+        let Some(payload) = hit else {
+            return false;
+        };
+        self.cancel_in_flight_search();
+        self.last_dispatched_query = trimmed_query.to_string();
+        self.search_completed_query = trimmed_query.to_string();
+        self.search_error = None;
+        self.search_artists = payload.artists;
+        self.search_albums = payload.albums;
+        self.search_playlists = payload.playlists;
+        self.search_songs = payload.songs;
+        self.search_results_rev = self.search_results_rev.wrapping_add(1);
+        true
+    }
+
+    pub fn refresh_local_search_matches(&mut self) {
+        let q = self.search_query.trim().to_ascii_lowercase();
+        self.search_local_cards.clear();
+        self.search_local_songs.clear();
+        self.search_results_rev = self.search_results_rev.wrapping_add(1);
+        if q.is_empty() {
             return;
         }
-        self.last_dispatched_query = query.clone();
+        let mut seen_cards: HashSet<(String, String)> = HashSet::new();
+        let mut push_card = |c: &MediaCardItem, out: &mut Vec<MediaCardItem>| {
+            if out.len() >= 6 {
+                return;
+            }
+            if (contains_ascii_icase(&c.title, &q) || contains_ascii_icase(&c.subtitle, &q))
+                && seen_cards.insert((c.kind.clone(), c.id.clone()))
+            {
+                out.push(c.clone());
+            }
+        };
+        for c in &self.sidebar_playlists {
+            push_card(c, &mut self.search_local_cards);
+        }
+        for key in ["playlists", "albums", "artists"] {
+            if let Some(list) = self.lib_cards.get(key) {
+                for c in list {
+                    push_card(c, &mut self.search_local_cards);
+                }
+            }
+        }
+        let mut seen_tracks: HashSet<String> = HashSet::new();
+        for tr in &self.lib_songs {
+            if self.search_local_songs.len() >= 5 {
+                break;
+            }
+            if contains_ascii_icase(&tr.name, &q)
+                || contains_ascii_icase(&tr.artist_name, &q)
+                || contains_ascii_icase(&tr.album_name, &q)
+            {
+                let tid = tr.effective_adam_id_str();
+                let key = if tid.is_empty() {
+                    tr.name.clone()
+                } else {
+                    tid.to_string()
+                };
+                if seen_tracks.insert(key) {
+                    self.search_local_songs.push(tr.clone());
+                }
+            }
+        }
+        if self.search_local_songs.len() < 5 {
+            const MAX_CACHE_TRACK_SCAN: usize = 4_000;
+            let mut scanned = 0usize;
+            'cache_scan: for det in self.playlist_cache.details.values() {
+                for tr in &det.tracks {
+                    if self.search_local_songs.len() >= 5 || scanned >= MAX_CACHE_TRACK_SCAN {
+                        break 'cache_scan;
+                    }
+                    scanned += 1;
+                    if contains_ascii_icase(&tr.name, &q)
+                        || contains_ascii_icase(&tr.artist_name, &q)
+                        || contains_ascii_icase(&tr.album_name, &q)
+                    {
+                        let tid = tr.effective_adam_id_str();
+                        let key = if tid.is_empty() {
+                            tr.name.clone()
+                        } else {
+                            tid.to_string()
+                        };
+                        if seen_tracks.insert(key) {
+                            self.search_local_songs.push(tr.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn mark_search_query_edited(&mut self) {
+        if let Some(h) = self.search_debounce_abort.take() {
+            h.abort();
+        }
+        self.search_debounce_gen = self.search_debounce_gen.wrapping_add(1);
+        self.refresh_local_search_matches();
+
+        let q = self.search_query.trim().to_string();
+        if q.is_empty() {
+            self.last_search_typed = None;
+            self.cancel_in_flight_search();
+            self.search_artists.clear();
+            self.search_albums.clear();
+            self.search_playlists.clear();
+            self.search_songs.clear();
+            self.search_error = None;
+            self.search_completed_query.clear();
+            self.last_dispatched_query.clear();
+            return;
+        }
+
+        // Instant 0ms cache hit while editing / backspacing!
+        if self.try_apply_cached_search(&q) {
+            self.last_search_typed = None;
+            if self.wake_hwnd != 0 && self.route != PageRoute::Search {
+                self.navigate_to(PageRoute::Search);
+            }
+            return;
+        }
+
+        // Zero-redraw async debounce timer (220ms): no continuous redraw loop while typing!
+        self.last_search_typed = Some(Instant::now());
+        if self.wake_hwnd != 0 {
+            let gen = self.search_debounce_gen;
+            let tx = self.tx.clone();
+            let hwnd = self.wake_hwnd;
+            let handle = self.rt.spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(220)).await;
+                let _ = tx.send(AsyncMsg::SearchDebounceDue { gen });
+                Self::post_ui_wake(hwnd);
+            });
+            self.search_debounce_abort = Some(handle.abort_handle());
+        }
+    }
+
+    fn record_recent_search(&mut self, q: &str) {
+        let clean = q.trim();
+        if clean.is_empty() {
+            return;
+        }
+        let lower = clean.to_ascii_lowercase();
+        self.search_recent_queries
+            .retain(|x| x.to_ascii_lowercase() != lower);
+        self.search_recent_queries.insert(0, clean.to_string());
+        self.search_recent_queries.truncate(8);
+    }
+
+    pub fn dispatch_search(&mut self, query: String) {
+        self.dispatch_search_ex(query, false);
+    }
+
+    pub fn dispatch_search_ex(&mut self, query: String, force_refresh: bool) {
+        let q = query.trim().to_string();
+        if q.is_empty() {
+            return;
+        }
+        if let Some(h) = self.search_debounce_abort.take() {
+            h.abort();
+        }
+        self.last_search_typed = None;
+        self.record_recent_search(&q);
+        self.refresh_local_search_matches();
+
         if self.route != PageRoute::Search {
             self.navigate_to(PageRoute::Search);
         }
+
+        if !force_refresh && self.try_apply_cached_search(&q) {
+            return;
+        }
+
+        self.cancel_in_flight_search();
+        let req_seq = self.search_req_seq;
+        let cache_key = self.search_cache_key(&q);
+        self.last_dispatched_query = q.clone();
+        self.search_loading = true;
+        self.search_error = None;
+        if self.search_completed_query != q {
+            self.search_artists.clear();
+            self.search_albums.clear();
+            self.search_playlists.clear();
+            self.search_songs.clear();
+        }
+
         let backend = self.settings.playback_backend;
         let tx = self.tx.clone();
         let hwnd = self.wake_hwnd;
@@ -5213,64 +7196,80 @@ impl AppUi {
         match backend {
             PlaybackBackend::NetEase => {
                 let ck = non_empty_opt(&self.settings.netease_cookie);
-                let q = query.trim().to_string();
-                self.rt.spawn(async move {
-                    if let Ok((albs, pls, songs)) = netease_api::search_catalog(&q, ck.as_deref()).await {
-                        let map_c = |v: Vec<netease_api::NetEaseCard>| -> Vec<MediaCardItem> {
-                            v.into_iter()
-                                .map(|c| MediaCardItem {
-                                    id: c.id,
-                                    kind: c.kind,
-                                    title: c.title,
-                                    subtitle: c.subtitle,
-                                    description: c.description,
-                                    artwork_url: c.artwork_url,
-                                    badge: c.badge,
-                                    track_input: c.track_input,
-                                })
-                                .collect()
-                        };
-                        let _ = tx.send(AsyncMsg::BackendSearchLoaded {
-                            backend,
-                            query: q,
-                            albums: map_c(albs),
-                            playlists: map_c(pls),
-                            songs,
+                let handle = self.rt.spawn(async move {
+                    let res = netease_api::search_catalog(&q, ck.as_deref())
+                        .await
+                        .map(|(arts, albs, pls, songs)| {
+                            let map_c = |v: Vec<netease_api::NetEaseCard>| -> Vec<MediaCardItem> {
+                                v.into_iter()
+                                    .map(|c| MediaCardItem {
+                                        id: c.id,
+                                        kind: c.kind,
+                                        title: c.title,
+                                        subtitle: c.subtitle,
+                                        description: c.description,
+                                        artwork_url: c.artwork_url,
+                                        badge: c.badge,
+                                        track_input: c.track_input,
+                                    })
+                                    .collect()
+                            };
+                            SearchCatalogPayload {
+                                artists: map_c(arts),
+                                albums: map_c(albs),
+                                playlists: map_c(pls),
+                                songs,
+                            }
                         });
-                        Self::post_ui_wake(hwnd);
-                    }
+                    let _ = tx.send(AsyncMsg::SearchCompleted {
+                        seq: req_seq,
+                        backend,
+                        cache_key,
+                        query: q,
+                        res,
+                    });
+                    Self::post_ui_wake(hwnd);
                 });
+                self.search_task_abort = Some(handle.abort_handle());
                 return;
             }
             PlaybackBackend::QQMusic => {
                 let ck = non_empty_opt(&self.settings.qq_cookie);
-                let q = query.trim().to_string();
-                self.rt.spawn(async move {
-                    if let Ok((albs, pls, songs)) = qq_api::search_catalog(&q, ck.as_deref()).await {
-                        let map_c = |v: Vec<qq_api::QQCard>| -> Vec<MediaCardItem> {
-                            v.into_iter()
-                                .map(|c| MediaCardItem {
-                                    id: c.id,
-                                    kind: c.kind,
-                                    title: c.title,
-                                    subtitle: c.subtitle,
-                                    description: c.description,
-                                    artwork_url: c.artwork_url,
-                                    badge: c.badge,
-                                    track_input: None,
-                                })
-                                .collect()
-                        };
-                        let _ = tx.send(AsyncMsg::BackendSearchLoaded {
-                            backend,
-                            query: q,
-                            albums: map_c(albs),
-                            playlists: map_c(pls),
-                            songs,
+                let handle = self.rt.spawn(async move {
+                    let res = qq_api::search_catalog(&q, ck.as_deref())
+                        .await
+                        .map(|(arts, albs, pls, songs)| {
+                            let map_c = |v: Vec<qq_api::QQCard>| -> Vec<MediaCardItem> {
+                                v.into_iter()
+                                    .map(|c| MediaCardItem {
+                                        id: c.id,
+                                        kind: c.kind,
+                                        title: c.title,
+                                        subtitle: c.subtitle,
+                                        description: c.description,
+                                        artwork_url: c.artwork_url,
+                                        badge: c.badge,
+                                        track_input: None,
+                                    })
+                                    .collect()
+                            };
+                            SearchCatalogPayload {
+                                artists: map_c(arts),
+                                albums: map_c(albs),
+                                playlists: map_c(pls),
+                                songs,
+                            }
                         });
-                        Self::post_ui_wake(hwnd);
-                    }
+                    let _ = tx.send(AsyncMsg::SearchCompleted {
+                        seq: req_seq,
+                        backend,
+                        cache_key,
+                        query: q,
+                        res,
+                    });
+                    Self::post_ui_wake(hwnd);
                 });
+                self.search_task_abort = Some(handle.abort_handle());
                 return;
             }
             _ => {}
@@ -5278,34 +7277,48 @@ impl AppUi {
 
         let sf = self.settings.storefront.clone();
         let utok = non_empty_opt(&self.settings.user_token);
-        let enc: String = url::form_urlencoded::byte_serialize(query.trim().as_bytes()).collect();
-        self.rt.spawn(async move {
+        let enc: String = url::form_urlencoded::byte_serialize(q.as_bytes()).collect();
+        let handle = self.rt.spawn(async move {
             let path = format!(
-                "v1/catalog/{sf}/search?term={enc}&types=songs,albums,playlists&extend=audioTraits&limit=20&l=zh-Hans-CN"
+                "v1/catalog/{sf}/search?term={enc}&types=songs,artists,albums,playlists&extend=audioTraits&limit=12&l=zh-Hans-CN"
             );
-            if let Ok(json) = am_api::fetch_am_api(path, utok, None, Some(sf)).await {
-                let albums =
-                    parse_media_cards_array(json.pointer("/results/albums/data"), "albums");
-                let playlists =
-                    parse_media_cards_array(json.pointer("/results/playlists/data"), "playlists");
-                let songs = json
-                    .pointer("/results/songs/data")
-                    .and_then(Value::as_array)
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| parse_track_from_am_json(v, None, None))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let _ = tx.send(AsyncMsg::SearchResults {
-                    query,
-                    albums,
-                    playlists,
-                    songs,
+            let res = am_api::fetch_am_api(path, utok, None, Some(sf))
+                .await
+                .map(|json| {
+                    let artists =
+                        parse_media_cards_array(json.pointer("/results/artists/data"), "artists");
+                    let albums =
+                        parse_media_cards_array(json.pointer("/results/albums/data"), "albums");
+                    let playlists = parse_media_cards_array(
+                        json.pointer("/results/playlists/data"),
+                        "playlists",
+                    );
+                    let songs = json
+                        .pointer("/results/songs/data")
+                        .and_then(Value::as_array)
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| parse_track_from_am_json(v, None, None))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    SearchCatalogPayload {
+                        artists,
+                        albums,
+                        playlists,
+                        songs,
+                    }
                 });
-                Self::post_ui_wake(hwnd);
-            }
+            let _ = tx.send(AsyncMsg::SearchCompleted {
+                seq: req_seq,
+                backend,
+                cache_key,
+                query: q,
+                res,
+            });
+            Self::post_ui_wake(hwnd);
         });
+        self.search_task_abort = Some(handle.abort_handle());
     }
 
     pub fn fetch_sidebar_playlists(&self) {
@@ -5373,9 +7386,16 @@ impl AppUi {
         };
         let sf = self.settings.storefront.clone();
         self.rt.spawn(async move {
-            let path = "v1/me/library/playlists?limit=24&l=zh-Hans-CN".to_string();
-            if let Ok(json) = am_api::fetch_am_api(path, Some(utok), None, Some(sf)).await {
-                let cards = parse_media_cards_array(json.get("data"), "library-playlists");
+            if let Ok(items) = am_api::fetch_am_paginated_data(
+                "v1/me/library/playlists?limit=100&l=zh-Hans-CN",
+                Some(utok),
+                Some(sf),
+                20,
+                true,
+            )
+            .await
+            {
+                let cards = parse_media_cards_slice(&items, "library-playlists");
                 let _ = tx.send(AsyncMsg::SidebarPlaylistsLoaded(cards));
                 Self::post_ui_wake(hwnd);
             }
@@ -5620,19 +7640,19 @@ impl AppUi {
             PageRoute::LibSongs => {
                 self.rt.spawn(async move {
                     let _guard = lib_guard;
-                    let path =
-                        "v1/me/library/songs?include=catalog&extend=audioTraits&limit=80&l=zh-Hans-CN"
-                            .to_string();
-                    if let Ok(json) = am_api::fetch_am_api(path, Some(utok), None, Some(sf)).await {
-                        let songs = json
-                            .get("data")
-                            .and_then(Value::as_array)
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|v| parse_track_from_am_json(v, None, None))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
+                    if let Ok(items) = am_api::fetch_am_paginated_data(
+                        "v1/me/library/songs?include=catalog&extend=audioTraits&limit=100&l=zh-Hans-CN",
+                        Some(utok),
+                        Some(sf),
+                        50,
+                        true,
+                    )
+                    .await
+                    {
+                        let songs = items
+                            .iter()
+                            .filter_map(|v| parse_track_from_am_json(v, None, None))
+                            .collect();
                         let _ = tx.send(AsyncMsg::LibrarySongsLoaded { backend, songs });
                         Self::post_ui_wake(hwnd);
                     }
@@ -5643,31 +7663,36 @@ impl AppUi {
             | PageRoute::LibArtists
             | PageRoute::LibPlaylists
             | PageRoute::LibForYou => {
-                let (rkey, path, default_kind) = match route {
+                let (rkey, path, default_kind, max_pages) = match route {
                     PageRoute::LibRecent => (
                         "recent",
                         "v1/me/library/recently-added?limit=25&l=zh-Hans-CN",
                         "library-albums",
+                        4usize,
                     ),
                     PageRoute::LibAlbums => (
                         "albums",
-                        "v1/me/library/albums?limit=40&l=zh-Hans-CN",
+                        "v1/me/library/albums?limit=100&l=zh-Hans-CN",
                         "library-albums",
+                        15usize,
                     ),
                     PageRoute::LibArtists => (
                         "artists",
-                        "v1/me/library/artists?limit=40&l=zh-Hans-CN",
+                        "v1/me/library/artists?limit=100&l=zh-Hans-CN",
                         "library-artists",
+                        15usize,
                     ),
                     PageRoute::LibPlaylists => (
                         "playlists",
-                        "v1/me/library/playlists?limit=40&l=zh-Hans-CN",
+                        "v1/me/library/playlists?limit=100&l=zh-Hans-CN",
                         "library-playlists",
+                        20usize,
                     ),
                     _ => (
                         "foryou",
                         "v1/me/recommendations?limit=12&l=zh-Hans-CN",
                         "playlists",
+                        1usize,
                     ),
                 };
                 let rkey_s = rkey.to_string();
@@ -5675,9 +7700,8 @@ impl AppUi {
                 let dkind_s = default_kind.to_string();
                 self.rt.spawn(async move {
                     let _guard = lib_guard;
-                    if let Ok(json) = am_api::fetch_am_api(path_s, Some(utok), None, Some(sf)).await
-                    {
-                        let cards = if rkey_s == "foryou" {
+                    if rkey_s == "foryou" {
+                        if let Ok(json) = am_api::fetch_am_api(path_s, Some(utok), None, Some(sf)).await {
                             let mut acc = Vec::new();
                             if let Some(arr) = json.get("data").and_then(Value::as_array) {
                                 for group in arr {
@@ -5688,10 +7712,23 @@ impl AppUi {
                                     acc.extend(sub);
                                 }
                             }
-                            acc
-                        } else {
-                            parse_media_cards_array(json.get("data"), &dkind_s)
-                        };
+                            let _ = tx.send(AsyncMsg::LibraryCardsLoaded {
+                                backend,
+                                route_key: rkey_s,
+                                cards: acc,
+                            });
+                            Self::post_ui_wake(hwnd);
+                        }
+                    } else if let Ok(items) = am_api::fetch_am_paginated_data(
+                        &path_s,
+                        Some(utok),
+                        Some(sf),
+                        max_pages,
+                        true,
+                    )
+                    .await
+                    {
+                        let cards = parse_media_cards_slice(&items, &dkind_s);
                         let _ = tx.send(AsyncMsg::LibraryCardsLoaded {
                             backend,
                             route_key: rkey_s,
@@ -5705,13 +7742,42 @@ impl AppUi {
         }
     }
 
+    /// Coalesces `PlaylistDiskCache` disk persistence over a 1,200ms debounce window so startup sync
+    /// writes once instead of 17x full 1.46 MB atomic rewrites (24.9 MB + 17x FlushFileBuffers!).
     pub fn save_playlist_cache_async(&self) {
+        if self.wake_hwnd == 0 {
+            return;
+        }
         let Some(path) = PlaylistDiskCache::cache_path() else {
             return;
         };
-        let cache = self.playlist_cache.clone();
-        self.rt.spawn_blocking(move || {
-            cache.save_to_path(&path);
+        let gen = self
+            .playlist_cache_save_gen
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1;
+        if let Ok(mut guard) = self.pending_playlist_cache_disk.lock() {
+            *guard = Some(self.playlist_cache.clone());
+        }
+        self.playlist_cache_dirty
+            .store(true, std::sync::atomic::Ordering::Release);
+        let gen_arc = std::sync::Arc::clone(&self.playlist_cache_save_gen);
+        let dirty_arc = std::sync::Arc::clone(&self.playlist_cache_dirty);
+        let snap_arc = std::sync::Arc::clone(&self.pending_playlist_cache_disk);
+        self.rt.spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+            if gen_arc.load(std::sync::atomic::Ordering::Acquire) != gen {
+                return;
+            }
+            if !dirty_arc.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                return;
+            }
+            let to_write = snap_arc.lock().ok().and_then(|mut g| g.take());
+            if let Some(cache) = to_write {
+                let _ = tokio::task::spawn_blocking(move || {
+                    cache.save_to_path(&path);
+                })
+                .await;
+            }
         });
     }
 
@@ -5760,16 +7826,21 @@ impl AppUi {
             }
         }
         self.detail_data = Some(data);
+        self.detail_data_rev = self.detail_data_rev.wrapping_add(1);
     }
 
     pub fn dispatch_background_playlist_sync(&mut self) {
         let Some(utok) = non_empty_opt(&self.settings.user_token) else {
             return;
         };
-        if self.playlist_sync_in_flight {
-            // Reset flag immediately on next sync cycle; coalesce rapid duplicate calls
+        if self
+            .playlist_sync_in_flight
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            // Properly coalesce overlapping startup / periodic playlist sync requests!
             return;
         }
+        let in_flight_flag = std::sync::Arc::clone(&self.playlist_sync_in_flight);
         let sf = self.settings.storefront.clone();
         let tx = self.tx.clone();
         let hwnd = self.wake_hwnd;
@@ -5798,9 +7869,24 @@ impl AppUi {
         }
 
         self.rt.spawn(async move {
-            let path = "v1/me/library/playlists?limit=24&l=zh-Hans-CN".to_string();
-            if let Ok(json) = am_api::fetch_am_api(path, Some(utok.clone()), None, Some(sf.clone())).await {
-                let cards = parse_media_cards_array(json.get("data"), "library-playlists");
+            struct SyncInFlightGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for SyncInFlightGuard {
+                fn drop(&mut self) {
+                    self.0.store(false, std::sync::atomic::Ordering::Release);
+                }
+            }
+            let _sync_guard = SyncInFlightGuard(in_flight_flag);
+
+            if let Ok(items) = am_api::fetch_am_paginated_data(
+                "v1/me/library/playlists?limit=100&l=zh-Hans-CN",
+                Some(utok.clone()),
+                Some(sf.clone()),
+                20,
+                true,
+            )
+            .await
+            {
+                let cards = parse_media_cards_slice(&items, "library-playlists");
                 for c in &cards {
                     if c.kind.contains("playlist") && seen_ids.insert(c.id.clone()) {
                         targets.push((c.kind.clone(), c.id.clone(), c.title.clone()));
@@ -5809,7 +7895,7 @@ impl AppUi {
                 let _ = tx.send(AsyncMsg::SidebarPlaylistsLoaded(cards));
                 Self::post_ui_wake(hwnd);
             }
-            targets.truncate(14);
+            targets.truncate(64);
             for (kind, id, title_hint) in targets {
                 tokio::time::sleep(std::time::Duration::from_millis(120)).await;
                 if let Ok(detail) =
@@ -5834,6 +7920,7 @@ impl AppUi {
         title_hint: String,
         force_refresh: bool,
     ) {
+        self.abort_pending_detail_fetch();
         self.detail_req_seq = self.detail_req_seq.wrapping_add(1);
         let req_seq = self.detail_req_seq;
         let expected_id = id.clone();
@@ -5845,6 +7932,7 @@ impl AppUi {
         if self.settings.page_cache_enabled && !force_refresh {
             if let Some((cached, fetched_at)) = self.get_detail_mem_cache(&kind, &id) {
                 self.detail_data = Some(cached);
+                self.detail_data_rev = self.detail_data_rev.wrapping_add(1);
                 self.detail_loading = false;
                 if fetched_at.elapsed().as_secs() < Self::SWR_FRESH_TTL_SECS {
                     return;
@@ -5859,25 +7947,33 @@ impl AppUi {
                 {
                     let det = cached.to_detail();
                     self.detail_data = Some(det.clone());
+                    self.detail_data_rev = self.detail_data_rev.wrapping_add(1);
                     self.detail_loading = false;
                     let disk_age = current_unix_sec().saturating_sub(cached.updated_unix_sec);
-                    if disk_age < Self::SWR_FRESH_TTL_SECS {
+                    // Only treat disk cache as fresh when written with paginated schema v2+
+                    // (v0/v1 caches could hold truncated 100-track playlists and must revalidate!)
+                    if self.playlist_cache.schema_version >= PLAYLIST_CACHE_SCHEMA_VERSION
+                        && disk_age < Self::SWR_FRESH_TTL_SECS
+                    {
                         self.put_detail_mem_cache(backend, &kind, &id, det);
                         return;
                     }
                 } else {
                     self.detail_loading = true;
                     self.detail_data = None;
+                    self.detail_data_rev = self.detail_data_rev.wrapping_add(1);
                 }
             } else {
                 self.detail_loading = true;
                 self.detail_data = None;
+                self.detail_data_rev = self.detail_data_rev.wrapping_add(1);
             }
         } else if force_refresh && self.detail_data.as_ref().is_some_and(|d| d.id == id) {
             self.detail_loading = false;
         } else {
             self.detail_loading = true;
             self.detail_data = None;
+            self.detail_data_rev = self.detail_data_rev.wrapping_add(1);
         }
 
         let sf = self.settings.storefront.clone();
@@ -5886,7 +7982,7 @@ impl AppUi {
         let hwnd = self.wake_hwnd;
         let req_kind = kind.clone();
 
-        self.rt.spawn(async move {
+        let handle = self.rt.spawn(async move {
             let res = Self::fetch_container_detail_api(sf, utok, kind, id, title_hint).await;
             let _ = tx.send(AsyncMsg::ContainerLoaded {
                 seq: req_seq,
@@ -5897,6 +7993,7 @@ impl AppUi {
             });
             Self::post_ui_wake(hwnd);
         });
+        self.detail_task_abort = Some(handle.abort_handle());
     }
 
     pub async fn fetch_container_detail_api(
@@ -6006,9 +8103,7 @@ impl AppUi {
                             .and_then(Value::as_array)
                             .map(|arr| {
                                 arr.iter()
-                                    .filter_map(|t| {
-                                        parse_track_from_am_json(t, None, artwork_url.as_deref())
-                                    })
+                                    .filter_map(|t| parse_track_from_am_json(t, None, None))
                                     .collect::<Vec<_>>()
                             })
                             .unwrap_or_default();
@@ -6090,7 +8185,7 @@ impl AppUi {
                         .and_then(Value::as_array)
                         .map(|arr| {
                             arr.iter()
-                                .filter_map(|t| parse_track_from_am_json(t, None, artwork_url.as_deref()))
+                                .filter_map(|t| parse_track_from_am_json(t, None, None))
                                 .collect::<Vec<_>>()
                         })
                         .unwrap_or_default();
@@ -6113,6 +8208,11 @@ impl AppUi {
                     } else {
                         "playlists"
                     };
+                    let max_track_pages = if kind == "library-playlists" {
+                        am_api::DEFAULT_PLAYLIST_MAX_PAGES
+                    } else {
+                        20
+                    };
                     let meta_path = format!(
                         "v1/me/library/{sub}/{id}?include=catalog&extend=editorialVideo&extend%5Balbums%5D=editorialVideo&extend%5Bplaylists%5D=editorialVideo&l=zh-Hans-CN"
                     );
@@ -6127,6 +8227,14 @@ impl AppUi {
                                 .await
                                 .ok();
                         let root = meta_json.as_ref().and_then(|j| j.pointer("/data/0"));
+                        let cat_id = root.and_then(|r| {
+                            r.pointer("/relationships/catalog/data/0/id")
+                                .or_else(|| r.pointer("/attributes/playParams/globalId"))
+                                .or_else(|| r.pointer("/attributes/playParams/catalogId"))
+                                .and_then(Value::as_str)
+                                .map(|s| s.to_string())
+                                .filter(|s| !s.is_empty())
+                        });
                         let mut motion_video_url = root
                             .and_then(|r| r.pointer("/relationships/catalog/data/0/attributes"))
                             .and_then(am_api::extract_editorial_motion_video_from_attrs)
@@ -6135,14 +8243,7 @@ impl AppUi {
                                     .and_then(am_api::extract_editorial_motion_video_from_attrs)
                             });
                         if motion_video_url.is_none() {
-                            let cat_id = root.and_then(|r| {
-                                r.pointer("/relationships/catalog/data/0/id")
-                                    .or_else(|| r.pointer("/attributes/playParams/globalId"))
-                                    .or_else(|| r.pointer("/attributes/playParams/catalogId"))
-                                    .and_then(Value::as_str)
-                                    .map(|s| s.to_string())
-                            });
-                            if let Some(cid) = cat_id {
+                            if let Some(ref cid) = cat_id {
                                 let cat_path = format!(
                                     "v1/catalog/{sf_m}/{sub}/{cid}?extend=editorialVideo&l=zh-Hans-CN"
                                 );
@@ -6156,17 +8257,77 @@ impl AppUi {
                                 }
                             }
                         }
-                        (meta_json, motion_video_url)
+                        (meta_json, motion_video_url, cat_id)
                     };
-                    let tracks_fut =
-                        am_api::fetch_am_api(tracks_path, utok, None, Some(sf));
-                    let ((meta_json, motion_video_url), tr_res) =
+                    let tracks_fut = am_api::fetch_am_paginated_data(
+                        &tracks_path,
+                        utok.clone(),
+                        Some(sf.clone()),
+                        max_track_pages,
+                        false,
+                    );
+                    let ((meta_json, motion_video_url, cat_id), tr_res) =
                         tokio::join!(meta_and_motion_fut, tracks_fut);
-                    let tr_json = tr_res?;
+
+                    // Apple Music returns HTTP 404 on `/tracks` for empty library playlists and some
+                    // subscribed catalog playlists whose tracks live under their catalog globalId!
+                    let mut raw_track_items = match tr_res {
+                        Ok(items) => items,
+                        Err(err) => {
+                            let is_404 = err.contains("404");
+                            if let Some(ref cid) = cat_id {
+                                let cat_tracks_path = format!(
+                                    "v1/catalog/{sf}/{sub}/{cid}/tracks?extend=audioTraits&limit=100&l=zh-Hans-CN"
+                                );
+                                match am_api::fetch_am_paginated_data(
+                                    &cat_tracks_path,
+                                    utok.clone(),
+                                    Some(sf.clone()),
+                                    max_track_pages,
+                                    false,
+                                )
+                                .await
+                                {
+                                    Ok(items) => items,
+                                    Err(_) if is_404 && meta_json.is_some() => Vec::new(),
+                                    Err(_) => return Err(err),
+                                }
+                            } else if is_404 && meta_json.is_some() {
+                                Vec::new()
+                            } else {
+                                return Err(err);
+                            }
+                        }
+                    };
+                    if raw_track_items.is_empty()
+                        || (sub == "playlists" && raw_track_items.len() == 100)
+                    {
+                        if let Some(ref cid) = cat_id {
+                            let cat_tracks_path = format!(
+                                "v1/catalog/{sf}/{sub}/{cid}/tracks?extend=audioTraits&limit=100&l=zh-Hans-CN"
+                            );
+                            if let Ok(cat_items) = am_api::fetch_am_paginated_data(
+                                &cat_tracks_path,
+                                utok.clone(),
+                                Some(sf.clone()),
+                                max_track_pages,
+                                false,
+                            )
+                            .await
+                            {
+                                if cat_items.len() > raw_track_items.len() {
+                                    raw_track_items = cat_items;
+                                }
+                            }
+                        }
+                    }
 
                     let root = meta_json.as_ref().and_then(|j| j.pointer("/data/0"));
                     let title = root
-                        .and_then(|r| r.pointer("/attributes/name"))
+                        .and_then(|r| {
+                            r.pointer("/attributes/name")
+                                .or_else(|| r.pointer("/relationships/catalog/data/0/attributes/name"))
+                        })
                         .and_then(Value::as_str)
                         .unwrap_or(&title_hint)
                         .to_string();
@@ -6174,31 +8335,43 @@ impl AppUi {
                         .and_then(|r| {
                             r.pointer("/attributes/artistName")
                                 .or_else(|| r.pointer("/attributes/curatorName"))
+                                .or_else(|| {
+                                    r.pointer("/relationships/catalog/data/0/attributes/curatorName")
+                                })
+                                .or_else(|| {
+                                    r.pointer("/relationships/catalog/data/0/attributes/artistName")
+                                })
                         })
                         .and_then(Value::as_str)
                         .unwrap_or("资料库")
                         .to_string();
                     let description = root
-                        .and_then(|r| r.pointer("/attributes/description/standard"))
+                        .and_then(|r| {
+                            r.pointer("/attributes/description/standard")
+                                .or_else(|| {
+                                    r.pointer("/relationships/catalog/data/0/attributes/description/standard")
+                                })
+                        })
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .to_string();
                     let artwork_url = root
-                        .and_then(|r| r.pointer("/attributes/artwork/url"))
+                        .and_then(|r| {
+                            r.pointer("/attributes/artwork/url")
+                                .or_else(|| {
+                                    r.pointer("/relationships/catalog/data/0/attributes/artwork/url")
+                                })
+                        })
                         .and_then(Value::as_str)
                         .map(|u| format_artwork_template(u, 600));
 
-                    let tracks = tr_json
-                        .get("data")
-                        .and_then(Value::as_array)
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|t| {
-                                    parse_track_from_am_json(t, Some(&title), artwork_url.as_deref())
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default();
+                    let is_album = kind == "library-albums";
+                    let fb_album = is_album.then_some(title.as_str());
+                    let fb_art = if is_album { artwork_url.as_deref() } else { None };
+                    let tracks: Vec<AgentTrackInput> = raw_track_items
+                        .iter()
+                        .filter_map(|t| parse_track_from_am_json(t, fb_album, fb_art))
+                        .collect();
 
                     Ok(ContainerDetailData {
                         id,
@@ -6215,7 +8388,7 @@ impl AppUi {
                     let path = format!(
                         "v1/catalog/{sf}/{kind}/{id}?include=tracks&extend=audioTraits,editorialVideo&l=zh-Hans-CN"
                     );
-                    let json = am_api::fetch_am_api(path, utok, None, Some(sf)).await?;
+                    let json = am_api::fetch_am_api(path, utok.clone(), None, Some(sf.clone())).await?;
                     let root = json
                         .pointer("/data/0")
                         .ok_or_else(|| "未找到该专辑或播放列表".to_string())?;
@@ -6246,17 +8419,27 @@ impl AppUi {
                         .get("attributes")
                         .and_then(am_api::extract_editorial_motion_video_from_attrs);
 
-                    let tracks = root
-                        .pointer("/relationships/tracks/data")
-                        .and_then(Value::as_array)
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|t| {
-                                    parse_track_from_am_json(t, Some(&title), artwork_url.as_deref())
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default();
+                    let max_track_pages = if kind.contains("playlist") {
+                        am_api::DEFAULT_PLAYLIST_MAX_PAGES
+                    } else {
+                        20
+                    };
+                    let all_track_items = am_api::fetch_catalog_container_remaining_tracks(
+                        &sf,
+                        &kind,
+                        &id,
+                        root,
+                        utok,
+                        max_track_pages,
+                    )
+                    .await;
+                    let is_album = kind.contains("album");
+                    let fb_album = is_album.then_some(title.as_str());
+                    let fb_art = if is_album { artwork_url.as_deref() } else { None };
+                    let tracks: Vec<AgentTrackInput> = all_track_items
+                        .iter()
+                        .filter_map(|t| parse_track_from_am_json(t, fb_album, fb_art))
+                        .collect();
 
                     Ok(ContainerDetailData {
                         id,
@@ -6337,6 +8520,7 @@ impl AppUi {
             return;
         }
         if !matches!(&next, PageRoute::ContainerDetail { .. }) {
+            self.abort_pending_detail_fetch();
             self.detail_req_seq = self.detail_req_seq.wrapping_add(1);
             self.cover_launch_anim = None;
         } else if let PageRoute::ContainerDetail { ref id, .. } = next {
@@ -6355,7 +8539,12 @@ impl AppUi {
             self.pending_route_mem_trim = true;
         }
         self.art_epoch
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        // Drop stale off-route non-hero decodes immediately instead of uploading them on the new page!
+        self.pending_art_uploads
+            .retain(|(_, _, hero, _, _)| *hero);
+        self.last_visible_playing_row_rect = None;
+        self.last_detail_hero_rect = None;
         let prev = std::mem::replace(&mut self.route, next.clone());
         self.nav_history.push(prev);
         if self.nav_history.len() > 24 {
@@ -6671,7 +8860,7 @@ impl AppUi {
         self.search_query.replace_range(a..b, "");
         self.search_cursor = a;
         self.search_sel_anchor = None;
-        self.last_search_typed = Some(Instant::now());
+        self.mark_search_query_edited();
         true
     }
 
@@ -6684,7 +8873,7 @@ impl AppUi {
         self.search_query.insert_str(pos, s);
         self.search_cursor = pos + s.len();
         self.search_sel_anchor = None;
-        self.last_search_typed = Some(Instant::now());
+        self.mark_search_query_edited();
     }
 
     fn search_hit_test_x(&self, mouse_x: f32) -> usize {
@@ -6764,7 +8953,7 @@ impl AppUi {
                 let prev = self.prev_search_word_boundary(self.search_cursor);
                 self.search_query.replace_range(prev..self.search_cursor, "");
                 self.search_cursor = prev;
-                self.last_search_typed = Some(Instant::now());
+                self.mark_search_query_edited();
             }
             return (true, None);
         }
@@ -6846,7 +9035,7 @@ impl AppUi {
                         self.next_search_char_boundary(self.search_cursor)
                     };
                     self.search_query.replace_range(self.search_cursor..next, "");
-                    self.last_search_typed = Some(Instant::now());
+                    self.mark_search_query_edited();
                 }
                 (true, None)
             }
@@ -6877,12 +9066,15 @@ impl AppUi {
                     let prev = self.prev_search_char_boundary(cur);
                     self.search_query.replace_range(prev..cur, "");
                     self.search_cursor = prev;
-                    self.last_search_typed = Some(Instant::now());
+                    self.mark_search_query_edited();
                 }
             }
             return true;
         }
         if ch == '\r' || ch == '\n' {
+            if let Some(h) = self.search_debounce_abort.take() {
+                h.abort();
+            }
             self.last_search_typed = None;
             let q = self.search_query.trim().to_string();
             if !q.is_empty() {
@@ -7041,12 +9233,22 @@ impl AppUi {
         let over_now = x >= 0.0 && y >= 0.0 && self.is_interactive_at(x, y);
         let changed_over = over_now != self.last_hovered_interactive;
         self.last_hovered_interactive = over_now;
-        !self.glass_off()
-            || over_now
+        // Only wake idle/paused renders when pointer actually hits/leaves an interactive control,
+        // enters/exits topbar or open glass popover, or while hover/toggle/glass springs are settling!
+        // Never return unconditionally `!self.glass_off()` (eliminates paused 125-300+ FPS mouse storms!).
+        let near_glass_overlay = !self.glass_off()
+            && (now_in_tb
+                || self.context_menu.is_some()
+                || self.show_queue_popover
+                || self.show_more_popover);
+        over_now
             || changed_over
             || tb_changed
+            || near_glass_overlay
             || !self.top_bar_guard_spring.is_settled_norm()
-            || !self.hover_alphas.is_empty()
+            || self.has_settling_hover
+            || self.has_settling_toggle
+            || self.has_active_glass_motion
     }
 
     pub fn on_mouse_down(&mut self, x: f32, y: f32) -> bool {
@@ -7758,21 +9960,52 @@ impl AppUi {
             UiAction::FocusSearch => {
                 self.search_focused = true;
                 self.search_cursor = self.search_query.len();
-                if self.route != PageRoute::Search && !self.search_query.is_empty() {
+                if self.route != PageRoute::Search {
                     self.navigate_to(PageRoute::Search);
                 }
             }
             UiAction::ClearSearch => {
+                if let Some(h) = self.search_debounce_abort.take() {
+                    h.abort();
+                }
+                self.cancel_in_flight_search();
                 self.search_query.clear();
                 self.search_cursor = 0;
                 self.search_sel_anchor = None;
                 self.search_scroll_x = 0.0;
                 self.search_char_xs = vec![(0, 0.0)];
+                self.search_char_xs_query.clear();
+                self.last_search_typed = None;
                 self.last_dispatched_query.clear();
+                self.search_completed_query.clear();
+                self.search_error = None;
+                self.search_artists.clear();
+                self.search_albums.clear();
+                self.search_playlists.clear();
+                self.search_songs.clear();
+                self.search_local_cards.clear();
+                self.search_local_songs.clear();
+                self.search_results_rev = self.search_results_rev.wrapping_add(1);
                 self.search_focused = true;
             }
             UiAction::SetSearchFilter(f) => {
                 self.search_filter = f;
+                self.scroll_y = 0.0;
+                self.scroll_target_y = 0.0;
+                self.scroll_vel_y = 0.0;
+            }
+            UiAction::RunSearchQuery(q) => {
+                let clean = q.trim().to_string();
+                if !clean.is_empty() {
+                    self.search_query = clean.clone();
+                    self.search_cursor = clean.len();
+                    self.search_sel_anchor = None;
+                    self.search_focused = false;
+                    self.dispatch_search(clean);
+                }
+            }
+            UiAction::ClearRecentSearches => {
+                self.search_recent_queries.clear();
             }
             UiAction::PlayContainer { kind, id, shuffle } => {
                 if kind == "artists"
@@ -7797,13 +10030,30 @@ impl AppUi {
                     self.rt.spawn(async move {
                         let tracks_res = if kind == "ne-song" {
                             let sid = netease_api::strip_ne_id(&id);
-                            Ok(vec![AgentTrackInput {
-                                id: format!("ne:{sid}"),
-                                catalog_id: Some(sid),
-                                kind: Some("ne-song".to_string()),
-                                name: "网易云单曲".to_string(),
-                                ..Default::default()
-                            }])
+                            let hydrated = sid
+                                .parse::<i64>()
+                                .ok()
+                                .map(|n| vec![n]);
+                            if let Some(ids) = hydrated {
+                                match netease_api::fetch_songs_detail_batch(&ids, ck.as_deref()).await {
+                                    Ok(v) if !v.is_empty() => Ok(v),
+                                    _ => Ok(vec![AgentTrackInput {
+                                        id: format!("ne:{sid}"),
+                                        catalog_id: Some(sid),
+                                        kind: Some("ne-song".to_string()),
+                                        name: "网易云单曲".to_string(),
+                                        ..Default::default()
+                                    }]),
+                                }
+                            } else {
+                                Ok(vec![AgentTrackInput {
+                                    id: format!("ne:{sid}"),
+                                    catalog_id: Some(sid),
+                                    kind: Some("ne-song".to_string()),
+                                    name: "网易云单曲".to_string(),
+                                    ..Default::default()
+                                }])
+                            }
                         } else if kind == "ne-station" {
                             netease_api::fetch_station_tracks(&id, ck.as_deref()).await
                         } else {
@@ -7829,7 +10079,9 @@ impl AppUi {
                                         let _ = tx.send(AsyncMsg::PlaybackUpdated(st));
                                     }
                                     Err(e) => {
-                                        let _ = tx.send(AsyncMsg::BannerError(e));
+                                        if !native_player::is_download_cancelled_err(&e) {
+                                            let _ = tx.send(AsyncMsg::BannerError(e));
+                                        }
                                     }
                                 }
                             }
@@ -7886,7 +10138,9 @@ impl AppUi {
                                         let _ = tx.send(AsyncMsg::PlaybackUpdated(st));
                                     }
                                     Err(e) => {
-                                        let _ = tx.send(AsyncMsg::BannerError(e));
+                                        if !native_player::is_download_cancelled_err(&e) {
+                                            let _ = tx.send(AsyncMsg::BannerError(e));
+                                        }
                                     }
                                 }
                             }
@@ -7998,6 +10252,7 @@ impl AppUi {
                 let mut list = match source {
                     TrackListSource::HomeSongs => self.home_songs.clone(),
                     TrackListSource::SearchSongs => self.search_songs.clone(),
+                    TrackListSource::SearchLocalSongs => self.search_local_songs.clone(),
                     TrackListSource::LibrarySongs => self.lib_songs.clone(),
                     TrackListSource::DetailTracks => self
                         .detail_data
@@ -8156,6 +10411,7 @@ impl AppUi {
                 }
             }
             UiAction::RefreshCurrentView => {
+                self.failed_art.clear();
                 let cur = self.route.clone();
                 match cur {
                     PageRoute::Home | PageRoute::Browse => self.fetch_home_charts(),
@@ -8163,7 +10419,7 @@ impl AppUi {
                     PageRoute::Search => {
                         let q = self.search_query.trim().to_string();
                         if !q.is_empty() {
-                            self.dispatch_search(q);
+                            self.dispatch_search_ex(q, true);
                         }
                     }
                     PageRoute::ContainerDetail {
@@ -8193,6 +10449,11 @@ impl AppUi {
                         let _ = tx.send(AsyncMsg::BannerError(e));
                     }
                 });
+            }
+            UiAction::OpenLogsFolder => {
+                if let Err(e) = crate::logger::open_logs_folder() {
+                    self.set_banner(e, true);
+                }
             }
             UiAction::TogglePauseDownloads(pause) => {
                 self.downloads_paused = pause;
@@ -8395,38 +10656,39 @@ impl AppUi {
                 self.fetch_home_charts();
             }
             UiAction::SyncOfficialClientAccount => {
-                self.official_account = am_api::detect_official_am_account();
-                let mut synced_parts = Vec::new();
-                if let Some(ref off_sf) = self.official_account.storefront {
-                    self.settings.storefront = off_sf.clone();
-                    self.settings.storefront_customized = false;
-                    synced_parts.push(format!("地区 {}", off_sf.to_uppercase()));
-                }
-                if let Some(ref name) = self.official_account.display_name {
-                    synced_parts.push(format!("账号 {name}"));
-                }
-                if self.settings.user_token.is_empty() {
-                    let legacy = am_api::import_legacy_amlight_credentials();
-                    if let Some(tok) = legacy.user_token {
-                        self.settings.user_token = tok;
-                        self.settings.token_cleared_by_user = false;
-                        synced_parts.push("已恢复资料库授权 Token".to_string());
-                    }
-                }
-                self.save_settings();
-                self.fetch_home_charts();
-                if !self.settings.user_token.is_empty() {
-                    self.dispatch_background_playlist_sync();
-                }
-                if synced_parts.is_empty() && !self.official_account.signed_in {
-                    self.set_banner("未检测到桌面版 Apple Music 登录记录".to_string(), true);
+                if self.wake_hwnd != 0 {
+                    let need_legacy = self.settings.user_token.is_empty();
+                    let tx = self.tx.clone();
+                    let hwnd = self.wake_hwnd;
+                    self.set_banner("正在异步扫描原装 Apple Music 客户端账号...".to_string(), false);
+                    self.rt.spawn(async move {
+                        let (official, legacy_token, legacy_storefront) =
+                            tokio::task::spawn_blocking(move || {
+                                let off = am_api::detect_official_am_account();
+                                let (ltok, lsf) = if need_legacy {
+                                    let leg = am_api::import_legacy_amlight_credentials();
+                                    (leg.user_token, leg.storefront)
+                                } else {
+                                    (None, None)
+                                };
+                                (off, ltok, lsf)
+                            })
+                            .await
+                            .unwrap_or_default();
+                        let _ = tx.send(AsyncMsg::OfficialAccountDetected {
+                            official,
+                            legacy_token,
+                            legacy_storefront,
+                            show_banner: true,
+                        });
+                        Self::post_ui_wake(hwnd);
+                    });
                 } else {
-                    let detail = if synced_parts.is_empty() {
-                        "原装客户端播放服务就绪".to_string()
-                    } else {
-                        synced_parts.join(" · ")
-                    };
-                    self.set_banner(format!("已同步原装端信息：{detail}"), false);
+                    self.official_account = am_api::detect_official_am_account();
+                    if let Some(ref off_sf) = self.official_account.storefront {
+                        self.settings.storefront = off_sf.clone();
+                        self.settings.storefront_customized = false;
+                    }
                 }
             }
             UiAction::CheckDrmHealth => {
@@ -8502,10 +10764,18 @@ impl AppUi {
                 self.sidebar_playlists.clear();
                 self.playlist_cache = PlaylistDiskCache::default();
                 if let Some(p) = PlaylistDiskCache::cache_path() {
-                    let _ = fs::remove_file(p);
+                    if self.wake_hwnd != 0 {
+                        self.rt.spawn(async move {
+                            let _ = tokio::task::spawn_blocking(move || fs::remove_file(p)).await;
+                        });
+                    } else {
+                        let _ = fs::remove_file(p);
+                    }
                 }
                 self.lib_cards.clear();
                 self.lib_songs.clear();
+                self.lib_cards_rev = self.lib_cards_rev.wrapping_add(1);
+                self.lib_songs_rev = self.lib_songs_rev.wrapping_add(1);
                 self.auth_result = None;
                 self.set_banner("已清除 Media-User-Token".to_string(), false);
             }
@@ -8547,6 +10817,13 @@ impl AppUi {
                 let mut next = self.audio_prefs.clone();
                 next.crossfade_songs_enabled = !next.crossfade_songs_enabled;
                 self.save_audio_prefs_async(next);
+            }
+            UiAction::ToggleSmtcPublish => {
+                self.settings.smtc_publish_enabled = !self.settings.smtc_publish_enabled;
+                if self.wake_hwnd != 0 {
+                    self.save_settings();
+                }
+                self.sync_smtc_publisher(true);
             }
             UiAction::SelectOutputDevice(dev_id) => {
                 let tx = self.tx.clone();
@@ -8728,20 +11005,30 @@ impl AppUi {
                 self.settings.motion_artwork_enabled = !self.settings.motion_artwork_enabled;
                 self.motion_art
                     .set_global_enabled(self.settings.motion_artwork_enabled && !self.settings.reduce_motion);
-                if self.settings.motion_artwork_enabled && self.wake_hwnd != 0 {
+                if self.settings.motion_artwork_enabled
+                    && self.can_use_track_motion_artwork()
+                    && self.wake_hwnd != 0
+                {
                     let cur_key = self.current_lyrics_key.clone();
                     if !cur_key.is_empty()
                         && !self.track_motion_urls.contains_key(&cur_key)
                         && self.pending_motion_tracks.insert(cur_key.clone())
                     {
                         let sf = self.settings.storefront.clone();
-                        let aid = self.smtc.adam_id.clone();
+                        let aid = self
+                            .smtc
+                            .adam_id
+                            .as_deref()
+                            .filter(|a| !a.is_empty() && a.chars().all(|c| c.is_ascii_digit()))
+                            .map(|s| s.to_string());
                         let tt = self.smtc.title.clone();
                         let ar = self.smtc.artist.clone();
                         let al = self.smtc.album.clone();
                         let tx = self.tx.clone();
                         let hwnd = self.wake_hwnd;
-                        self.rt.spawn(async move {
+                        self.abort_pending_track_motion_probe();
+                        let probe_key = cur_key.clone();
+                        let handle = self.rt.spawn(async move {
                             let vurl = am_api::fetch_track_motion_video_url(
                                 &sf,
                                 aid.as_deref(),
@@ -8756,6 +11043,7 @@ impl AppUi {
                             });
                             Self::post_ui_wake(hwnd);
                         });
+                        self.track_motion_task_abort = Some((probe_key, handle.abort_handle()));
                     }
                 }
                 if self.wake_hwnd != 0 {
@@ -8912,7 +11200,7 @@ impl AppUi {
                             title: det.title.clone(),
                             subtitle: det.subtitle.clone(),
                             artwork_url: det.artwork_url.clone(),
-                            tracks: det.tracks.clone(),
+                            tracks: std::sync::Arc::from(det.tracks.as_slice()),
                         },
                         show_playlist_submenu: false,
                         from_lyrics: false,
@@ -8945,6 +11233,7 @@ impl AppUi {
                     self.play_tracks_async(vec![track], 0);
                 } else {
                     self.play_next_queue.push_front(track);
+        self.play_next_queue_ver = self.play_next_queue_ver.wrapping_add(1);
                     self.set_banner(format!("已将「{tname}」加入下一首播放"), false);
                 }
             }
@@ -9702,7 +11991,9 @@ impl AppUi {
                         let _ = tx.send(AsyncMsg::PlaybackUpdated(st));
                     }
                     Err(e) => {
-                        let _ = tx.send(AsyncMsg::BannerError(e));
+                        if !native_player::is_download_cancelled_err(&e) {
+                            let _ = tx.send(AsyncMsg::BannerError(e));
+                        }
                     }
                 }
                 Self::post_ui_wake(hwnd);
@@ -9777,6 +12068,7 @@ impl AppUi {
             )
         {
             if let Some(next_tr) = self.play_next_queue.pop_front() {
+            self.play_next_queue_ver = self.play_next_queue_ver.wrapping_add(1);
                 self.play_tracks_async(vec![next_tr], 0);
                 return;
             }
@@ -9789,9 +12081,11 @@ impl AppUi {
                 }
                 self.smtc_optimistic_seek = Some((clamped, Instant::now()));
                 self.smtc_seek_pre_univ = self.last_smtc_timeline_univ;
+                self.smtc.position_sec = clamped;
                 self.playhead_anchor_sec = clamped;
                 self.playhead_anchor_inst = Instant::now();
                 self.lyrics_view.animator.reset_word_clamps();
+                self.sync_smtc_publisher(true);
             }
         } else if action.eq_ignore_ascii_case("next") || action.eq_ignore_ascii_case("prev") {
             self.smtc_optimistic_seek = None;
@@ -9969,13 +12263,22 @@ impl AppUi {
         self.has_settling_toggle = false;
         r.step_glass_animations(if self.settings.reduce_motion { 1.0 } else { dt });
         r.set_aggressive_memory_release(self.settings.aggressive_memory_release);
-        if self.settings.aggressive_memory_release
-            && (self.pending_route_mem_trim
-                || self.last_mem_trim_at.elapsed() >= std::time::Duration::from_secs(12))
-        {
-            self.pending_route_mem_trim = false;
-            self.last_mem_trim_at = Instant::now();
-            r.perform_aggressive_memory_trim(self.show_lyrics_overlay);
+        // P2-3: Calm aggressive memory release — trigger on route switches or sustained idle (>30s)
+        // with >=60s cooldown instead of evicting live Liquid Glass SDF bitmaps every 12s while active!
+        if self.settings.aggressive_memory_release {
+            let trim_elapsed = self.last_mem_trim_at.elapsed();
+            let idle_trim_due = self.last_mouse_move_at.elapsed()
+                >= std::time::Duration::from_secs(30)
+                && !self.has_active_ui_motion()
+                && trim_elapsed >= std::time::Duration::from_secs(60);
+            if self.pending_route_mem_trim
+                || idle_trim_due
+                || trim_elapsed >= std::time::Duration::from_secs(180)
+            {
+                self.pending_route_mem_trim = false;
+                self.last_mem_trim_at = Instant::now();
+                r.perform_aggressive_memory_trim(self.show_lyrics_overlay);
+            }
         }
         if self.win_max_trans < 1.0 {
             if self.settings.reduce_motion {
@@ -10244,94 +12547,20 @@ impl AppUi {
             );
         }
 
-        // Sample full WASAPI audio visualizer on Visualizer page, or ultra-lightweight 512-pt FFT
-        // when playing with「实时频谱播放图标」enabled so both the playing-cover 5 bars and sidebar
-        // Visualizer icon react to real-time audio even when the Visualizer page is closed!
-        let is_playing_now = self.smtc.status == "Playing";
-        let on_visualizer_page = self.route == PageRoute::Visualizer && !self.show_lyrics_overlay;
-        let use_live_icon_fft = !on_visualizer_page
-            && is_playing_now
-            && self.settings.live_eq_icon_spectrum
-            && !self.settings.reduce_motion
-            && !self.show_lyrics_overlay;
-        if on_visualizer_page {
-            self.latest_viz_snap = audio_viz::sample_live_visualizer(dt);
-            self.viz_state
-                .step(&self.latest_viz_snap, dt, self.settings.reduce_motion);
-        } else if use_live_icon_fft {
-            let (active, bass, mid, high, beat, spec32) = audio_viz::sample_rhythm_levels_fast(dt);
-            self.latest_viz_snap.active_signal = active;
-            self.latest_viz_snap.bass_energy = bass;
-            self.latest_viz_snap.mid_energy = mid;
-            self.latest_viz_snap.high_energy = high;
-            self.latest_viz_snap.beat_pulse = beat;
-            self.latest_viz_snap.spectrum_32 = spec32;
-        } else {
-            self.latest_viz_snap.active_signal = false;
-            self.latest_viz_snap.beat_pulse = 0.0;
-            self.latest_viz_snap.bass_energy = if is_playing_now && !self.settings.reduce_motion {
-                let p = (self.smtc.position_sec as f32) * 2.8;
-                0.22 + 0.14 * p.sin().abs()
-            } else {
-                0.0
-            };
-        }
-
-        if is_playing_now && !self.settings.reduce_motion {
-            let s = &self.latest_viz_snap;
-            let beat = s.beat_pulse * 0.24;
-            let raw_5 = if (on_visualizer_page || use_live_icon_fft) && s.active_signal {
-                [
-                    (s.spectrum_32[1] * 1.15 + beat).clamp(0.14, 1.0),
-                    (s.spectrum_32[6] * 1.25 + beat * 0.8).clamp(0.18, 1.0),
-                    (s.spectrum_32[12] * 1.32 + s.mid_energy * 0.35).clamp(0.20, 1.0),
-                    (s.spectrum_32[19] * 1.32 + s.mid_energy * 0.30).clamp(0.18, 1.0),
-                    (s.spectrum_32[26] * 1.35 + s.high_energy * 0.32).clamp(0.14, 1.0),
-                ]
-            } else {
-                let p = (self.smtc.position_sec as f32) * 5.8;
-                [
-                    0.24 + 0.32 * (p * 1.00 + 0.1).sin().abs(),
-                    0.32 + 0.40 * (p * 1.32 + 1.1).sin().abs(),
-                    0.36 + 0.48 * (p * 1.58 + 2.3).sin().abs(),
-                    0.32 + 0.40 * (p * 1.84 + 3.4).sin().abs(),
-                    0.22 + 0.34 * (p * 2.12 + 4.5).sin().abs(),
-                ]
-            };
-            let atk = (1.0 - (-24.0 * dt).exp()).clamp(0.05, 1.0);
-            let rel = (1.0 - (-11.0 * dt).exp()).clamp(0.03, 1.0);
-            for i in 0..5 {
-                let k = if raw_5[i] > self.eq_bars_smooth[i] { atk } else { rel };
-                self.eq_bars_smooth[i] += (raw_5[i] - self.eq_bars_smooth[i]) * k;
-            }
-        } else {
-            let decay = (-12.0 * dt).exp();
-            for b in &mut self.eq_bars_smooth {
-                *b *= decay;
-                if *b < 0.008 {
-                    *b = 0.0;
-                }
-            }
-        }
-
-        // Request current track artwork if needed
+        // Request current track artwork once at hero resolution (MiniPlayer / list thumbs reuse hero_cache!)
         if let Some(art_url) = self.smtc.artwork_url.clone() {
             self.request_artwork(r, &art_url, true);
-            self.request_artwork(r, &art_url, false);
         }
 
         let motion_on = self.settings.motion_artwork_enabled && !self.settings.reduce_motion;
         self.motion_art.set_global_enabled(motion_on);
+        let allow_track_motion = motion_on && self.can_use_track_motion_artwork();
         let meta_motion_key = if !self.smtc.title.trim().is_empty() {
-            format!(
-                "meta_motion:{}|{}",
-                self.smtc.title.trim().to_lowercase(),
-                self.smtc.artist.trim().to_lowercase()
-            )
+            meta_motion_cache_key(&self.smtc.title, &self.smtc.artist, &self.smtc.album)
         } else {
             String::new()
         };
-        if motion_on
+        if allow_track_motion
             && lyr_open_t > 0.01
             && self.wake_hwnd != 0
             && !self.smtc.title.trim().is_empty()
@@ -10350,13 +12579,20 @@ impl AppUi {
                         .is_some());
             if !already_known && self.pending_motion_tracks.insert(fetch_key.clone()) {
                 let sf = self.settings.storefront.clone();
-                let aid = self.smtc.adam_id.clone();
+                let aid = self
+                    .smtc
+                    .adam_id
+                    .as_deref()
+                    .filter(|a| !a.is_empty() && a.chars().all(|c| c.is_ascii_digit()))
+                    .map(|s| s.to_string());
                 let tt = self.smtc.title.clone();
                 let ar = self.smtc.artist.clone();
                 let al = self.smtc.album.clone();
                 let tx = self.tx.clone();
                 let hwnd = self.wake_hwnd;
-                self.rt.spawn(async move {
+                self.abort_pending_track_motion_probe();
+                let probe_key = fetch_key.clone();
+                let handle = self.rt.spawn(async move {
                     let vurl = am_api::fetch_track_motion_video_url(
                         &sf,
                         aid.as_deref(),
@@ -10371,32 +12607,45 @@ impl AppUi {
                     });
                     Self::post_ui_wake(hwnd);
                 });
+                self.track_motion_task_abort = Some((probe_key, handle.abort_handle()));
             }
         }
-        let lyrics_motion_url = if motion_on && lyr_open_t > 0.01 {
-            self.track_motion_urls
-                .get(&self.current_lyrics_key)
-                .and_then(|o| o.as_deref())
-                .or_else(|| {
-                    if meta_motion_key.is_empty() {
-                        None
-                    } else {
-                        self.track_motion_urls
-                            .get(&meta_motion_key)
-                            .and_then(|o| o.as_deref())
-                    }
-                })
-        } else {
-            None
-        };
+        let lyrics_motion_owned: Option<String> =
+            if allow_track_motion && self.is_window_focused && lyr_open_t > 0.01 {
+                self.track_motion_urls
+                    .get(&self.current_lyrics_key)
+                    .and_then(|o| o.as_deref())
+                    .or_else(|| {
+                        if meta_motion_key.is_empty() {
+                            None
+                        } else {
+                            self.track_motion_urls
+                                .get(&meta_motion_key)
+                                .and_then(|o| o.as_deref())
+                        }
+                    })
+                    .map(|s| s.to_string())
+            } else {
+                None
+            };
+        if self.last_lyrics_motion_url != lyrics_motion_owned {
+            r.invalidate_motion_texture("lyrics_cover");
+            self.last_lyrics_motion_url = lyrics_motion_owned;
+        }
         r.set_lyrics_blur_downsample(self.settings.lyrics_blur_downsample);
-        self.motion_art
-            .set_slot("lyrics_cover", lyrics_motion_url, lyrics_motion_url.is_some());
-        let lyrics_motion_frame = lyrics_motion_url
+        self.motion_art.set_slot(
+            "lyrics_cover",
+            self.last_lyrics_motion_url.as_deref(),
+            self.last_lyrics_motion_url.is_some(),
+        );
+        let lyrics_motion_frame = self
+            .last_lyrics_motion_url
+            .as_deref()
             .and_then(|u| self.motion_art.latest_frame("lyrics_cover", Some(u)));
 
         // Album / Playlist Detail Page Hero Motion Cover slot (`detail_hero`)
         let detail_motion_url = if motion_on
+            && self.settings.playback_backend.supports_motion_artwork()
             && self.is_window_focused
             && !self.show_lyrics_overlay
             && matches!(self.route, PageRoute::ContainerDetail { .. })
@@ -10408,6 +12657,10 @@ impl AppUi {
         } else {
             None
         };
+        if self.last_detail_motion_url != detail_motion_url {
+            r.invalidate_motion_texture("detail_hero");
+            self.last_detail_motion_url = detail_motion_url.clone();
+        }
         self.motion_art.set_slot(
             "detail_hero",
             detail_motion_url.as_deref(),
@@ -10421,7 +12674,254 @@ impl AppUi {
             || self.route != PageRoute::Home
         {
             self.visible_home_motion_urls.clear();
+            self.visible_home_motion_targets.clear();
+            self.prefetch_home_motion_targets.clear();
+            if !motion_on || self.show_lyrics_overlay || self.route != PageRoute::Home {
+                self.rendered_home_motion_urls.clear();
+                self.rendered_home_motion_cards.clear();
+                self.motion_fade_alphas.clear();
+                self.last_card_motion_seqs.clear();
+                self.drawn_home_motion_seqs.clear();
+                if self.show_lyrics_overlay || !motion_on {
+                    self.has_settling_motion_fade = false;
+                }
+            }
             self.motion_art.sync_visible_urls(&[]);
+            self.motion_art.sync_prefetch_urls(&[]);
+        }
+
+        // Pre-compute layout geometry needed by R4 Cadence Alignment & Dirty-Rect Plan
+        let sb_open_t = self.sidebar_open_spring.value.clamp(0.0, 1.0);
+        let sb_layout_w = if is_narrow {
+            0.0
+        } else {
+            Theme::SIDEBAR_WIDTH * sb_open_t
+        };
+        if sb_open_t <= 0.003 || is_narrow {
+            self.last_sidebar_eq_rect = None;
+        }
+        let content_area = RectF::new(sb_layout_w, 0.0, (win_w - sb_layout_w).max(200.0), win_h);
+        let tb_guard_a = if self.route == PageRoute::Visualizer {
+            0.0
+        } else {
+            self.top_bar_guard_spring.value.clamp(0.0, 1.0)
+        };
+        let pill_w = (content_area.w - 48.0).clamp(380.0, Theme::MINI_PLAYER_MAX_WIDTH);
+        let pill_h = Theme::MINI_PLAYER_HEIGHT;
+        let pill_x = content_area.center_x() - pill_w * 0.5;
+        let pill_y = content_area.bottom() - pill_h - Theme::MINI_PLAYER_BOTTOM_MARGIN;
+        let mini_pill = RectF::new(pill_x, pill_y, pill_w, pill_h);
+        let pb_w = ((pill_x + pill_w - 122.0) - (pill_x + 192.0) - 8.0).max(1.0);
+        let (prog_px_bucket, prog_sec_bucket) = if self.smtc.duration_sec > 0.5 {
+            let frac = (self.smtc.position_sec / self.smtc.duration_sec).clamp(0.0, 1.0);
+            let px_w = (pb_w * r.dpi_scale.max(1.0)).max(1.0) as f64;
+            (
+                (frac * px_w).floor() as i32,
+                self.smtc.position_sec.floor() as i32,
+            )
+        } else {
+            (-1, -1)
+        };
+
+        let is_playing_now = self.smtc.status == "Playing";
+        let on_visualizer_page = self.route == PageRoute::Visualizer && !self.show_lyrics_overlay;
+        let has_overlay_popup = self.show_queue_popover
+            || self.show_more_popover
+            || self.context_menu.is_some()
+            || self.transfer_modal.is_some()
+            || self.listen_together.modal_open
+            || self.banner_text.is_some();
+        let eq_in_home_content = self.home_shelves.is_empty() && !self.home_songs.is_empty();
+        let eq_decaying = !is_playing_now && self.eq_bars_smooth.iter().any(|&v| v > 0.008);
+        let has_active_home_motion = motion_on
+            && self.is_window_focused
+            && !self.show_lyrics_overlay
+            && self.route == PageRoute::Home
+            && (self.motion_art.has_active_playing_slots()
+                || !self.rendered_home_motion_cards.is_empty());
+        let pre_home_scene_fp = if self.route == PageRoute::Home && lyr_open_t <= 0.004 {
+            self.compute_home_settled_scene_fp(r, sb_layout_w, tb_guard_a)
+        } else {
+            0
+        };
+        let ui_motion_other_than_fade = self.has_active_ui_motion_excluding_motion_fade();
+        let pending_home_settle = self.route == PageRoute::Home
+            && !self.show_lyrics_overlay
+            && self.is_window_focused
+            && motion_on
+            && !self.visible_home_motion_targets.is_empty()
+            && self.last_home_scroll_at.elapsed() < std::time::Duration::from_millis(90);
+        let was_settled_home_candidate = self.route == PageRoute::Home
+            && lyr_open_t <= 0.004
+            && self.settled_home_baseline_valid
+            && !ui_motion_other_than_fade
+            && !pending_home_settle
+            && !r.has_active_artwork_fade()
+            && self.win_max_trans >= 0.998
+            && self.cover_launch_anim.is_none()
+            && !has_overlay_popup
+            && !eq_in_home_content
+            && !eq_decaying
+            && pre_home_scene_fp == self.last_home_scene_fp
+            && (is_playing_now || has_active_home_motion);
+
+        // Evaluate which Home motion cover cards actually advanced or are crossfading
+        let cur_global_motion_seq = self.motion_art.latest_global_frame_seq();
+        let mut motion_changed = false;
+        let mut dirty_rects: Vec<RectF> = Vec::new();
+        let mut dirty_top_glass = false;
+        let mut dirty_bottom_glass = false;
+        if self.route == PageRoute::Home && lyr_open_t <= 0.004 && motion_on {
+            let top_overlap_y = 78.0f32;
+            let bot_overlap_y = (win_h - 106.0).max(0.0);
+            for (u, card_rect) in &self.rendered_home_motion_cards {
+                let cur_seq = self
+                    .motion_art
+                    .latest_frame_for_url(u)
+                    .map(|f| f.frame_seq)
+                    .unwrap_or(0);
+                let prev_seq = self.last_card_motion_seqs.get(u).copied().unwrap_or(0);
+                let is_fading = self
+                    .motion_fade_alphas
+                    .get(u)
+                    .copied()
+                    .is_some_and(|a| a > 0.0 && a < 0.995);
+                if cur_seq != prev_seq {
+                    motion_changed = true;
+                }
+                if was_settled_home_candidate && (cur_seq != prev_seq || is_fading) {
+                    dirty_rects.push(card_rect.inset(-2.0, -2.0));
+                    if card_rect.y < top_overlap_y && card_rect.bottom() > 0.0 {
+                        dirty_top_glass = true;
+                    }
+                    if card_rect.bottom() > bot_overlap_y && card_rect.y < win_h {
+                        dirty_bottom_glass = true;
+                    }
+                }
+            }
+        }
+        let progress_changed = is_playing_now
+            && self.smtc.duration_sec > 0.5
+            && (prog_px_bucket != self.last_progress_pixel_bucket
+                || prog_sec_bucket != self.last_progress_sec_bucket);
+
+        // Sample full WASAPI audio visualizer on Visualizer page, or ultra-lightweight 512-pt FFT
+        // when playing with「实时频谱播放图标」enabled. On settled Home, align EQ stepping cleanly
+        // with `motion_art.active_cadence_ms()` so EQ never triggers out-of-phase full redraws!
+        let use_live_icon_fft = !on_visualizer_page
+            && is_playing_now
+            && self.settings.live_eq_icon_spectrum
+            && !self.settings.reduce_motion
+            && !self.show_lyrics_overlay;
+        let sidebar_eq_visible = !is_narrow
+            && sb_open_t > 0.003
+            && self.settings.live_eq_icon_spectrum
+            && !self.settings.reduce_motion
+            && self.last_sidebar_eq_rect.is_some();
+        self.home_eq_cadence_accum_sec = (self.home_eq_cadence_accum_sec + dt).min(0.5);
+        let cadence_sec = (self.motion_art.active_cadence_ms().clamp(16, 100) as f32) / 1000.0;
+        let should_step_eq = if !was_settled_home_candidate {
+            true
+        } else if !is_playing_now {
+            false
+        } else if has_active_home_motion {
+            motion_changed
+                || (sidebar_eq_visible && self.home_eq_cadence_accum_sec >= cadence_sec * 2.5)
+        } else {
+            sidebar_eq_visible && self.home_eq_cadence_accum_sec >= cadence_sec
+        };
+
+        if should_step_eq {
+            let eq_dt = if was_settled_home_candidate {
+                self.home_eq_cadence_accum_sec.clamp(0.001, 0.12)
+            } else {
+                dt
+            };
+            self.home_eq_cadence_accum_sec = 0.0;
+            let prev_eq = self.eq_bars_smooth;
+            if on_visualizer_page {
+                self.latest_viz_snap = audio_viz::sample_live_visualizer(eq_dt);
+                self.viz_state
+                    .step_active(&self.latest_viz_snap, eq_dt, self.settings.reduce_motion);
+            } else if use_live_icon_fft {
+                let (active, bass, mid, high, beat, spec32) =
+                    audio_viz::sample_rhythm_levels_fast(eq_dt);
+                self.latest_viz_snap.active_signal = active;
+                self.latest_viz_snap.bass_energy = bass;
+                self.latest_viz_snap.mid_energy = mid;
+                self.latest_viz_snap.high_energy = high;
+                self.latest_viz_snap.beat_pulse = beat;
+                self.latest_viz_snap.spectrum_32 = spec32;
+            } else {
+                self.latest_viz_snap.active_signal = false;
+                self.latest_viz_snap.beat_pulse = 0.0;
+                self.latest_viz_snap.bass_energy = if is_playing_now && !self.settings.reduce_motion {
+                    let p = (self.smtc.position_sec as f32) * 2.8;
+                    0.22 + 0.14 * p.sin().abs()
+                } else {
+                    0.0
+                };
+            }
+
+            if is_playing_now && !self.settings.reduce_motion {
+                let s = &self.latest_viz_snap;
+                let beat = s.beat_pulse * 0.24;
+                let raw_5 = if (on_visualizer_page || use_live_icon_fft) && s.active_signal {
+                    [
+                        (s.spectrum_32[1] * 1.15 + beat).clamp(0.14, 1.0),
+                        (s.spectrum_32[6] * 1.25 + beat * 0.8).clamp(0.18, 1.0),
+                        (s.spectrum_32[12] * 1.32 + s.mid_energy * 0.35).clamp(0.20, 1.0),
+                        (s.spectrum_32[19] * 1.32 + s.mid_energy * 0.30).clamp(0.18, 1.0),
+                        (s.spectrum_32[26] * 1.35 + s.high_energy * 0.32).clamp(0.14, 1.0),
+                    ]
+                } else {
+                    let p = (self.smtc.position_sec as f32) * 5.8;
+                    [
+                        0.24 + 0.32 * (p * 1.00 + 0.1).sin().abs(),
+                        0.32 + 0.40 * (p * 1.32 + 1.1).sin().abs(),
+                        0.36 + 0.48 * (p * 1.58 + 2.3).sin().abs(),
+                        0.32 + 0.40 * (p * 1.84 + 3.4).sin().abs(),
+                        0.22 + 0.34 * (p * 2.12 + 4.5).sin().abs(),
+                    ]
+                };
+                let atk = (1.0 - (-24.0 * eq_dt).exp()).clamp(0.05, 1.0);
+                let rel = (1.0 - (-11.0 * eq_dt).exp()).clamp(0.03, 1.0);
+                for i in 0..5 {
+                    let k = if raw_5[i] > self.eq_bars_smooth[i] { atk } else { rel };
+                    self.eq_bars_smooth[i] += (raw_5[i] - self.eq_bars_smooth[i]) * k;
+                }
+            } else {
+                let decay = (-12.0 * eq_dt).exp();
+                for b in &mut self.eq_bars_smooth {
+                    *b *= decay;
+                    if *b < 0.008 {
+                        *b = 0.0;
+                    }
+                }
+            }
+
+            if was_settled_home_candidate && sidebar_eq_visible {
+                let eq_changed = (0..5).any(|i| (self.eq_bars_smooth[i] - prev_eq[i]).abs() > 0.004);
+                if eq_changed {
+                    if let Some(eq_r) = self.last_sidebar_eq_rect {
+                        dirty_rects.push(eq_r);
+                    }
+                }
+            }
+        }
+
+        if was_settled_home_candidate {
+            if progress_changed || dirty_bottom_glass {
+                dirty_rects.push(mini_pill.inset(-8.0, -8.0));
+            }
+            if dirty_top_glass {
+                dirty_rects.push(RectF::new(
+                    content_area.x,
+                    0.0,
+                    content_area.w,
+                    TOP_BAR_GUARD_H + 6.0,
+                ));
+            }
         }
 
         if lyr_open_t > 0.004 {
@@ -10461,14 +12961,36 @@ impl AppUi {
         self.lyrics_view.center_axis = self.settings.lyrics_center_axis;
         if lyr_open_t > 0.004 && self.lyrics_view.show_queue {
             self.sync_lyrics_queue_if_needed(false);
+            let q_len = self.lyrics_view.queue_tracks.len();
+            if q_len > 0 {
+                let row_stride = 60.0f32;
+                let scroll_y = self.lyrics_view.queue_scroll_y.max(0.0);
+                let vis_h = (self.lyrics_view.queue_column_rect.h.max(win_h - 140.0)).max(240.0);
+                let start_idx = ((scroll_y / row_stride).floor() as usize).saturating_sub(3);
+                let end_idx = ((((scroll_y + vis_h) / row_stride).ceil() as usize) + 6).min(q_len);
+                let mut urls_to_req: Vec<String> = Vec::with_capacity(end_idx.saturating_sub(start_idx));
+                for tr in &self.lyrics_view.queue_tracks[start_idx.min(q_len)..end_idx] {
+                    if let Some(ref u) = tr.artwork_url {
+                        if !u.is_empty() && !r.has_artwork(u, false) {
+                            urls_to_req.push(u.clone());
+                        }
+                    }
+                }
+                for u in urls_to_req {
+                    self.request_artwork_sized(r, &u, false, 160);
+                }
+            }
         }
 
         // Fast path when Lyrics view is fully expanded (`lyr_open_t >= 0.996`)
         if lyr_open_t >= 0.996 {
+            self.settled_home_baseline_valid = false;
             r.release_lyrics_transition_surfaces();
             self.hover_alphas.clear();
             self.hit_regions.clear();
-            r.begin_draw(Theme::BG_PRIMARY);
+            let full_plan = DirtyFramePlan::full();
+            self.last_dirty_plan = full_plan.clone();
+            let _ = r.begin_draw_dirty(Theme::BG_PRIMARY, &full_plan);
             let art_key = self.smtc.artwork_url.clone();
             let lyr_key = self.current_lyrics_key.clone();
             let glass_off = self.glass_off();
@@ -10526,8 +13048,21 @@ impl AppUi {
             r.release_lyrics_transition_surfaces();
             self.lyrics_view.release_gpu_caches(r);
         }
+        let dirty_plan = if was_settled_home_candidate {
+            DirtyFramePlan {
+                dirty_rects_dip: dirty_rects,
+                force_full: false,
+            }
+        } else {
+            DirtyFramePlan::full()
+        };
+        self.last_dirty_plan = dirty_plan.clone();
+        if !r.begin_draw_dirty(Theme::BG_PRIMARY, &dirty_plan) {
+            self.last_rendered_motion_seq = cur_global_motion_seq;
+            return;
+        }
         self.hit_regions.clear();
-        r.begin_draw(Theme::BG_PRIMARY);
+        self.has_settling_motion_fade = false;
 
         // Pre-bakeAdded/Removed playlist diff rows into offscreen GPU bitmaps at clip/layer depth == 0!
         let mut diff_finished = false;
@@ -10584,7 +13119,7 @@ impl AppUi {
                     }
                     if let Some(tr) = tr_opt {
                         if let Some(ref u) = tr.artwork_url {
-                            self.request_artwork(r, u, false);
+                            self.request_artwork_sized(r, u, false, 160);
                         }
                         if let Some(pad) = r.begin_row_fx_bake(next_slot, row_w, row_h) {
                             Self::render_track_row_visuals(
@@ -10619,16 +13154,9 @@ impl AppUi {
         }
 
         // Smoothly animated sidebar width (`0.0 .. Theme::SIDEBAR_WIDTH`) + floating drawer on narrow windows!
-        let sb_open_t = self.sidebar_open_spring.value.clamp(0.0, 1.0);
-        let sb_layout_w = if is_narrow {
-            0.0
-        } else {
-            Theme::SIDEBAR_WIDTH * sb_open_t
-        };
         if sb_open_t <= 0.003 {
             self.sidebar_nav_rect = RectF::default();
         }
-        let content_area = RectF::new(sb_layout_w, 0.0, (win_w - sb_layout_w).max(200.0), win_h);
 
         // 1. LAYER 1: Content Layer with smooth nonlinear page-transition entrance!
         // Plus subtle window maximize/restore centered scale transition (when reduce_motion is OFF)!
@@ -10655,23 +13183,54 @@ impl AppUi {
         self.draw_main_content_layer(r, content_area);
         clip_hit_regions_below_topbar(&mut self.hit_regions, TOP_BAR_GUARD_H);
 
-        // Immediately sync URL-keyed viewport motion slots right after drawing Home content:
-        // every visible motion cover plays smoothly, and every cover leaving the viewport stops immediately!
+        // Immediately sync URL-keyed viewport motion slots & scroll-active prefetch window right after drawing Home!
+        // - Already-cached MP4s & warm-paused slots activate IMMEDIATELY (0ms debounce) even while fast scrolling!
+        // - Uncached network HLS cards use a brief ~80ms settle debounce for active decode while STILL prefetching immediately!
         if motion_on
             && self.is_window_focused
             && !self.show_lyrics_overlay
             && self.route == PageRoute::Home
         {
-            self.motion_art
-                .sync_visible_urls(&self.visible_home_motion_urls);
+            let scrolling_fast = self.scroll_vel_y.abs() > 25.0
+                || (self.scroll_y - self.scroll_target_y).abs() > 2.5;
+            if scrolling_fast {
+                self.last_home_scroll_at = Instant::now();
+            }
+            let uncached_settled = !scrolling_fast
+                && self.last_home_scroll_at.elapsed() >= std::time::Duration::from_millis(80);
+            if uncached_settled {
+                self.motion_art
+                    .sync_visible_urls_with_targets(&self.visible_home_motion_targets);
+                self.motion_art
+                    .sync_prefetch_urls(&self.prefetch_home_motion_targets);
+            } else {
+                let mut immediate_visible: Vec<(String, u32)> =
+                    Vec::with_capacity(self.visible_home_motion_targets.len());
+                let mut active_prefetch: Vec<(String, u32)> = Vec::with_capacity(
+                    self.visible_home_motion_targets.len()
+                        + self.prefetch_home_motion_targets.len(),
+                );
+                for (u, target_px) in &self.visible_home_motion_targets {
+                    if self.motion_art.is_url_cached_ready_nonblocking(u)
+                        || self.motion_art.latest_frame_for_url(u).is_some()
+                    {
+                        immediate_visible.push((u.clone(), *target_px));
+                    } else {
+                        active_prefetch.push((u.clone(), *target_px));
+                    }
+                }
+                for (u, target_px) in &self.prefetch_home_motion_targets {
+                    if !active_prefetch.iter().any(|(x, _)| x == u) {
+                        active_prefetch.push((u.clone(), *target_px));
+                    }
+                }
+                self.motion_art
+                    .sync_visible_urls_with_targets(&immediate_visible);
+                self.motion_art.sync_prefetch_urls(&active_prefetch);
+            }
         }
 
         // Top-Bar Placeholder Scrim (fades in smoothly when cursor hovers into top bar while browsing!)
-        let tb_guard_a = if self.route == PageRoute::Visualizer {
-            0.0
-        } else {
-            self.top_bar_guard_spring.value.clamp(0.0, 1.0)
-        };
         if tb_guard_a > 0.006 {
             let guard_rect = RectF::new(content_area.x, 0.0, content_area.w, TOP_BAR_GUARD_H);
             let bg_a = if self.glass_off() { 0.90 } else { 0.72 };
@@ -10709,7 +13268,102 @@ impl AppUi {
         // Completely skipped on Settings (or whenever Liquid Glass is disabled) for 0 GPU blur cost!
         let glass_off_now = self.glass_off();
         if !glass_off_now {
-            r.begin_glass_backdrop_snapshot(false);
+            let has_hero_launch = self.cover_launch_anim.is_some()
+                && matches!(self.route, PageRoute::ContainerDetail { .. });
+            let trans_t = self.route_trans.clamp(0.0, 1.0);
+            let ease = 1.0 - (1.0 - trans_t).powi(4);
+            let trans_dy = if self.settings.reduce_motion || has_hero_launch {
+                0.0
+            } else {
+                (1.0 - ease) * 18.0 * self.route_trans_dir
+            };
+            let grip_overlaps_btn = if tb_guard_a > 0.006 {
+                let reopen_t = if is_narrow {
+                    1.0
+                } else {
+                    (1.0 - sb_open_t).clamp(0.0, 1.0)
+                };
+                let back_btn_right = content_area.x
+                    + 18.0
+                    + Theme::TOP_BAR_H
+                    + if reopen_t > 0.01 {
+                        (Theme::TOP_BAR_H + 8.0) * reopen_t
+                    } else {
+                        0.0
+                    };
+                let more_x = content_area.right()
+                    - 18.0
+                    - Theme::TOP_BAR_H
+                    - (8.0 + Theme::TOP_BAR_H) * 2.0
+                    - (14.0 + Theme::TOP_BAR_H);
+                let leftmost_right_x =
+                    if let Some((lt_active, _)) = self.build_listen_together_pill_info() {
+                        let lt_w = if lt_active { 124.0f32 } else { 78.0f32 };
+                        more_x - 8.0 - lt_w
+                    } else {
+                        more_x
+                    };
+                let grip_x0 = content_area.center_x() - 28.0;
+                let grip_x1 = content_area.center_x() + 28.0;
+                let blur_pad = 20.0;
+                back_btn_right + blur_pad >= grip_x0 || leftmost_right_x - blur_pad <= grip_x1
+            } else {
+                false
+            };
+            let top_bar_solid_bg = if !self.show_lyrics_overlay
+                && !is_narrow
+                && !grip_overlaps_btn
+                && self.route != PageRoute::Visualizer
+                && self.route != PageRoute::Settings
+                && self.scroll_y <= 2.0
+                && trans_dy.abs() < 0.5
+                && !max_trans_active
+                && self.cover_launch_anim.is_none()
+                && self.sidebar_open_spring.is_settled_norm()
+            {
+                if tb_guard_a > 0.006 {
+                    Some(Theme::BG_PRIMARY.lerp(
+                        Color::rgb(16, 16, 21),
+                        (0.72 * tb_guard_a).clamp(0.0, 1.0),
+                    ))
+                } else {
+                    Some(Theme::BG_PRIMARY)
+                }
+            } else {
+                None
+            };
+            let dirty_mask = self.compute_backdrop_dirty_mask(
+                r,
+                sb_layout_w,
+                tb_guard_a,
+                trans_dy,
+                max_trans_active,
+                lyr_open_t,
+                top_bar_solid_bg.is_some(),
+            );
+            if max_trans_active {
+                r.set_glass_snapshot_x_rois([(0.0, 0.0); 2], 0, None);
+            } else {
+                let pill_w = (content_area.w - 48.0).clamp(380.0, Theme::MINI_PLAYER_MAX_WIDTH);
+                let pill_x = content_area.center_x() - pill_w * 0.5;
+                r.set_glass_snapshot_x_rois(
+                    [
+                        (content_area.x + 14.0, content_area.x + 98.0),
+                        (content_area.right() - 328.0, content_area.right() - 14.0),
+                    ],
+                    2,
+                    Some((pill_x - 4.0, pill_x + pill_w + 4.0)),
+                );
+            }
+            r.begin_glass_backdrop_snapshot_strips_ex(
+                false,
+                54.0,
+                82.0,
+                top_bar_solid_bg,
+                dirty_mask,
+            );
+        } else {
+            self.backdrop_fp.valid = false;
         }
         self.draw_top_floating_nav(r, content_area, nav_sb_t);
         self.draw_floating_mini_player(r, content_area);
@@ -10875,17 +13529,54 @@ impl AppUi {
         } else {
             self.effective_frame_pacing().0
         };
+        let stats_before_present = r.frame_stats();
         r.end_window_draw_and_present(
             self.settings.window_corner_radius,
             self.is_window_maximized,
             sync_int,
         );
+        let stats_after_present = r.frame_stats();
+
+        // Update R4 cadence telemetry & settled-Home baseline tracking using exact drawn frame seqs
+        // (avoids missing a new frame decoded by the background worker during Present!)
+        self.last_rendered_motion_seq = cur_global_motion_seq;
+        self.last_progress_pixel_bucket = prog_px_bucket;
+        self.last_progress_sec_bucket = prog_sec_bucket;
+        if self.route == PageRoute::Home && lyr_open_t <= 0.004 {
+            self.last_card_motion_seqs.clear();
+            for (u, _) in &self.rendered_home_motion_cards {
+                let seq = self.drawn_home_motion_seqs.get(u).copied().unwrap_or(0);
+                self.last_card_motion_seqs.insert(u.clone(), seq);
+            }
+            let presented_dirty =
+                stats_after_present.present1_dirty_frames > stats_before_present.present1_dirty_frames;
+            if presented_dirty {
+                self.cadence_stats.home_dirty_rect_frames += 1;
+            } else {
+                self.cadence_stats.home_full_redraw_count += 1;
+            }
+            if motion_changed {
+                self.cadence_stats.home_video_frame_present_count += 1;
+            } else if is_playing_now && was_settled_home_candidate {
+                self.cadence_stats.home_non_video_playing_redraws += 1;
+            }
+            self.last_home_scene_fp = self.compute_home_settled_scene_fp(r, sb_layout_w, tb_guard_a);
+            self.settled_home_baseline_valid = !self.has_active_ui_motion_excluding_motion_fade()
+                && !r.has_active_artwork_fade()
+                && self.win_max_trans >= 0.998
+                && self.cover_launch_anim.is_none()
+                && !has_overlay_popup
+                && !eq_in_home_content;
+        } else {
+            self.settled_home_baseline_valid = false;
+        }
     }
 
     // ========================================================================
     // iPadOS Apple Music Left Sidebar (`media_1794844113582_e39fc57c.jpg`)
     // ========================================================================
     fn draw_ipad_sidebar(&mut self, r: &mut D2DRenderer, sb: RectF, allow_live_glass: bool) {
+        self.last_sidebar_eq_rect = None;
         let is_floating = self.last_win_w < Theme::SIDEBAR_AUTO_COLLAPSE_WIDTH;
         if !self.glass_off() && allow_live_glass && is_floating {
             // Narrow-window floating sidebar drawer refracts live album covers underneath!
@@ -11023,7 +13714,10 @@ impl AppUi {
 
         let text_vp = RectF::new(sbox.x + 36.0, sbox.y, (sbox.w - 64.0).max(24.0), sbox.h);
         self.search_cursor = self.clamp_search_byte_idx(self.search_cursor);
-        self.search_char_xs = r.compute_single_line_char_xs(&self.search_query, 14.0, 400);
+        if self.search_char_xs_query != self.search_query {
+            self.search_char_xs = r.compute_single_line_char_xs(&self.search_query, 14.0, 400);
+            self.search_char_xs_query = self.search_query.clone();
+        }
         let total_text_w = self.search_char_xs.last().map(|&(_, x)| x).unwrap_or(0.0);
         let caret_rel_x = self.search_byte_to_x(self.search_cursor);
 
@@ -11089,6 +13783,7 @@ impl AppUi {
             let caret_y = sbox.y + (sbox.h - caret_h) * 0.5;
             let caret_x = (text_vp.x + caret_rel_x - self.search_scroll_x)
                 .clamp(text_vp.x, text_vp.right() - 1.6);
+            self.search_caret_screen_x = caret_x;
             r.fill_rounded_rect(
                 RectF::new(caret_x, caret_y, 1.6, caret_h),
                 0.8,
@@ -11338,7 +14033,7 @@ impl AppUi {
                 .hidden_sidebar_keys
                 .iter()
                 .any(|k| k == "pl_all");
-            let pls_count = self.sidebar_playlists.len().min(24);
+            let pls_count = self.sidebar_playlists.len();
             let mut full_pl_h = (pls_count as f32) * 37.0;
             if !hidden_all {
                 full_pl_h += 37.0;
@@ -11382,9 +14077,9 @@ impl AppUi {
                     );
                 }
 
-                // Zero-clone stack move of `sidebar_playlists`!
+                // Zero-clone stack move of `sidebar_playlists` (frustum-culled below, zero artificial cap!)
                 let pls = std::mem::take(&mut self.sidebar_playlists);
-                for pl in pls.iter().take(24) {
+                for pl in pls.iter() {
                     let row = RectF::new(x0 + 10.0, inner_y, sb.w - 20.0, 36.0);
                     let is_sel = !self.sidebar_edit_mode
                         && matches!(
@@ -11410,7 +14105,7 @@ impl AppUi {
                         let thumb = RectF::new(row.x + 8.0, row.y + 6.0, 24.0, 24.0);
                         let mut drew_t = false;
                         if let Some(ref u) = pl.artwork_url {
-                            self.request_artwork(r, u, false);
+                            self.request_artwork_sized(r, u, false, 160);
                             drew_t = r.draw_rounded_artwork(u, false, thumb, 5.0, row_alpha);
                         }
                         if !drew_t {
@@ -11632,6 +14327,9 @@ impl AppUi {
 
         let vis_alpha = (if hidden { 0.38 * edit_t } else { 1.0 }) * sec_alpha;
         let ic_rect = RectF::new(row.x + 10.0, row.y + 8.5, 19.0, 19.0);
+        if icon == SfIcon::Visualizer {
+            self.last_sidebar_eq_rect = intersect_rect(ic_rect.inset(-2.5, -2.5), nav_clip);
+        }
         let show_live_viz_icon = (self.route == PageRoute::Visualizer || self.settings.live_eq_icon_spectrum)
             && self.eq_bars_smooth.iter().any(|&v| v > 0.02);
         if icon == SfIcon::Visualizer && show_live_viz_icon {
@@ -12096,7 +14794,7 @@ impl AppUi {
         let art_x = cx + 22.0;
         let art_rect = RectF::new(art_x, cy - 21.0, 42.0, 42.0);
         if let Some(ref u) = self.smtc.artwork_url.clone() {
-            self.request_artwork(r, u, false);
+            self.request_artwork_sized(r, u, false, 160);
         }
         let drew_cov = self
             .smtc
@@ -12257,6 +14955,8 @@ impl AppUi {
     // Content Layer Router (Home, Browse, Radio, Detail, Search, Library, Visualizer, Settings)
     // ========================================================================
     fn draw_main_content_layer(&mut self, r: &mut D2DRenderer, area: RectF) {
+        self.last_visible_playing_row_rect = None;
+        self.last_detail_hero_rect = None;
         // Nonlinear quintic ease-out page transition (`1 - (1 - t)^4`) across ALL routes!
         // When a Hero Cover Launch zoom animation is flying into `ContainerDetail`, keep `art_rect`
         // stationary and let `draw_container_detail_page` fade the detail page in behind the flying cover!
@@ -12282,12 +14982,6 @@ impl AppUi {
 
         if self.route == PageRoute::Visualizer {
             let viz_area = RectF::new(area.x, area.y + trans_dy, area.w, area.h);
-            let smtc_snap = self.smtc.clone();
-            let exp_specs = self.smtc.stream_specs.clone();
-            let exp_badge = self.smtc.audio_quality.clone();
-            let prefs = self.audio_prefs.clone();
-            let devs = self.devices.clone();
-            let art_key = self.smtc.artwork_url.clone();
             let fps = self.measured_fps;
             let is_anim = self.needs_continuous_animation();
             let cap_lbl = self
@@ -12298,17 +14992,16 @@ impl AppUi {
             let mpos = self.mouse_pos;
             let mdown = self.mouse_down;
             let red_tr = self.glass_off();
-            let snap = self.latest_viz_snap.clone();
             self.viz_state.draw(
                 r,
                 viz_area,
-                &snap,
-                &smtc_snap,
-                exp_specs.as_ref(),
-                exp_badge.as_deref(),
-                &prefs,
-                &devs,
-                art_key.as_deref(),
+                &self.latest_viz_snap,
+                &self.smtc,
+                self.smtc.stream_specs.as_ref(),
+                self.smtc.audio_quality.as_deref(),
+                &self.audio_prefs,
+                &self.devices,
+                self.smtc.artwork_url.as_deref(),
                 fps,
                 is_anim,
                 &cap_lbl,
@@ -12353,12 +15046,20 @@ impl AppUi {
                     out_y
                 } else {
                     self.visible_home_motion_urls.clear();
+                    self.visible_home_motion_targets.clear();
+                    self.prefetch_home_motion_targets.clear();
+                    self.rendered_home_motion_urls.clear();
+                    self.rendered_home_motion_cards.clear();
                     self.draw_home_or_browse(r, x0, start_y, inner_w, heading)
                 }
             }
             PageRoute::Browse => {
                 let heading = self.settings.playback_backend.browse_heading();
                 self.visible_home_motion_urls.clear();
+                self.visible_home_motion_targets.clear();
+                self.prefetch_home_motion_targets.clear();
+                self.rendered_home_motion_urls.clear();
+                self.rendered_home_motion_cards.clear();
                 if !self.browse_shelves.is_empty() {
                     let shelves = std::mem::take(&mut self.browse_shelves);
                     let out_y = self.draw_editorial_shelves_page(
@@ -12392,6 +15093,10 @@ impl AppUi {
             PageRoute::Radio => {
                 let heading = self.settings.playback_backend.radio_heading();
                 self.visible_home_motion_urls.clear();
+                self.visible_home_motion_targets.clear();
+                self.prefetch_home_motion_targets.clear();
+                self.rendered_home_motion_urls.clear();
+                self.rendered_home_motion_cards.clear();
                 if !self.radio_shelves.is_empty() {
                     let shelves = std::mem::take(&mut self.radio_shelves);
                     let out_y = self.draw_editorial_shelves_page(
@@ -12448,7 +15153,12 @@ impl AppUi {
             }
             PageRoute::LibPlaylists => {
                 let c = self.lib_cards.remove("playlists").unwrap_or_default();
-                let out_y = self.draw_cards_page(r, x0, start_y, inner_w, "所有播放列表", &c, true);
+                let heading = if c.is_empty() {
+                    "所有播放列表".to_string()
+                } else {
+                    format!("所有播放列表 · {}", c.len())
+                };
+                let out_y = self.draw_cards_page(r, x0, start_y, inner_w, &heading, &c, true);
                 if !c.is_empty() {
                     self.lib_cards.insert("playlists".to_string(), c);
                 }
@@ -12763,6 +15473,7 @@ impl AppUi {
     ) -> f32 {
         let art_sz = 228.0f32.min(w * 0.34).max(164.0);
         let art_rect = RectF::new(x0, y, art_sz, art_sz);
+        self.last_detail_hero_rect = Some(art_rect);
 
         // Evaluate active Hero Album Cover Launch Zoom Animation (`clicked card -> detail hero`)
         let route_id = match &self.route {
@@ -12872,14 +15583,21 @@ impl AppUi {
                 } else {
                     None
                 };
-                if let Some(ref frame) = mf {
-                    r.fill_rounded_rect(
-                        RectF::new(art_rect.x + 4.0, art_rect.y + 8.0, art_sz - 8.0, art_sz),
-                        pending_rad,
-                        Color::rgba(0, 0, 0, 0.45),
-                    );
-                    let _ = r.draw_motion_artwork(frame, art_rect, pending_rad, 1.0);
-                    r.stroke_rounded_rect(art_rect, pending_rad, Color::rgba(255, 255, 255, 0.14), 1.0);
+                if let (Some(u), Some(ref frame)) = (pending_vid.as_deref(), mf) {
+                    let smooth_a = self.advance_detail_motion_crossfade(u);
+                    if smooth_a < 0.995 {
+                        draw_flying_cover(self, r, art_rect, pending_rad, pending_art.as_deref());
+                    } else {
+                        r.fill_rounded_rect(
+                            RectF::new(art_rect.x + 4.0, art_rect.y + 8.0, art_sz - 8.0, art_sz),
+                            pending_rad,
+                            Color::rgba(0, 0, 0, 0.45),
+                        );
+                    }
+                    if smooth_a > 0.005 {
+                        let _ = r.draw_motion_artwork(frame, art_rect, pending_rad, smooth_a);
+                        r.stroke_rounded_rect(art_rect, pending_rad, Color::rgba(255, 255, 255, 0.14), 1.0);
+                    }
                 } else {
                     draw_flying_cover(self, r, art_rect, pending_rad, pending_art.as_deref());
                 }
@@ -12985,18 +15703,29 @@ impl AppUi {
             } else {
                 None
             };
-            let mut drew_hero = detail_mf
-                .as_ref()
-                .map(|mf| r.draw_motion_artwork(mf, art_rect, hero_rad, 1.0))
-                .unwrap_or(false);
-            if !drew_hero {
-                if let Some(ref u) = detail.artwork_url {
-                    self.request_artwork(r, u, true);
+            let detail_fade_a = match (detail.motion_video_url.as_deref(), detail_mf.as_ref()) {
+                (Some(u), Some(_)) => self.advance_detail_motion_crossfade(u),
+                _ => 0.0,
+            };
+            let mut drew_hero = false;
+            if let Some(ref u) = detail.artwork_url {
+                self.request_artwork(r, u, true);
+                if detail_fade_a < 0.995 {
                     drew_hero = r.draw_rounded_artwork(u, true, art_rect, hero_rad, 1.0)
                         || r.draw_rounded_artwork(u, false, art_rect, hero_rad, 1.0);
                 }
-            } else if let Some(ref u) = detail.artwork_url {
-                self.request_artwork(r, u, true);
+            }
+            if let Some(ref mf) = detail_mf {
+                if detail_fade_a > 0.005 {
+                    if r.draw_motion_artwork(mf, art_rect, hero_rad, detail_fade_a) {
+                        drew_hero = true;
+                    } else if !drew_hero {
+                        if let Some(ref u) = detail.artwork_url {
+                            drew_hero = r.draw_rounded_artwork(u, true, art_rect, hero_rad, 1.0)
+                                || r.draw_rounded_artwork(u, false, art_rect, hero_rad, 1.0);
+                        }
+                    }
+                }
             }
             if !drew_hero {
                 r.fill_rounded_rect(art_rect, hero_rad, Theme::BG_ELEVATED);
@@ -13009,7 +15738,7 @@ impl AppUi {
             let hero_is_loading_slot = self.playback_loading
                 && (self.playback_loading_container_id.as_deref() == Some(detail.id.as_str())
                     || self.playback_loading_track_id.as_deref().is_some_and(|tid| {
-                        detail.tracks.iter().any(|t| t.effective_adam_id() == tid)
+                        detail.tracks.iter().any(|t| t.effective_adam_id_str() == tid)
                     }));
             if hero_is_loading_slot {
                 r.fill_rounded_rect(art_rect, hero_rad, Color::rgba(8, 8, 14, 0.48));
@@ -13028,7 +15757,7 @@ impl AppUi {
         let hero_is_loading = self.playback_loading
             && (self.playback_loading_container_id.as_deref() == Some(detail.id.as_str())
                 || self.playback_loading_track_id.as_deref().is_some_and(|tid| {
-                    detail.tracks.iter().any(|t| t.effective_adam_id() == tid)
+                    detail.tracks.iter().any(|t| t.effective_adam_id_str() == tid)
                 }));
 
         let rx = art_rect.right() + 28.0;
@@ -13438,7 +16167,7 @@ impl AppUi {
         &mut self,
         r: &mut D2DRenderer,
         x0: f32,
-        mut y: f32,
+        y: f32,
         w: f32,
         tracks: &[AgentTrackInput],
         source: TrackListSource,
@@ -13505,13 +16234,13 @@ impl AppUi {
                         let ry = y + cur_idx_f * row_h;
                         if ry + row_h >= pre_top && ry <= pre_bot {
                             if let Some(ref u) = tr.artwork_url {
-                                self.request_artwork(r, u, false);
+                                self.request_artwork_sized(r, u, false, 160);
                             }
                         }
                         if ry + row_h < 0.0 || ry > win_h {
                             continue;
                         }
-                        let eff_id = tr.effective_adam_id();
+                        let eff_id = tr.effective_adam_id_str();
                         let is_cur = self
                             .smtc
                             .adam_id
@@ -13523,6 +16252,9 @@ impl AppUi {
                                 .as_deref()
                                 .is_some_and(|tid| !tid.is_empty() && tid == eff_id);
                         let row = RectF::new(x0 - 8.0, ry, w + 16.0, row_h);
+                        if is_cur {
+                            self.last_visible_playing_row_rect = Some(row);
+                        }
                         let dots = RectF::new(x0 + w - 28.0, ry + 14.0, 28.0, 28.0);
                         let is_hov =
                             allow_page_hov && row.contains(self.mouse_pos.0, self.mouse_pos.1);
@@ -13572,14 +16304,28 @@ impl AppUi {
             }
         }
 
-        for (idx, tr) in tracks.iter().enumerate() {
-            let ry = y;
-            y += row_h;
+        // O(1) arithmetic virtualization jump to the exact prefetch/visible window (eliminates O(N) scan on 5,000-track playlists!)
+        let total_tracks = tracks.len();
+        let start_idx = if total_tracks == 0 {
+            0
+        } else {
+            (((pre_top - y) / row_h).floor() as isize).clamp(0, total_tracks as isize) as usize
+        };
+        let end_idx = if total_tracks == 0 {
+            0
+        } else {
+            ((((pre_bot - y) / row_h).ceil() as isize) + 1).clamp(start_idx as isize, total_tracks as isize)
+                as usize
+        };
+
+        for idx in start_idx..end_idx {
+            let tr = &tracks[idx];
+            let ry = y + (idx as f32) * row_h;
 
             // Directional velocity-aware cover prefetch BEFORE frustum culling!
             if ry + row_h >= pre_top && ry <= pre_bot {
                 if let Some(ref u) = tr.artwork_url {
-                    self.request_artwork(r, u, false);
+                    self.request_artwork_sized(r, u, false, 160);
                 }
             }
 
@@ -13589,12 +16335,15 @@ impl AppUi {
             }
 
             let row = RectF::new(x0 - 8.0, ry, w + 16.0, row_h);
-            let eff_id = tr.effective_adam_id();
+            let eff_id = tr.effective_adam_id_str();
             let is_cur = self
                 .smtc
                 .adam_id
                 .as_deref()
                 .is_some_and(|a| !a.is_empty() && a == eff_id);
+            if is_cur {
+                self.last_visible_playing_row_rect = Some(row);
+            }
             let is_row_loading = self.playback_loading
                 && self
                     .playback_loading_track_id
@@ -13607,10 +16356,11 @@ impl AppUi {
                 match source {
                     TrackListSource::HomeSongs => "tr_home",
                     TrackListSource::SearchSongs => "tr_srch",
+                    TrackListSource::SearchLocalSongs => "tr_srch_loc",
                     TrackListSource::LibrarySongs => "tr_lib",
                     TrackListSource::DetailTracks => "tr_det",
                 },
-                if eff_id.is_empty() { &tr.name } else { &eff_id },
+                if eff_id.is_empty() { &tr.name } else { eff_id },
             ) ^ (idx as u64);
             let hov_t = self.eval_hover_alpha(hov_key, is_hov);
 
@@ -13649,7 +16399,7 @@ impl AppUi {
                 },
             });
         }
-        y
+        y + (total_tracks as f32) * row_h
     }
 
     // ========================================================================
@@ -13665,8 +16415,22 @@ impl AppUi {
         shelves: &[EditorialShelf],
         allow_motion: bool,
     ) -> f32 {
+        let win_h = r.logical_height();
+        let dpi_scale = r.dpi_scale.max(1.0);
+        let pre_top = -0.75 * win_h;
+        let pre_bot = win_h + 1.5 * win_h;
+        let vp_center_y = win_h * 0.5;
+        let mut visible_motion_candidates: Vec<(String, u32, f32)> = Vec::new();
+        let mut prefetch_motion_candidates: Vec<(String, u32, f32)> = Vec::new();
+
         if allow_motion {
             self.visible_home_motion_urls.clear();
+            self.visible_home_motion_targets.clear();
+            self.prefetch_home_motion_targets.clear();
+            self.rendered_home_motion_urls.clear();
+            self.rendered_home_motion_cards.clear();
+            self.drawn_home_motion_seqs.clear();
+            self.visited_motion_fade_urls.clear();
         }
         r.draw_text(
             heading,
@@ -13680,7 +16444,6 @@ impl AppUi {
         );
         y += 52.0;
 
-        let win_h = r.logical_height();
         let allow_hov = self.mouse_pos.1 >= TOP_BAR_GUARD_H;
         let motion_enabled = allow_motion
             && self.settings.motion_artwork_enabled
@@ -13725,14 +16488,35 @@ impl AppUi {
                     };
                     let card_w = (w - gap * ((cols - 1) as f32)) / (cols as f32);
                     let card_h = (card_w * 1.28).clamp(245.0, 415.0);
+                    let target_px = (card_w.max(card_h) * dpi_scale).round().clamp(128.0, 1024.0) as u32;
                     let show_n = shelf.items.len().min(cols);
+                    let row_in_prefetch = y + card_h >= pre_top && y <= pre_bot;
                     for (idx, it) in shelf.items.iter().take(show_n).enumerate() {
                         let cx = x0 + (idx as f32) * (card_w + gap);
                         let cy = y;
+                        let pick_vid_url = it
+                            .motion_tall_video_url
+                            .as_deref()
+                            .or(it.motion_video_url.as_deref());
                         if cy + card_h >= -420.0 && cy <= win_h + 720.0 && !it.artwork_url.is_empty() {
                             self.request_artwork(r, &it.artwork_url, true);
                         }
-                        if cy + card_h < 0.0 || cy > win_h {
+                        if motion_enabled {
+                            if let Some(u) = pick_vid_url {
+                                let dist = ((cy + card_h * 0.5) - vp_center_y).abs();
+                                if cy + card_h > 0.0 && cy < win_h {
+                                    visible_motion_candidates.push((u.to_string(), target_px, dist));
+                                    if !self.rendered_home_motion_urls.iter().any(|x| x == u) {
+                                        self.rendered_home_motion_urls.push(u.to_string());
+                                    }
+                                    self.rendered_home_motion_cards
+                                        .push((u.to_string(), RectF::new(cx, cy, card_w, card_h)));
+                                } else if cy + card_h >= pre_top && cy <= pre_bot {
+                                    prefetch_motion_candidates.push((u.to_string(), target_px, dist));
+                                }
+                            }
+                        }
+                        if cy + card_h <= 0.0 || cy >= win_h {
                             continue;
                         }
                         let card_r = RectF::new(cx, cy, card_w, card_h);
@@ -13741,28 +16525,31 @@ impl AppUi {
                             fnv1a_hover_key("ed_pick", &it.id) ^ ((s_idx as u64) << 16) ^ ((idx as u64) << 32),
                             is_hov,
                         );
-                        let pick_vid_url = it
-                            .motion_tall_video_url
-                            .as_deref()
-                            .or(it.motion_video_url.as_deref());
-                        if motion_enabled && cy + card_h > TOP_BAR_GUARD_H - 12.0 && cy < win_h {
-                            if let Some(u) = pick_vid_url {
-                                if !self.visible_home_motion_urls.iter().any(|x| x == u) {
-                                    self.visible_home_motion_urls.push(u.to_string());
-                                }
-                            }
-                        }
                         let pick_mf = if motion_enabled {
                             pick_vid_url.and_then(|u| self.motion_art.latest_frame_for_url(u))
                         } else {
                             None
                         };
-                        let drew = pick_mf
-                            .as_ref()
-                            .map(|mf| r.draw_motion_artwork(mf, card_r, 16.0, 1.0))
-                            .unwrap_or(false)
-                            || (!it.artwork_url.is_empty()
-                                && r.draw_rounded_artwork(&it.artwork_url, true, card_r, 16.0, 1.0));
+                        if let (Some(u), Some(ref mf)) = (pick_vid_url, &pick_mf) {
+                            self.drawn_home_motion_seqs.insert(u.to_string(), mf.frame_seq);
+                        }
+                        let fade_a = match (pick_vid_url, pick_mf.as_ref()) {
+                            (Some(u), Some(_)) => self.advance_motion_crossfade(u),
+                            _ => 0.0,
+                        };
+                        let mut drew = false;
+                        if fade_a < 0.995 && !it.artwork_url.is_empty() {
+                            drew = r.draw_rounded_artwork(&it.artwork_url, true, card_r, 16.0, 1.0);
+                        }
+                        if let Some(ref mf) = pick_mf {
+                            if fade_a > 0.005 {
+                                if r.draw_motion_artwork(mf, card_r, 16.0, fade_a) {
+                                    drew = true;
+                                } else if !drew && !it.artwork_url.is_empty() {
+                                    drew = r.draw_rounded_artwork(&it.artwork_url, true, card_r, 16.0, 1.0);
+                                }
+                            }
+                        }
                         if !drew {
                             r.fill_rounded_rect(card_r, 16.0, Theme::BG_ELEVATED);
                         }
@@ -13870,6 +16657,23 @@ impl AppUi {
                                         shuffle: false,
                                     },
                                 });
+                            }
+                        }
+                    }
+                    // Horizontal lookahead prefetch for additional Top Picks items in the shelf
+                    if motion_enabled && row_in_prefetch {
+                        let base_dist = ((y + card_h * 0.5) - vp_center_y).abs();
+                        for (extra_i, it) in shelf.items.iter().skip(show_n).take(6).enumerate() {
+                            if let Some(u) = it
+                                .motion_tall_video_url
+                                .as_deref()
+                                .or(it.motion_video_url.as_deref())
+                            {
+                                prefetch_motion_candidates.push((
+                                    u.to_string(),
+                                    target_px,
+                                    base_dist + ((extra_i + 1) as f32) * 140.0,
+                                ));
                             }
                         }
                     }
@@ -14023,6 +16827,7 @@ impl AppUi {
                     };
                     let card_w = (w - gap * ((cols - 1) as f32)) / (cols as f32);
                     let card_h = (card_w * 0.62).clamp(180.0, 290.0);
+                    let target_px = (card_w.max(card_h) * dpi_scale).round().clamp(128.0, 1024.0) as u32;
                     let show_n = shelf.items.len().min(6);
                     for (idx, it) in shelf.items.iter().take(show_n).enumerate() {
                         let col = idx % cols;
@@ -14032,7 +16837,22 @@ impl AppUi {
                         if cy + card_h >= -420.0 && cy <= win_h + 720.0 && !it.artwork_url.is_empty() {
                             self.request_artwork(r, &it.artwork_url, true);
                         }
-                        if cy + card_h < 0.0 || cy > win_h {
+                        if motion_enabled {
+                            if let Some(u) = it.motion_video_url.as_deref() {
+                                let dist = ((cy + card_h * 0.5) - vp_center_y).abs();
+                                if cy + card_h > 0.0 && cy < win_h {
+                                    visible_motion_candidates.push((u.to_string(), target_px, dist));
+                                    if !self.rendered_home_motion_urls.iter().any(|x| x == u) {
+                                        self.rendered_home_motion_urls.push(u.to_string());
+                                    }
+                                    self.rendered_home_motion_cards
+                                        .push((u.to_string(), RectF::new(cx, cy, card_w, card_h)));
+                                } else if cy + card_h >= pre_top && cy <= pre_bot {
+                                    prefetch_motion_candidates.push((u.to_string(), target_px, dist));
+                                }
+                            }
+                        }
+                        if cy + card_h <= 0.0 || cy >= win_h {
                             continue;
                         }
                         let card_r = RectF::new(cx, cy, card_w, card_h);
@@ -14041,13 +16861,6 @@ impl AppUi {
                             fnv1a_hover_key("ed_hero", &it.id) ^ ((s_idx as u64) << 16) ^ ((idx as u64) << 32),
                             is_hov,
                         );
-                        if motion_enabled && cy + card_h > TOP_BAR_GUARD_H - 12.0 && cy < win_h {
-                            if let Some(u) = it.motion_video_url.as_deref() {
-                                if !self.visible_home_motion_urls.iter().any(|x| x == u) {
-                                    self.visible_home_motion_urls.push(u.to_string());
-                                }
-                            }
-                        }
                         let hero_mf = if motion_enabled {
                             it.motion_video_url
                                 .as_deref()
@@ -14055,12 +16868,26 @@ impl AppUi {
                         } else {
                             None
                         };
-                        let drew = hero_mf
-                            .as_ref()
-                            .map(|mf| r.draw_motion_artwork(mf, card_r, 14.0, 1.0))
-                            .unwrap_or(false)
-                            || (!it.artwork_url.is_empty()
-                                && r.draw_rounded_artwork(&it.artwork_url, true, card_r, 14.0, 1.0));
+                        if let (Some(u), Some(ref mf)) = (it.motion_video_url.as_deref(), &hero_mf) {
+                            self.drawn_home_motion_seqs.insert(u.to_string(), mf.frame_seq);
+                        }
+                        let fade_a = match (it.motion_video_url.as_deref(), hero_mf.as_ref()) {
+                            (Some(u), Some(_)) => self.advance_motion_crossfade(u),
+                            _ => 0.0,
+                        };
+                        let mut drew = false;
+                        if fade_a < 0.995 && !it.artwork_url.is_empty() {
+                            drew = r.draw_rounded_artwork(&it.artwork_url, true, card_r, 14.0, 1.0);
+                        }
+                        if let Some(ref mf) = hero_mf {
+                            if fade_a > 0.005 {
+                                if r.draw_motion_artwork(mf, card_r, 14.0, fade_a) {
+                                    drew = true;
+                                } else if !drew && !it.artwork_url.is_empty() {
+                                    drew = r.draw_rounded_artwork(&it.artwork_url, true, card_r, 14.0, 1.0);
+                                }
+                            }
+                        }
                         if !drew {
                             r.fill_rounded_rect(card_r, 14.0, Theme::BG_ELEVATED);
                         }
@@ -14151,7 +16978,7 @@ impl AppUi {
                                         .clone()
                                         .or_else(|| it.motion_tall_video_url.clone()),
                                     card_rect: card_r,
-                                    card_radius: 16.0,
+                                    card_radius: 14.0,
                                 }
                             };
                             self.hit_regions.push(HitRegion { rect: card_r, action: act });
@@ -14168,7 +16995,20 @@ impl AppUi {
                         }
                     }
                     let rows = (show_n + cols - 1) / cols;
-                    y += (rows as f32) * (card_h + 16.0) + 12.0;
+                    let shelf_h = (rows as f32) * (card_h + 16.0);
+                    if motion_enabled && y + shelf_h >= pre_top && y <= pre_bot {
+                        let base_dist = ((y + shelf_h * 0.5) - vp_center_y).abs();
+                        for (extra_i, it) in shelf.items.iter().skip(show_n).take(6).enumerate() {
+                            if let Some(u) = it.motion_video_url.as_deref() {
+                                prefetch_motion_candidates.push((
+                                    u.to_string(),
+                                    target_px,
+                                    base_dist + ((extra_i + 1) as f32) * 140.0,
+                                ));
+                            }
+                        }
+                    }
+                    y += shelf_h + 12.0;
                 }
                 EditorialShelfKind::TrackGrid => {
                     let gap = 14.0;
@@ -14281,6 +17121,7 @@ impl AppUi {
                     let cols = ((w + gap) / 188.0).floor().clamp(2.0, 6.0) as usize;
                     let card_w = (w - gap * ((cols - 1) as f32)) / (cols as f32);
                     let card_h = card_w + 48.0;
+                    let target_px = (card_w * dpi_scale).round().clamp(128.0, 1024.0) as u32;
                     // On rich multi-shelf pages (Home/New), display crisp 1-row editorial strips matching official Apple Music!
                     let max_rows = if shelves.len() >= 4 { 1 } else { 2 };
                     let show_n = shelf.items.len().min(cols * max_rows);
@@ -14292,7 +17133,22 @@ impl AppUi {
                         if cy + card_h >= -360.0 && cy <= win_h + 560.0 && !it.artwork_url.is_empty() {
                             self.request_artwork(r, &it.artwork_url, false);
                         }
-                        if cy + card_h < 0.0 || cy > win_h {
+                        if motion_enabled {
+                            if let Some(u) = it.motion_video_url.as_deref() {
+                                let dist = ((cy + card_h * 0.5) - vp_center_y).abs();
+                                if cy + card_h > 0.0 && cy < win_h {
+                                    visible_motion_candidates.push((u.to_string(), target_px, dist));
+                                    if !self.rendered_home_motion_urls.iter().any(|x| x == u) {
+                                        self.rendered_home_motion_urls.push(u.to_string());
+                                    }
+                                    self.rendered_home_motion_cards
+                                        .push((u.to_string(), RectF::new(cx, cy, card_w, card_w)));
+                                } else if cy + card_h >= pre_top && cy <= pre_bot {
+                                    prefetch_motion_candidates.push((u.to_string(), target_px, dist));
+                                }
+                            }
+                        }
+                        if cy + card_h <= 0.0 || cy >= win_h {
                             continue;
                         }
                         let art_r = RectF::new(cx, cy, card_w, card_w);
@@ -14309,13 +17165,6 @@ impl AppUi {
                                 Color::rgba(255, 255, 255, 0.052 * hov_t),
                             );
                         }
-                        if motion_enabled && cy + card_h > TOP_BAR_GUARD_H - 12.0 && cy < win_h {
-                            if let Some(u) = it.motion_video_url.as_deref() {
-                                if !self.visible_home_motion_urls.iter().any(|x| x == u) {
-                                    self.visible_home_motion_urls.push(u.to_string());
-                                }
-                            }
-                        }
                         let sq_mf = if motion_enabled {
                             it.motion_video_url
                                 .as_deref()
@@ -14323,12 +17172,26 @@ impl AppUi {
                         } else {
                             None
                         };
-                        let drew = sq_mf
-                            .as_ref()
-                            .map(|mf| r.draw_motion_artwork(mf, art_r, 12.0, 1.0))
-                            .unwrap_or(false)
-                            || (!it.artwork_url.is_empty()
-                                && r.draw_rounded_artwork(&it.artwork_url, false, art_r, 12.0, 1.0));
+                        if let (Some(u), Some(ref mf)) = (it.motion_video_url.as_deref(), &sq_mf) {
+                            self.drawn_home_motion_seqs.insert(u.to_string(), mf.frame_seq);
+                        }
+                        let fade_a = match (it.motion_video_url.as_deref(), sq_mf.as_ref()) {
+                            (Some(u), Some(_)) => self.advance_motion_crossfade(u),
+                            _ => 0.0,
+                        };
+                        let mut drew = false;
+                        if fade_a < 0.995 && !it.artwork_url.is_empty() {
+                            drew = r.draw_rounded_artwork(&it.artwork_url, false, art_r, 12.0, 1.0);
+                        }
+                        if let Some(ref mf) = sq_mf {
+                            if fade_a > 0.005 {
+                                if r.draw_motion_artwork(mf, art_r, 12.0, fade_a) {
+                                    drew = true;
+                                } else if !drew && !it.artwork_url.is_empty() {
+                                    drew = r.draw_rounded_artwork(&it.artwork_url, false, art_r, 12.0, 1.0);
+                                }
+                            }
+                        }
                         if !drew {
                             r.fill_rounded_rect(art_r, 12.0, Theme::BG_ELEVATED);
                             r.draw_icon(
@@ -14445,9 +17308,68 @@ impl AppUi {
                         }
                     }
                     let rows = (show_n + cols - 1) / cols;
-                    y += (rows as f32) * (card_h + 14.0) + 22.0;
+                    let shelf_h = (rows as f32) * (card_h + 14.0);
+                    // Horizontal lookahead prefetch for additional items along the shelf
+                    if motion_enabled && y + shelf_h >= pre_top && y <= pre_bot {
+                        let base_dist = ((y + shelf_h * 0.5) - vp_center_y).abs();
+                        for (extra_i, it) in shelf.items.iter().skip(show_n).take(6).enumerate() {
+                            if let Some(u) = it.motion_video_url.as_deref() {
+                                prefetch_motion_candidates.push((
+                                    u.to_string(),
+                                    target_px,
+                                    base_dist + ((extra_i + 1) as f32) * 140.0,
+                                ));
+                            }
+                        }
+                    }
+                    y += shelf_h + 22.0;
                 }
             }
+        }
+
+        if allow_motion {
+            // Prioritize viewport-centered motion cards up to MAX_VIEWPORT_SLOTS (20);
+            // overflow visible cards and offscreen [-0.75*win_h, +1.5*win_h] / horizontal-ahead
+            // cards feed the scroll-active prefetch window cleanly!
+            visible_motion_candidates.sort_by(|a, b| a.2.total_cmp(&b.2));
+            for (u, target_px, dist) in visible_motion_candidates {
+                if let Some(existing) = self
+                    .visible_home_motion_targets
+                    .iter_mut()
+                    .find(|(eu, _)| eu == &u)
+                {
+                    existing.1 = existing.1.max(target_px);
+                    continue;
+                }
+                if self.visible_home_motion_targets.len() < MAX_VIEWPORT_SLOTS {
+                    self.visible_home_motion_urls.push(u.clone());
+                    self.visible_home_motion_targets.push((u, target_px));
+                } else {
+                    prefetch_motion_candidates.push((u, target_px, dist));
+                }
+            }
+
+            prefetch_motion_candidates.sort_by(|a, b| a.2.total_cmp(&b.2));
+            for (u, target_px, _) in prefetch_motion_candidates {
+                if self.visible_home_motion_urls.iter().any(|vu| vu == &u) {
+                    continue;
+                }
+                if let Some(existing) = self
+                    .prefetch_home_motion_targets
+                    .iter_mut()
+                    .find(|(eu, _)| eu == &u)
+                {
+                    existing.1 = existing.1.max(target_px);
+                    continue;
+                }
+                if self.prefetch_home_motion_targets.len() >= 32 {
+                    break;
+                }
+                self.prefetch_home_motion_targets.push((u, target_px));
+            }
+
+            let visited = &self.visited_motion_fade_urls;
+            self.motion_fade_alphas.retain(|k, _| visited.contains(k));
         }
         y
     }
@@ -14571,11 +17493,28 @@ impl AppUi {
             win_h + 560.0
         };
 
-        for (i, item) in items.iter().enumerate() {
+        let row_pitch = card_h + 14.0;
+        let total_rows = (items.len() + cols - 1) / cols;
+        let start_row = if total_rows == 0 {
+            0
+        } else {
+            (((pre_top - y) / row_pitch).floor() as isize).clamp(0, total_rows as isize) as usize
+        };
+        let end_row = if total_rows == 0 {
+            0
+        } else {
+            ((((pre_bot - y) / row_pitch).ceil() as isize) + 1)
+                .clamp(start_row as isize, total_rows as isize) as usize
+        };
+        let start_i = (start_row * cols).min(items.len());
+        let end_i = (end_row * cols).min(items.len());
+
+        for i in start_i..end_i {
+            let item = &items[i];
             let col = i % cols;
             let row_idx = i / cols;
             let cx = x0 + (col as f32) * (card_w + gap);
-            let cy = y + (row_idx as f32) * (card_h + 14.0);
+            let cy = y + (row_idx as f32) * row_pitch;
 
             if cy + card_h >= pre_top && cy <= pre_bot {
                 if let Some(ref u) = item.artwork_url {
@@ -15015,14 +17954,15 @@ impl AppUi {
     }
 
     fn draw_search_page(&mut self, r: &mut D2DRenderer, x0: f32, mut y: f32, w: f32) -> f32 {
-        let hdr = if self.search_query.trim().is_empty() {
+        let trimmed = self.search_query.trim().to_string();
+        let hdr = if trimmed.is_empty() {
             self.settings.playback_backend.search_placeholder().to_string()
         } else {
-            format!("“{}” 的搜索结果", self.search_query.trim())
+            format!("“{}” 的搜索结果", trimmed)
         };
         r.draw_text(
             &hdr,
-            RectF::new(x0, y, w, 36.0),
+            RectF::new(x0, y, (w - 150.0).max(200.0), 36.0),
             26.0,
             700,
             Theme::TEXT_PRIMARY,
@@ -15030,33 +17970,68 @@ impl AppUi {
             true,
             false,
         );
-        y += 44.0;
-
-        // Liquid Glass Filter Pills: 热门结果 / 歌曲 / 专辑 / 播放列表
-        let filters = ["热门结果", "歌曲", "专辑", "播放列表"];
-        let mut fx = x0;
-        for (i, &fl) in filters.iter().enumerate() {
-            let sel = self.search_filter == (i as u8);
-            let pill = RectF::new(fx, y, 84.0, 30.0);
-            let hov = pill.contains(self.mouse_pos.0, self.mouse_pos.1);
-            r.draw_liquid_glass_button(
-                pill,
-                15.0,
-                if sel {
-                    GlassBtnVariant::Tinted(Theme::ACCENT_RED)
-                } else {
-                    GlassBtnVariant::Regular
-                },
-                hov,
-                self.mouse_down,
-                self.mouse_pos,
-                self.glass_off(),
+        if self.search_loading && !trimmed.is_empty() {
+            let sp_cx = x0 + w - 102.0;
+            let sp_cy = y + 18.0;
+            r.draw_loading_spinner(
+                sp_cx,
+                sp_cy,
+                7.5,
+                self.spinner_phase,
+                Theme::ACCENT_RED,
             );
             r.draw_text(
-                fl,
+                "搜索中...",
+                RectF::new(sp_cx + 14.0, y + 6.0, 86.0, 24.0),
+                12.8,
+                500,
+                Theme::TEXT_SECONDARY,
+                TextAlign::Left,
+                true,
+                false,
+            );
+        }
+        y += 44.0;
+
+        // Ultra-fast flat iPadOS capsule filter tabs (zero heavy Liquid Glass refraction passes!)
+        let filter_specs: [(&str, Option<usize>); 5] = [
+            ("热门结果", None),
+            ("歌曲", (!self.search_songs.is_empty()).then_some(self.search_songs.len())),
+            ("艺人", (!self.search_artists.is_empty()).then_some(self.search_artists.len())),
+            ("专辑", (!self.search_albums.is_empty()).then_some(self.search_albums.len())),
+            ("播放列表", (!self.search_playlists.is_empty()).then_some(self.search_playlists.len())),
+        ];
+        let mut fx = x0;
+        for (i, (label, cnt_opt)) in filter_specs.iter().enumerate() {
+            let sel = self.search_filter == (i as u8);
+            let txt = match cnt_opt {
+                Some(n) => format!("{label} {n}"),
+                None => (*label).to_string(),
+            };
+            let pill_w = (txt.chars().count() as f32 * 10.5 + 32.0).clamp(78.0, 128.0);
+            let pill = RectF::new(fx, y, pill_w, 30.0);
+            let hov = self.mouse_pos.1 >= TOP_BAR_GUARD_H
+                && pill.contains(self.mouse_pos.0, self.mouse_pos.1);
+            let hov_t = self.eval_hover_alpha(fnv1a_hover_key("srch_pill", label), hov);
+            let bg = if sel {
+                Theme::ACCENT_RED
+            } else {
+                Color::rgba(255, 255, 255, 0.065 + 0.055 * hov_t)
+            };
+            r.fill_rounded_rect(pill, 15.0, bg);
+            if !sel {
+                r.stroke_rounded_rect(
+                    pill,
+                    15.0,
+                    Color::rgba(255, 255, 255, 0.08 + 0.08 * hov_t),
+                    0.9,
+                );
+            }
+            r.draw_text(
+                &txt,
                 pill,
                 12.8,
-                if sel { 600 } else { 400 },
+                if sel { 600 } else { 500 },
                 Theme::TEXT_PRIMARY,
                 TextAlign::Center,
                 true,
@@ -15066,14 +18041,14 @@ impl AppUi {
                 rect: pill,
                 action: UiAction::SetSearchFilter(i as u8),
             });
-            fx += 92.0;
+            fx += pill_w + 8.0;
         }
         y += 44.0;
 
-        if self.search_query.trim().is_empty() {
+        if trimmed.is_empty() {
             r.draw_text(
-                "在左侧搜索栏输入歌曲、艺人或专辑名称（支持中文输入法与 Ctrl+V 粘贴）。",
-                RectF::new(x0, y + 12.0, w, 26.0),
+                "在左侧搜索栏输入歌曲、艺人、专辑或歌单名称（Ctrl+F 快捷聚焦，支持中文输入法与 Ctrl+V 粘贴）。",
+                RectF::new(x0, y + 8.0, w, 26.0),
                 14.0,
                 400,
                 Theme::TEXT_SECONDARY,
@@ -15081,14 +18056,86 @@ impl AppUi {
                 true,
                 false,
             );
-            return y + 60.0;
+            y += 46.0;
+
+            if !self.search_recent_queries.is_empty() {
+                r.draw_text(
+                    "最近搜索",
+                    RectF::new(x0, y, 160.0, 24.0),
+                    16.0,
+                    700,
+                    Theme::TEXT_PRIMARY,
+                    TextAlign::Left,
+                    true,
+                    false,
+                );
+                let clr_r = RectF::new(x0 + w - 64.0, y, 64.0, 24.0);
+                let clr_hov = self.mouse_pos.1 >= TOP_BAR_GUARD_H
+                    && clr_r.contains(self.mouse_pos.0, self.mouse_pos.1);
+                r.draw_text(
+                    "清除",
+                    clr_r,
+                    13.0,
+                    500,
+                    if clr_hov { Theme::TEXT_PRIMARY } else { Theme::ACCENT_RED },
+                    TextAlign::Right,
+                    true,
+                    false,
+                );
+                self.hit_regions.push(HitRegion {
+                    rect: clr_r,
+                    action: UiAction::ClearRecentSearches,
+                });
+                y += 32.0;
+
+                let recent = self.search_recent_queries.clone();
+                let mut rx = x0;
+                let mut ry = y;
+                for q in recent {
+                    let chip_w = (q.chars().count() as f32 * 11.5 + 28.0).clamp(64.0, 240.0);
+                    if rx + chip_w > x0 + w && rx > x0 {
+                        rx = x0;
+                        ry += 36.0;
+                    }
+                    let chip = RectF::new(rx, ry, chip_w, 29.0);
+                    let hov = self.mouse_pos.1 >= TOP_BAR_GUARD_H
+                        && chip.contains(self.mouse_pos.0, self.mouse_pos.1);
+                    let hov_t = self.eval_hover_alpha(fnv1a_hover_key("srch_rec", &q), hov);
+                    r.fill_rounded_rect(
+                        chip,
+                        14.5,
+                        Color::rgba(255, 255, 255, 0.07 + 0.06 * hov_t),
+                    );
+                    r.stroke_rounded_rect(chip, 14.5, Color::rgba(255, 255, 255, 0.10), 0.9);
+                    r.draw_text(
+                        &q,
+                        chip.inset(10.0, 0.0),
+                        12.8,
+                        500,
+                        Theme::TEXT_PRIMARY,
+                        TextAlign::Center,
+                        true,
+                        false,
+                    );
+                    self.hit_regions.push(HitRegion {
+                        rect: chip,
+                        action: UiAction::RunSearchQuery(q),
+                    });
+                    rx += chip_w + 8.0;
+                }
+                y = ry + 48.0;
+            }
+            return y + 20.0;
         }
 
-        if (self.search_filter == 0 || self.search_filter == 1) && !self.search_songs.is_empty() {
+        // Instant 0ms Local Library Matches (shown immediately while online search loads or alongside Overview!)
+        if self.search_filter == 0
+            && (!self.search_local_cards.is_empty() || !self.search_local_songs.is_empty())
+        {
             r.draw_text(
-                "歌曲",
+                "来自你的资料库",
                 RectF::new(x0, y, w, 26.0),
-                18.0,
+                17.5,
                 700,
                 Theme::TEXT_PRIMARY,
                 TextAlign::Left,
@@ -15096,9 +18143,132 @@ impl AppUi {
                 false,
             );
             y += 32.0;
+            if !self.search_local_songs.is_empty() {
+                let ls = std::mem::take(&mut self.search_local_songs);
+                y = self.draw_tracklist_rows(r, x0, y, w, &ls, TrackListSource::SearchLocalSongs);
+                self.search_local_songs = ls;
+                y += 12.0;
+            }
+            if !self.search_local_cards.is_empty() {
+                let lc = std::mem::take(&mut self.search_local_cards);
+                y = self.draw_media_card_grid(r, x0, y, w, &lc);
+                self.search_local_cards = lc;
+                y += 18.0;
+            }
+        }
+
+        let has_remote = !self.search_songs.is_empty()
+            || !self.search_artists.is_empty()
+            || !self.search_albums.is_empty()
+            || !self.search_playlists.is_empty();
+
+        if self.search_loading && !has_remote {
+            y = self.draw_skeleton_track_rows(r, x0, y, w, 5);
+            y += 10.0;
+            y = self.draw_skeleton_card_grid(r, x0, y, w, 1);
+            return y + 24.0;
+        }
+
+        if let Some(err) = self.search_error.clone() {
+            if !has_remote {
+                let card = RectF::new(x0, y + 6.0, w.min(560.0), 86.0);
+                r.fill_rounded_rect(card, 12.0, Color::rgba(255, 255, 255, 0.05));
+                r.stroke_rounded_rect(card, 12.0, Color::rgba(255, 255, 255, 0.09), 1.0);
+                r.draw_text(
+                    &format!("搜索请求失败：{err}"),
+                    RectF::new(card.x + 16.0, card.y + 14.0, card.w - 32.0, 22.0),
+                    13.5,
+                    500,
+                    Theme::TEXT_PRIMARY,
+                    TextAlign::Left,
+                    true,
+                    false,
+                );
+                let retry_btn = RectF::new(card.x + 16.0, card.y + 44.0, 84.0, 28.0);
+                r.fill_rounded_rect(retry_btn, 14.0, Theme::ACCENT_RED);
+                r.draw_text(
+                    "重试",
+                    retry_btn,
+                    12.8,
+                    600,
+                    Theme::TEXT_PRIMARY,
+                    TextAlign::Center,
+                    true,
+                    false,
+                );
+                self.hit_regions.push(HitRegion {
+                    rect: retry_btn,
+                    action: UiAction::RefreshCurrentView,
+                });
+                return card.bottom() + 28.0;
+            }
+        }
+
+        if !self.search_loading
+            && !has_remote
+            && self.search_local_cards.is_empty()
+            && self.search_local_songs.is_empty()
+            && self.last_search_typed.is_none()
+        {
+            r.draw_text(
+                &format!("未找到与 “{trimmed}” 相关的结果，请尝试更换关键词。"),
+                RectF::new(x0, y + 14.0, w, 28.0),
+                14.2,
+                400,
+                Theme::TEXT_SECONDARY,
+                TextAlign::Left,
+                true,
+                false,
+            );
+            return y + 72.0;
+        }
+
+        // Section helper for Overview "查看全部 ›" links
+        let draw_section_hdr = |r: &mut D2DRenderer,
+                                    hit_regions: &mut Vec<HitRegion>,
+                                    title: &str,
+                                    total_n: usize,
+                                    overview_cap: usize,
+                                    target_filter: u8,
+                                    cur_filter: u8,
+                                    sy: f32| {
+            r.draw_text(
+                title,
+                RectF::new(x0, sy, (w - 110.0).max(160.0), 26.0),
+                18.0,
+                700,
+                Theme::TEXT_PRIMARY,
+                TextAlign::Left,
+                true,
+                false,
+            );
+            if cur_filter == 0 && total_n > overview_cap {
+                let more_r = RectF::new(x0 + w - 96.0, sy + 2.0, 96.0, 24.0);
+                r.draw_text(
+                    &format!("查看全部 ({total_n}) ›"),
+                    more_r,
+                    12.6,
+                    500,
+                    Theme::ACCENT_RED,
+                    TextAlign::Right,
+                    true,
+                    false,
+                );
+                hit_regions.push(HitRegion {
+                    rect: more_r,
+                    action: UiAction::SetSearchFilter(target_filter),
+                });
+            }
+        };
+
+        if (self.search_filter == 0 || self.search_filter == 1) && !self.search_songs.is_empty() {
+            let total_s = self.search_songs.len();
+            let cur_f = self.search_filter;
+            draw_section_hdr(r, &mut self.hit_regions, "歌曲", total_s, 5, 1, cur_f, y);
+            y += 32.0;
             let s = std::mem::take(&mut self.search_songs);
             let lim = if self.search_filter == 0 {
-                s.len().min(6)
+                s.len().min(5)
             } else {
                 s.len()
             };
@@ -15107,39 +18277,51 @@ impl AppUi {
             y += 22.0;
         }
 
-        if (self.search_filter == 0 || self.search_filter == 2) && !self.search_albums.is_empty() {
-            r.draw_text(
-                "专辑",
-                RectF::new(x0, y, w, 26.0),
-                18.0,
-                700,
-                Theme::TEXT_PRIMARY,
-                TextAlign::Left,
-                true,
-                false,
-            );
+        if (self.search_filter == 0 || self.search_filter == 2) && !self.search_artists.is_empty() {
+            let total_ar = self.search_artists.len();
+            let cur_f = self.search_filter;
+            draw_section_hdr(r, &mut self.hit_regions, "艺人", total_ar, 6, 2, cur_f, y);
+            y += 32.0;
+            let ar = std::mem::take(&mut self.search_artists);
+            let lim = if self.search_filter == 0 {
+                ar.len().min(6)
+            } else {
+                ar.len()
+            };
+            y = self.draw_media_card_grid(r, x0, y, w, &ar[..lim]);
+            self.search_artists = ar;
+            y += 22.0;
+        }
+
+        if (self.search_filter == 0 || self.search_filter == 3) && !self.search_albums.is_empty() {
+            let total_al = self.search_albums.len();
+            let cur_f = self.search_filter;
+            draw_section_hdr(r, &mut self.hit_regions, "专辑", total_al, 6, 3, cur_f, y);
             y += 32.0;
             let a = std::mem::take(&mut self.search_albums);
-            y = self.draw_media_card_grid(r, x0, y, w, &a);
+            let lim = if self.search_filter == 0 {
+                a.len().min(6)
+            } else {
+                a.len()
+            };
+            y = self.draw_media_card_grid(r, x0, y, w, &a[..lim]);
             self.search_albums = a;
             y += 22.0;
         }
 
-        if (self.search_filter == 0 || self.search_filter == 3) && !self.search_playlists.is_empty()
+        if (self.search_filter == 0 || self.search_filter == 4) && !self.search_playlists.is_empty()
         {
-            r.draw_text(
-                "播放列表",
-                RectF::new(x0, y, w, 26.0),
-                18.0,
-                700,
-                Theme::TEXT_PRIMARY,
-                TextAlign::Left,
-                true,
-                false,
-            );
+            let total_pl = self.search_playlists.len();
+            let cur_f = self.search_filter;
+            draw_section_hdr(r, &mut self.hit_regions, "播放列表", total_pl, 6, 4, cur_f, y);
             y += 32.0;
             let p = std::mem::take(&mut self.search_playlists);
-            y = self.draw_media_card_grid(r, x0, y, w, &p);
+            let lim = if self.search_filter == 0 {
+                p.len().min(6)
+            } else {
+                p.len()
+            };
+            y = self.draw_media_card_grid(r, x0, y, w, &p[..lim]);
             self.search_playlists = p;
         }
 
@@ -16637,8 +19819,8 @@ impl AppUi {
         // Section 3: 音频 (Authentic iPadOS Settings -> Music Audio Group)
         // --------------------------------------------------------------------
         {
-            let card_h = 52.0 + 48.0 + 54.0 + 48.0 + 48.0;
-            let foot_h = 20.0f32;
+            let card_h = 52.0 + 48.0 + 54.0 + 48.0 + 48.0 + 48.0;
+            let foot_h = 32.0f32;
             let sec_h = 27.0 + card_h + 6.0 + foot_h + 14.0;
             if y + sec_h >= -60.0 && y <= view_h + 60.0 {
                 let cy = Self::draw_ipad_section_header(r, cx, y, cw, "音频");
@@ -16814,13 +19996,26 @@ impl AppUi {
                     self.audio_prefs.crossfade_songs_enabled,
                     UiAction::ToggleCrossfade,
                 );
+                ry += 48.0;
+                Self::draw_ipad_divider(r, cx, cw, ry);
+
+                // Row 6: Windows SMTC Publishing toggle
+                self.draw_ipad_toggle_row(
+                    r,
+                    RectF::new(cx, ry, cw, 48.0),
+                    103,
+                    "系统媒体控制发布 (SMTC)",
+                    "",
+                    self.settings.smtc_publish_enabled,
+                    UiAction::ToggleSmtcPublish,
+                );
 
                 Self::draw_ipad_section_footer(
                     r,
                     cx,
                     cy + card_h,
                     cw,
-                    "更改音频质量后将在下一首播放或重新缓冲时生效。",
+                    "更改音频质量后将在下一首播放或重新缓冲时生效；开启 SMTC 发布可联动系统媒体卡片、耳机播控与 Lyricify 等外部歌词工具。",
                     foot_h,
                 );
             }
@@ -17538,7 +20733,7 @@ impl AppUi {
         // --------------------------------------------------------------------
         {
             let has_dl = self.update_latest_url.is_some();
-            let card_h = if has_dl { 48.0 * 4.0 } else { 48.0 * 3.0 };
+            let card_h = if has_dl { 48.0 * 5.0 } else { 48.0 * 4.0 };
             let foot_h = 22.0f32;
             let sec_h = 27.0 + card_h + 6.0 + foot_h + 14.0;
             if y + sec_h >= -60.0 && y <= view_h + 60.0 {
@@ -17597,6 +20792,27 @@ impl AppUi {
                 }
 
                 Self::draw_ipad_divider(r, cx, cw, ay);
+                let has_crash = crate::logger::has_recent_crash_log();
+                self.draw_ipad_action_link_row(
+                    r,
+                    RectF::new(cx, ay, cw, 48.0),
+                    "运行与崩溃日志",
+                    if has_crash {
+                        "存在崩溃记录"
+                    } else {
+                        "打开日志目录"
+                    },
+                    if has_crash {
+                        Theme::SIGNAL_AMBER
+                    } else {
+                        ios_blue
+                    },
+                    true,
+                    Some(UiAction::OpenLogsFolder),
+                );
+                ay += 48.0;
+
+                Self::draw_ipad_divider(r, cx, cw, ay);
                 self.draw_ipad_action_link_row(
                     r,
                     RectF::new(cx, ay, cw, 48.0),
@@ -17628,7 +20844,7 @@ impl AppUi {
     // Floating Popovers (Up Next Queue & Volume/Output Quick Popover) + Banner
     // ========================================================================
     fn draw_queue_popover(&mut self, r: &mut D2DRenderer, area: RectF) {
-        let q = self.active_queue_tracks();
+        let q = self.active_queue_tracks_cached();
         let pop_w = 336.0;
         let pop_h = 368.0f32.min((area.h - 140.0).max(220.0));
         let pop = RectF::new(
@@ -17717,7 +20933,12 @@ impl AppUi {
 
         let right_pad = if self.queue_max_scroll_y > 1.0 { 16.0 } else { 10.0 };
         r.push_clip(list_rect);
-        for (idx, tr) in q.iter().enumerate() {
+        let q_start = ((self.queue_scroll_y / row_stride).floor() as isize)
+            .clamp(0, q.len() as isize) as usize;
+        let q_end = ((((self.queue_scroll_y + list_rect.h) / row_stride).ceil() as isize) + 1)
+            .clamp(q_start as isize, q.len() as isize) as usize;
+        for idx in q_start..q_end {
+            let tr = &q[idx];
             let y = list_rect.y + (idx as f32) * row_stride - self.queue_scroll_y;
             if y + 38.0 < list_rect.y || y > list_rect.bottom() {
                 continue;
@@ -17730,7 +20951,7 @@ impl AppUi {
                 .smtc
                 .adam_id
                 .as_deref()
-                .is_some_and(|a| a == tr.effective_adam_id());
+                .is_some_and(|a| a == tr.effective_adam_id_str());
             if is_cur {
                 r.fill_rounded_rect(row, 8.0, Theme::ROW_ACTIVE);
             } else if hit_r.h > 1.0 && hit_r.contains(self.mouse_pos.0, self.mouse_pos.1) {
@@ -17971,7 +21192,7 @@ impl AppUi {
     }
 
     fn draw_context_menu(&mut self, r: &mut D2DRenderer, win_rect: RectF) {
-        let Some(cm) = self.context_menu.clone() else {
+        let Some(cm) = self.context_menu.take() else {
             return;
         };
 
@@ -18563,10 +21784,11 @@ impl AppUi {
         if pushed_cm_clip {
             r.pop_clip();
         }
+        self.context_menu = Some(cm);
     }
 
     fn draw_playlist_transfer_modal(&mut self, r: &mut D2DRenderer, win_rect: RectF) {
-        let Some(tm) = self.transfer_modal.clone() else {
+        let Some(tm) = self.transfer_modal.take() else {
             return;
         };
 
@@ -18857,6 +22079,7 @@ impl AppUi {
                 action: UiAction::StartPlaylistTransfer,
             });
         }
+        self.transfer_modal = Some(tm);
     }
 
     // ========================================================================
@@ -18909,18 +22132,20 @@ impl AppUi {
         let hwnd = self.wake_hwnd;
         self.rt.spawn(async move {
             let mut tick: u64 = 0;
+            let mut adaptive = listen_together::AdaptivePollState::new();
+            let mut next_delay_ms: u64 = listen_together::POLL_INTERVAL_ACTIVE_MS;
             loop {
-                tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(next_delay_ms)).await;
                 if stop.load(std::sync::atomic::Ordering::Acquire) {
                     break;
                 }
                 let snap = native_player::get_playback_state();
                 let sid = snap.adam_id.as_deref().unwrap_or("0");
-                let play_st = if snap.status == "Playing" { "PLAY" } else { "PAUSE" };
+                let local_playing = snap.status == "Playing";
+                let play_st = if local_playing { "PLAY" } else { "PAUSE" };
                 let prog_ms = (snap.position_sec.max(0.0) * 1000.0).round() as i64;
-                // Fetch roomUsers every 3rd tick (~2.25s) while polling authoritative `sync/playlist/get`
-                // + `heartbeat` in parallel every 750ms for crisp low-latency partner sync!
-                let fetch_users = tick % 3 == 0;
+                // Adaptive cadence: 750ms while playing/active; backs off 2s -> 3s when paused & unchanged!
+                let fetch_users = adaptive.should_fetch_users(tick, local_playing);
                 tick = tick.wrapping_add(1);
                 let st = listen_together::poll_room_sync(
                     &room_id,
@@ -18935,6 +22160,7 @@ impl AppUi {
                 if stop.load(std::sync::atomic::Ordering::Acquire) {
                     break;
                 }
+                next_delay_ms = adaptive.next_delay_ms(local_playing, st.as_ref().ok());
                 let closed = st
                     .as_ref()
                     .is_ok_and(|s| s.room_closed || (s.code == 200 && !s.in_room));
@@ -19228,7 +22454,7 @@ impl AppUi {
         if !st.users.is_empty() {
             for u in &st.users {
                 if let Some(ref av) = u.avatar_url {
-                    self.request_artwork(r, av, false);
+                    self.request_artwork_sized(r, av, false, 160);
                 }
             }
             self.listen_together.users = st.users.clone();
@@ -20414,6 +23640,140 @@ impl AppUi {
 // Pure Helper Functions
 // ============================================================================
 
+#[inline]
+fn fnv1a_64_bytes(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+/// Builds a collision-free GPU artwork key for an SMTC base64 thumbnail.
+/// Incorporates content hash + byte length + album so delayed thumbnail refreshes on the same
+/// track ALWAYS replace stale GPU bitmaps and two tracks with identical title/artist never collide.
+pub fn make_smtc_artwork_key(title: &str, artist: &str, album: &str, thumb_b64: &str) -> String {
+    let h = fnv1a_64_bytes(thumb_b64.as_bytes());
+    format!(
+        "smtc://{h:016x}:{}\x1f{}\x1f{}\x1f{}",
+        thumb_b64.len(),
+        title.trim(),
+        artist.trim(),
+        album.trim()
+    )
+}
+
+/// Catalog-enrichment cache key including album so single vs. album / deluxe / live editions
+/// of the same song never cross-contaminate cover artwork.
+pub fn smtc_catalog_cache_key(title: &str, artist: &str, album: &str) -> String {
+    format!(
+        "{}\x1f{}\x1f{}",
+        title.trim().to_lowercase(),
+        artist.trim().to_lowercase(),
+        album.trim().to_lowercase()
+    )
+}
+
+/// Album-scoped fallback cache key for Apple Music track editorial motion videos.
+pub fn meta_motion_cache_key(title: &str, artist: &str, album: &str) -> String {
+    format!(
+        "meta_motion:{}|{}|{}",
+        title.trim().to_lowercase(),
+        artist.trim().to_lowercase(),
+        album.trim().to_lowercase()
+    )
+}
+
+/// Zero-allocation case-insensitive substring check where `needle_lower` is already
+/// ASCII-lowercased. Compares UTF-8 bytes directly while folding ASCII `A..=Z` -> `a..=z`
+/// on the fly (exact match for UTF-8 multi-byte CJK/Unicode sequences since ASCII bytes
+/// `0x00..=0x7F` never appear inside multi-byte UTF-8 sequences).
+#[inline]
+pub fn contains_ascii_icase(haystack: &str, needle_lower: &str) -> bool {
+    let nb = needle_lower.as_bytes();
+    if nb.is_empty() {
+        return true;
+    }
+    let hb = haystack.as_bytes();
+    if nb.len() > hb.len() {
+        return false;
+    }
+    let first = nb[0];
+    let limit = hb.len() - nb.len();
+    let mut i = 0usize;
+    while i <= limit {
+        if hb[i].to_ascii_lowercase() == first {
+            let mut matched = true;
+            let mut j = 1usize;
+            while j < nb.len() {
+                if hb[i + j].to_ascii_lowercase() != nb[j] {
+                    matched = false;
+                    break;
+                }
+                j += 1;
+            }
+            if matched {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Safely upgrades requested cover resolution ONLY on Apple Music `mzstatic.com` trailing
+/// `<w>x<h>...` segments (leaving NetEase, QQ Music, and custom CDN URLs untouched so
+/// blind `.replace("360x360", ...)` can never corrupt non-Apple URLs).
+pub fn upgrade_artwork_request_url(url: &str, hero: bool) -> String {
+    let trimmed = url.trim();
+    if !trimmed.contains("mzstatic.com") || trimmed.contains('?') {
+        return trimmed.to_string();
+    }
+    let Some(slash) = trimmed.rfind('/') else {
+        return trimmed.to_string();
+    };
+    let (prefix, tail) = trimmed.split_at(slash + 1);
+    let upgraded_tail = if hero {
+        tail.replace("360x360", "720x720")
+            .replace("240x240", "720x720")
+            .replace("120x120", "720x720")
+            .replace("480x480", "720x720")
+    } else {
+        tail.replace("120x120", "480x480")
+            .replace("240x240", "480x480")
+            .replace("360x360", "480x480")
+    };
+    format!("{prefix}{upgraded_tail}")
+}
+
+/// Dimension-tiered cover URL helper for Apple Music `mzstatic.com` trailing `<w>x<h>...`
+/// segments: requests `240x240` for <=200px small thumbs (lists/sidebar/MiniPlayer),
+/// `480x480` for cards, and `720x720` for hero covers; leaves NetEase/QQ/query URLs untouched.
+pub fn upgrade_artwork_request_url_dim(url: &str, target_dim: u32) -> String {
+    let trimmed = url.trim();
+    if !trimmed.contains("mzstatic.com") || trimmed.contains('?') {
+        return trimmed.to_string();
+    }
+    if target_dim >= 512 {
+        return upgrade_artwork_request_url(trimmed, true);
+    }
+    if target_dim > 200 {
+        return upgrade_artwork_request_url(trimmed, false);
+    }
+    let Some(slash) = trimmed.rfind('/') else {
+        return trimmed.to_string();
+    };
+    let (prefix, tail) = trimmed.split_at(slash + 1);
+    let sized_tail = tail
+        .replace("120x120", "240x240")
+        .replace("360x360", "240x240")
+        .replace("480x480", "240x240")
+        .replace("600x600", "240x240")
+        .replace("720x720", "240x240");
+    format!("{prefix}{sized_tail}")
+}
+
 fn smtc_meta_key(title: &str, artist: &str) -> String {
     format!("{}\x1f{}", title.trim().to_lowercase(), artist.trim().to_lowercase())
 }
@@ -20640,7 +24000,7 @@ async fn resolve_and_start_native_track(
     track: &AgentTrackInput,
 ) -> Result<SmtcState, String> {
     let is_ne = backend_tag == "netease" || track.id.starts_with("ne:");
-    let stream = if is_ne {
+    let (stream, quality_tag) = if is_ne {
         let ck = ACTIVE_NE_COOKIE
             .read()
             .ok()
@@ -20650,7 +24010,11 @@ async fn resolve_and_start_native_track(
             .read()
             .map(|x| *x)
             .unwrap_or(NetEaseQuality::ExHigh);
-        netease_api::resolve_song_stream(&track.id, q, ck.as_deref()).await?
+        let q_tag = format!("{q:?}");
+        (
+            netease_api::resolve_song_stream(&track.id, q, ck.as_deref()).await?,
+            q_tag,
+        )
     } else {
         let ck = ACTIVE_QQ_COOKIE
             .read()
@@ -20661,11 +24025,19 @@ async fn resolve_and_start_native_track(
             .read()
             .map(|x| *x)
             .unwrap_or(QQQuality::Mp3_320);
-        qq_api::resolve_song_stream(&track.id, track.catalog_id.as_deref(), q, ck.as_deref()).await?
+        let q_tag = format!("{q:?}");
+        (
+            qq_api::resolve_song_stream(&track.id, track.catalog_id.as_deref(), q, ck.as_deref())
+                .await?,
+            q_tag,
+        )
     };
 
-    let local_path = native_player::download_stream_to_cache(&stream).await?;
-    let tag_s = if is_ne { "netease" } else { "qqmusic" }.to_string();
+    let tag_str = if is_ne { "netease" } else { "qqmusic" };
+    let local_path =
+        native_player::download_stream_to_cache_keyed(&stream, tag_str, &track.id, &quality_tag)
+            .await?;
+    let tag_s = tag_str.to_string();
     tokio::task::spawn_blocking(move || {
         native_player::start_playback_file(&tag_s, queue_replace, jump_index, stream, local_path)
     })
@@ -20721,6 +24093,10 @@ fn parse_media_cards_array(val: Option<&Value>, fallback_kind: &str) -> Vec<Medi
     let Some(arr) = val.and_then(Value::as_array) else {
         return Vec::new();
     };
+    parse_media_cards_slice(arr, fallback_kind)
+}
+
+fn parse_media_cards_slice(arr: &[Value], fallback_kind: &str) -> Vec<MediaCardItem> {
     let mut out = Vec::with_capacity(arr.len());
     for item in arr {
         let Some(id) = item.get("id").and_then(Value::as_str) else {
@@ -20730,20 +24106,45 @@ fn parse_media_cards_array(val: Option<&Value>, fallback_kind: &str) -> Vec<Medi
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or(fallback_kind);
+        if item_type == "library-playlist-folders" {
+            continue;
+        }
         let attrs = item.get("attributes").unwrap_or(item);
+        if attrs.get("isFolder").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
         let title = attrs
             .get("name")
             .and_then(Value::as_str)
+            .or_else(|| {
+                item.pointer("/relationships/catalog/data/0/attributes/name")
+                    .and_then(Value::as_str)
+            })
             .unwrap_or("未知标题")
             .to_string();
         let subtitle = attrs
             .get("artistName")
             .or_else(|| attrs.get("curatorName"))
+            .or_else(|| {
+                item.pointer("/relationships/catalog/data/0/attributes/curatorName")
+            })
+            .or_else(|| {
+                item.pointer("/relationships/catalog/data/0/attributes/artistName")
+            })
             .and_then(Value::as_str)
-            .unwrap_or("Apple Music")
+            .unwrap_or(if item_type == "artists" || item_type == "library-artists" {
+                "艺人"
+            } else if item_type == "library-playlists" {
+                "资料库播放列表"
+            } else {
+                "Apple Music"
+            })
             .to_string();
         let artwork_url = attrs
             .pointer("/artwork/url")
+            .or_else(|| {
+                item.pointer("/relationships/catalog/data/0/attributes/artwork/url")
+            })
             .and_then(Value::as_str)
             .map(|u| format_artwork_template(u, 360));
         let badge = attrs

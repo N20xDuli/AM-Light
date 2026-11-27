@@ -541,6 +541,7 @@ pub struct LineAnimState {
     pub bg_syllable_lifts: Vec<Spring1D>,
     pub char_lifts: Vec<Spring1D>,
     pub bg_char_lifts: Vec<Spring1D>,
+    pub has_active_lifts: bool,
     pub measured_height: f32,
     /// Per-line monotonic playhead high-water mark (`ProcessedLine` `< 0.50s` anti-jitter clamp)
     pub max_word_t: f64,
@@ -567,6 +568,7 @@ impl LineAnimState {
             bg_syllable_lifts: vec![Spring1D::syllable_lift(0.0); bg_syllable_count],
             char_lifts: vec![Spring1D::char_lift(0.0); char_count],
             bg_char_lifts: vec![Spring1D::char_lift(0.0); bg_char_count],
+            has_active_lifts: false,
             measured_height: 64.0,
             max_word_t: -1.0,
         }
@@ -625,6 +627,8 @@ pub struct LyricsAnimator {
     layout_initialized: bool,
     last_playhead_sec: f64,
     clamp_reset_seq: u64,
+    /// Reusable per-frame layout scratch buffer (eliminates per-frame `Vec<f32>` heap allocation in `step()`).
+    rel_y_scratch: Vec<f32>,
 }
 
 impl Default for LyricsAnimator {
@@ -648,6 +652,7 @@ impl Default for LyricsAnimator {
             layout_initialized: false,
             last_playhead_sec: -1.0,
             clamp_reset_seq: 0,
+            rel_y_scratch: Vec::new(),
         }
     }
 }
@@ -993,14 +998,15 @@ impl LyricsAnimator {
         let vp_scale = (viewport_h / 720.0).clamp(0.92, 1.55);
         let dyn_line_spacing = Self::LINE_SPACING_IPAD * vp_scale;
 
-        // Compute cumulative vertical layout coordinates
-        let mut rel_y = vec![0.0f32; lyrics.lines.len()];
+        // Compute cumulative vertical layout coordinates (reuses `rel_y_scratch` with 0 per-frame heap alloc!)
+        self.rel_y_scratch.clear();
+        self.rel_y_scratch.reserve(lyrics.lines.len());
         let mut cursor = 0.0f32;
         if interlude_after.is_none() && self.interlude_height_spring.value > 0.5 {
             cursor += self.interlude_height_spring.value;
         }
         for i in 0..lyrics.lines.len() {
-            rel_y[i] = cursor;
+            self.rel_y_scratch.push(cursor);
             cursor += self.line_states[i].measured_height + dyn_line_spacing;
             if interlude_after == Some(i) && self.interlude_height_spring.value > 0.5 {
                 cursor += self.interlude_height_spring.value;
@@ -1008,10 +1014,10 @@ impl LyricsAnimator {
         }
 
         let selected_screen_y = (viewport_h * 0.24).clamp(68.0, 380.0);
-        let anchor_rel = rel_y.get(anchor_idx).copied().unwrap_or(0.0);
+        let anchor_rel = self.rel_y_scratch.get(anchor_idx).copied().unwrap_or(0.0);
 
         for i in 0..lyrics.lines.len() {
-            let desired_y = selected_screen_y + (rel_y[i] - anchor_rel);
+            let desired_y = selected_screen_y + (self.rel_y_scratch[i] - anchor_rel);
             let st = &mut self.line_states[i];
 
             if !self.layout_initialized {
@@ -1086,67 +1092,110 @@ impl LyricsAnimator {
                 playhead_sec + Self::SWEEP_HEADSTART_SEC
             };
 
-            // Step per-syllable lift springs ONLY when `line.has_word_sync` is true!
-            // When `!is_sel`, return to baseline briskly so post-line blur handoff happens smoothly and promptly.
-            let lift_dt = if is_sel { dt_sec } else { (dt_sec * 2.5).min(0.05) };
-            if st.syllable_lifts.len() != line.syllables.len() {
-                st.syllable_lifts = vec![Spring1D::syllable_lift(0.0); line.syllables.len()];
-            }
-            for (s_idx, syl) in line.syllables.iter().enumerate() {
-                let lift_target = if is_sel && line.has_word_sync && t_word >= syl.start_sec {
-                    -Self::SYLLABLE_LIFT_PX
-                } else {
-                    0.0
-                };
-                st.syllable_lifts[s_idx].target = lift_target;
-                st.syllable_lifts[s_idx].step(lift_dt);
-            }
+            // Step per-syllable & per-unit lift springs ONLY for active lines OR recently-active lines
+            // settling back to 0.0 (skips 98%+ of idle offscreen lines in O(1)!).
+            if is_sel || st.has_active_lifts {
+                let lift_dt = if is_sel { dt_sec } else { (dt_sec * 2.5).min(0.05) };
+                let mut any_lift_active = is_sel && line.has_word_sync;
 
-            if st.bg_syllable_lifts.len() != line.bg_syllables.len() {
-                st.bg_syllable_lifts = vec![Spring1D::syllable_lift(0.0); line.bg_syllables.len()];
-            }
-            for (b_idx, bsyl) in line.bg_syllables.iter().enumerate() {
-                let lift_target = if is_sel && line.has_word_sync && t_word >= bsyl.start_sec {
-                    -(Self::SYLLABLE_LIFT_PX * 0.8)
-                } else {
-                    0.0
-                };
-                st.bg_syllable_lifts[b_idx].target = lift_target;
-                st.bg_syllable_lifts[b_idx].step(lift_dt);
-            }
+                if st.syllable_lifts.len() != line.syllables.len() {
+                    st.syllable_lifts = vec![Spring1D::syllable_lift(0.0); line.syllables.len()];
+                }
+                for (s_idx, syl) in line.syllables.iter().enumerate() {
+                    let lift_target = if is_sel && line.has_word_sync && t_word >= syl.start_sec {
+                        -Self::SYLLABLE_LIFT_PX
+                    } else {
+                        0.0
+                    };
+                    let sp = &mut st.syllable_lifts[s_idx];
+                    sp.target = lift_target;
+                    if lift_target != 0.0 || sp.value.abs() > 1e-4 || sp.velocity.abs() > 1e-4 {
+                        sp.step(lift_dt);
+                        if sp.value.abs() > 1e-4 || sp.velocity.abs() > 1e-4 {
+                            any_lift_active = true;
+                        } else if lift_target == 0.0 {
+                            sp.value = 0.0;
+                            sp.velocity = 0.0;
+                        }
+                    }
+                }
 
-            // Step per-unit (`字` for CJK; `word` or `char` for Latin per user switch!) lift springs!
-            let char_lift_dist = Self::CHAR_LIFT_PX * vp_scale.clamp(0.95, 1.35);
-            let active_units = line.units_for_mode(self.latin_by_word);
-            if st.char_lifts.len() != active_units.len() {
-                st.char_lifts = vec![Spring1D::char_lift(0.0); active_units.len()];
-            }
-            for (c_idx, cu) in active_units.iter().enumerate() {
-                let lift_target = if is_sel && line.has_word_sync && t_word > cu.start_sec {
-                    let ramp = (cu.end_sec - cu.start_sec).clamp(0.035, 0.065);
-                    let u = ((t_word - cu.start_sec) / ramp).clamp(0.0, 1.0) as f32;
-                    -char_lift_dist * (u * u * (3.0 - 2.0 * u))
-                } else {
-                    0.0
-                };
-                st.char_lifts[c_idx].target = lift_target;
-                st.char_lifts[c_idx].step(lift_dt);
-            }
+                if st.bg_syllable_lifts.len() != line.bg_syllables.len() {
+                    st.bg_syllable_lifts =
+                        vec![Spring1D::syllable_lift(0.0); line.bg_syllables.len()];
+                }
+                for (b_idx, bsyl) in line.bg_syllables.iter().enumerate() {
+                    let lift_target = if is_sel && line.has_word_sync && t_word >= bsyl.start_sec {
+                        -(Self::SYLLABLE_LIFT_PX * 0.8)
+                    } else {
+                        0.0
+                    };
+                    let sp = &mut st.bg_syllable_lifts[b_idx];
+                    sp.target = lift_target;
+                    if lift_target != 0.0 || sp.value.abs() > 1e-4 || sp.velocity.abs() > 1e-4 {
+                        sp.step(lift_dt);
+                        if sp.value.abs() > 1e-4 || sp.velocity.abs() > 1e-4 {
+                            any_lift_active = true;
+                        } else if lift_target == 0.0 {
+                            sp.value = 0.0;
+                            sp.velocity = 0.0;
+                        }
+                    }
+                }
 
-            let active_bg_units = line.bg_units_for_mode(self.latin_by_word);
-            if st.bg_char_lifts.len() != active_bg_units.len() {
-                st.bg_char_lifts = vec![Spring1D::char_lift(0.0); active_bg_units.len()];
-            }
-            for (bc_idx, bcu) in active_bg_units.iter().enumerate() {
-                let lift_target = if is_sel && line.has_word_sync && t_word > bcu.start_sec {
-                    let ramp = (bcu.end_sec - bcu.start_sec).clamp(0.035, 0.065);
-                    let u = ((t_word - bcu.start_sec) / ramp).clamp(0.0, 1.0) as f32;
-                    -(char_lift_dist * 0.80) * (u * u * (3.0 - 2.0 * u))
-                } else {
-                    0.0
-                };
-                st.bg_char_lifts[bc_idx].target = lift_target;
-                st.bg_char_lifts[bc_idx].step(lift_dt);
+                // Step per-unit (`字` for CJK; `word` or `char` for Latin per user switch!) lift springs!
+                let char_lift_dist = Self::CHAR_LIFT_PX * vp_scale.clamp(0.95, 1.35);
+                let active_units = line.units_for_mode(self.latin_by_word);
+                if st.char_lifts.len() != active_units.len() {
+                    st.char_lifts = vec![Spring1D::char_lift(0.0); active_units.len()];
+                }
+                for (c_idx, cu) in active_units.iter().enumerate() {
+                    let lift_target = if is_sel && line.has_word_sync && t_word > cu.start_sec {
+                        let ramp = (cu.end_sec - cu.start_sec).clamp(0.035, 0.065);
+                        let u = ((t_word - cu.start_sec) / ramp).clamp(0.0, 1.0) as f32;
+                        -char_lift_dist * (u * u * (3.0 - 2.0 * u))
+                    } else {
+                        0.0
+                    };
+                    let sp = &mut st.char_lifts[c_idx];
+                    sp.target = lift_target;
+                    if lift_target != 0.0 || sp.value.abs() > 1e-4 || sp.velocity.abs() > 1e-4 {
+                        sp.step(lift_dt);
+                        if sp.value.abs() > 1e-4 || sp.velocity.abs() > 1e-4 {
+                            any_lift_active = true;
+                        } else if lift_target == 0.0 {
+                            sp.value = 0.0;
+                            sp.velocity = 0.0;
+                        }
+                    }
+                }
+
+                let active_bg_units = line.bg_units_for_mode(self.latin_by_word);
+                if st.bg_char_lifts.len() != active_bg_units.len() {
+                    st.bg_char_lifts = vec![Spring1D::char_lift(0.0); active_bg_units.len()];
+                }
+                for (bc_idx, bcu) in active_bg_units.iter().enumerate() {
+                    let lift_target = if is_sel && line.has_word_sync && t_word > bcu.start_sec {
+                        let ramp = (bcu.end_sec - bcu.start_sec).clamp(0.035, 0.065);
+                        let u = ((t_word - bcu.start_sec) / ramp).clamp(0.0, 1.0) as f32;
+                        -(char_lift_dist * 0.80) * (u * u * (3.0 - 2.0 * u))
+                    } else {
+                        0.0
+                    };
+                    let sp = &mut st.bg_char_lifts[bc_idx];
+                    sp.target = lift_target;
+                    if lift_target != 0.0 || sp.value.abs() > 1e-4 || sp.velocity.abs() > 1e-4 {
+                        sp.step(lift_dt);
+                        if sp.value.abs() > 1e-4 || sp.velocity.abs() > 1e-4 {
+                            any_lift_active = true;
+                        } else if lift_target == 0.0 {
+                            sp.value = 0.0;
+                            sp.velocity = 0.0;
+                        }
+                    }
+                }
+
+                st.has_active_lifts = any_lift_active;
             }
         }
 
@@ -2143,6 +2192,7 @@ pub fn parse_yrc_lyrics(yrc: &str, tlyric: Option<&str>) -> Option<ParsedLyrics>
     // Intentionally do NOT apply community `[offset:...]` tags (`0x22b047` / `0x22f379`)
     let trans_map = tlyric.map(parse_lrc_timestamp_map).unwrap_or_default();
     let mut trans_used = vec![false; trans_map.len()];
+    let mut trans_align = MonotonicTransCursor::default();
     let mut lines = Vec::new();
 
     for raw_line in yrc.lines() {
@@ -2195,8 +2245,13 @@ pub fn parse_yrc_lyrics(yrc: &str, tlyric: Option<&str>) -> Option<ParsedLyrics>
         }
         let start_sec = (line_start_ms / 1000.0).max(0.0);
         let end_sec = ((line_start_ms + line_dur_ms.max(150.0)) / 1000.0).max(start_sec + 0.15);
-        let translation =
-            find_closest_translation_monotonic(&trans_map, &mut trans_used, start_sec, 1.35);
+        let translation = find_closest_translation_monotonic_with_cursor(
+            &trans_map,
+            &mut trans_used,
+            &mut trans_align,
+            start_sec,
+            1.35,
+        );
         let is_rtl = contains_rtl_chars(&main_text);
         let word_cjk_units = build_word_cjk_units_from_syllables(&syllables);
         let char_units = build_char_units_from_syllables(&syllables);
@@ -2266,27 +2321,71 @@ fn parse_lrc_timestamp_map(lrc: &str) -> Vec<(f64, String)> {
     out
 }
 
-fn find_closest_translation_monotonic(
+#[derive(Clone, Copy, Debug)]
+struct MonotonicTransCursor {
+    cursor: usize,
+    prev_target: f64,
+}
+
+impl Default for MonotonicTransCursor {
+    fn default() -> Self {
+        Self {
+            cursor: 0,
+            prev_target: f64::NEG_INFINITY,
+        }
+    }
+}
+
+/// O(L + T) amortized two-pointer monotonic translation alignment on sorted `trans` timestamps.
+/// Falls back cleanly to O(log T) `partition_point` if a malformed file ever emits an out-of-order line.
+fn find_closest_translation_monotonic_with_cursor(
     trans: &[(f64, String)],
     used: &mut [bool],
+    state: &mut MonotonicTransCursor,
     target_sec: f64,
     max_diff_sec: f64,
 ) -> Option<String> {
-    let mut best: Option<(f64, usize)> = None;
-    for (idx, (t, _)) in trans.iter().enumerate() {
-        if used.get(idx).copied().unwrap_or(false) {
-            continue;
-        }
-        let diff = (t - target_sec).abs();
-        if diff <= max_diff_sec && best.is_none_or(|(bd, _)| diff < bd) {
-            best = Some((diff, idx));
+    if trans.is_empty() {
+        return None;
+    }
+    let min_t = target_sec - max_diff_sec;
+    let max_t = target_sec + max_diff_sec;
+
+    if target_sec < state.prev_target {
+        state.cursor = trans.partition_point(|(t, _)| *t < min_t);
+    } else {
+        while state.cursor < trans.len()
+            && (used.get(state.cursor).copied().unwrap_or(false) || trans[state.cursor].0 < min_t)
+        {
+            state.cursor += 1;
         }
     }
-    if let Some((_, idx)) = best {
-        if let Some(u) = used.get_mut(idx) {
+    state.prev_target = target_sec;
+
+    let mut best: Option<(f64, usize)> = None;
+    let mut idx = state.cursor;
+    while idx < trans.len() {
+        let t = trans[idx].0;
+        if t > max_t {
+            break;
+        }
+        if !used.get(idx).copied().unwrap_or(false) {
+            let diff = (t - target_sec).abs();
+            if diff <= max_diff_sec && best.is_none_or(|(bd, _)| diff < bd) {
+                best = Some((diff, idx));
+            }
+        }
+        idx += 1;
+    }
+
+    if let Some((_, best_idx)) = best {
+        if let Some(u) = used.get_mut(best_idx) {
             *u = true;
         }
-        return Some(trans[idx].1.clone());
+        while state.cursor < trans.len() && used.get(state.cursor).copied().unwrap_or(false) {
+            state.cursor += 1;
+        }
+        return Some(trans[best_idx].1.clone());
     }
     None
 }
@@ -2301,6 +2400,7 @@ pub fn parse_lrc_lyrics(lrc: &str, tlyric: Option<&str>, source_label: &str) -> 
     }
     let ext_trans = tlyric.map(parse_lrc_timestamp_map).unwrap_or_default();
     let mut ext_used = vec![false; ext_trans.len()];
+    let mut ext_align = MonotonicTransCursor::default();
 
     // Merge consecutive lines with identical timestamps as `(primary, translation)`
     let mut merged: Vec<(f64, String, Option<String>)> = Vec::with_capacity(raw_pairs.len());
@@ -2311,7 +2411,13 @@ pub fn parse_lrc_lyrics(lrc: &str, tlyric: Option<&str>, source_label: &str) -> 
                 continue;
             }
         }
-        let tr = find_closest_translation_monotonic(&ext_trans, &mut ext_used, t, 1.35);
+        let tr = find_closest_translation_monotonic_with_cursor(
+            &ext_trans,
+            &mut ext_used,
+            &mut ext_align,
+            t,
+            1.35,
+        );
         merged.push((t, txt, tr));
     }
 
@@ -2471,8 +2577,57 @@ pub fn parse_any_lyrics_file(content: &str) -> Option<ParsedLyrics> {
 // Multi-Source Async Fetcher (Apple Music TTML -> AMLL TTML -> NetEase YRC -> LRCLIB)
 // ============================================================================
 
-static LYRICS_CACHE: Lazy<Mutex<HashMap<String, Option<ParsedLyrics>>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+const LYRICS_CACHE_CAP: usize = 48;
+
+struct LyricsLruCache {
+    entries: HashMap<String, (Option<ParsedLyrics>, u64)>,
+    clock: u64,
+}
+
+impl LyricsLruCache {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::with_capacity(LYRICS_CACHE_CAP),
+            clock: 0,
+        }
+    }
+
+    fn get(&mut self, key: &str) -> Option<Option<ParsedLyrics>> {
+        let entry = self.entries.get_mut(key)?;
+        self.clock = self.clock.wrapping_add(1);
+        entry.1 = self.clock;
+        Some(entry.0.clone())
+    }
+
+    fn insert(&mut self, key: String, val: Option<ParsedLyrics>) {
+        self.clock = self.clock.wrapping_add(1);
+        let stamp = self.clock;
+        if let Some(existing) = self.entries.get_mut(&key) {
+            existing.0 = val;
+            existing.1 = stamp;
+            return;
+        }
+        while self.entries.len() >= LYRICS_CACHE_CAP {
+            let Some(evict_k) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, ts))| *ts)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            self.entries.remove(&evict_k);
+        }
+        self.entries.insert(key, (val, stamp));
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+static LYRICS_CACHE: Lazy<Mutex<LyricsLruCache>> =
+    Lazy::new(|| Mutex::new(LyricsLruCache::new()));
 
 static BUILTIN_AGENT_LYRICS_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
@@ -2508,7 +2663,11 @@ pub fn put_custom_lyrics_in_cache(key: &str, parsed: ParsedLyrics) {
 }
 
 pub fn get_cached_lyrics(key: &str) -> Option<Option<ParsedLyrics>> {
-    LYRICS_CACHE.lock().ok().and_then(|g| g.get(key).cloned())
+    LYRICS_CACHE.lock().ok().and_then(|mut g| g.get(key))
+}
+
+pub fn lyrics_cache_len() -> usize {
+    LYRICS_CACHE.lock().map(|g| g.len()).unwrap_or(0)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2650,24 +2809,43 @@ fn parse_best_amp_ttml_pair(
                 return Some(loc);
             }
             if base.is_syllable_synced {
-                // Backfill localized translations from `loc` onto syllable-synced `base` within 1.0s
+                // O(L + T) two-pointer backfill of localized translations from sorted `loc.lines`
+                // onto sorted syllable-synced `base.lines` within 1.0s
                 let mut used = vec![false; loc.lines.len()];
+                let mut cursor = 0usize;
+                let mut prev_t = f64::NEG_INFINITY;
                 for bl in &mut base.lines {
                     if bl.translation.is_some() {
                         continue;
                     }
+                    let min_t = bl.start_sec - 1.0;
+                    let max_t = bl.start_sec + 1.0;
+                    if bl.start_sec < prev_t {
+                        cursor = loc.lines.partition_point(|ll| ll.start_sec < min_t);
+                    } else {
+                        while cursor < loc.lines.len()
+                            && (used[cursor] || loc.lines[cursor].start_sec < min_t)
+                        {
+                            cursor += 1;
+                        }
+                    }
+                    prev_t = bl.start_sec;
                     let mut best_tr: Option<(f64, usize)> = None;
-                    for (idx, ll) in loc.lines.iter().enumerate() {
-                        if used[idx] {
-                            continue;
+                    let mut idx = cursor;
+                    while idx < loc.lines.len() && loc.lines[idx].start_sec <= max_t {
+                        if !used[idx] {
+                            let diff = (loc.lines[idx].start_sec - bl.start_sec).abs();
+                            if diff <= 1.0 && best_tr.is_none_or(|(bd, _)| diff < bd) {
+                                best_tr = Some((diff, idx));
+                            }
                         }
-                        let diff = (ll.start_sec - bl.start_sec).abs();
-                        if diff <= 1.0 && best_tr.is_none_or(|(bd, _)| diff < bd) {
-                            best_tr = Some((diff, idx));
-                        }
+                        idx += 1;
                     }
                     if let Some((_, idx)) = best_tr {
                         used[idx] = true;
+                        while cursor < loc.lines.len() && used[cursor] {
+                            cursor += 1;
+                        }
                         bl.translation = loc.lines[idx]
                             .translation
                             .clone()
@@ -3083,9 +3261,6 @@ fn put_cache_bounded(key: &str, val: Option<ParsedLyrics>) {
         return;
     };
     if let Ok(mut g) = LYRICS_CACHE.lock() {
-        if g.len() >= 48 {
-            g.clear();
-        }
         g.insert(key.to_string(), Some(parsed));
     }
 }
@@ -3522,12 +3697,18 @@ async fn backfill_netease_translations(
         return;
     }
     let mut used = vec![false; trans_map.len()];
+    let mut align = MonotonicTransCursor::default();
     for line in &mut parsed.lines {
         if line.translation.is_some() {
             continue;
         }
-        line.translation =
-            find_closest_translation_monotonic(&trans_map, &mut used, line.start_sec, 1.35);
+        line.translation = find_closest_translation_monotonic_with_cursor(
+            &trans_map,
+            &mut used,
+            &mut align,
+            line.start_sec,
+            1.35,
+        );
     }
 }
 

@@ -34,6 +34,40 @@ static WEB_AM_ACTIVE: AtomicBool = AtomicBool::new(false);
 static WEB_AM_SEQ: AtomicU64 = AtomicU64::new(0);
 static CDP_CMD_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Hard 100 MiB caps for Chromium/Edge HTTP disk cache and media cache so `web_am_profile`
+/// never grows unboundedly (sealing 0.5-2+ GB profile disk leak!).
+pub const WEB_AM_DISK_CACHE_BYTES: u64 = 104_857_600;
+pub const WEB_AM_MEDIA_CACHE_BYTES: u64 = 104_857_600;
+
+/// Builds the Chromium/Edge command-line arguments for the isolated Apple Music Web engine.
+pub fn build_edge_launch_args(
+    profile: &std::path::Path,
+    port: u16,
+    start_url: &str,
+    show_window: bool,
+) -> Vec<String> {
+    let mut args = vec![
+        format!("--user-data-dir={}", profile.display()),
+        format!("--remote-debugging-port={port}"),
+        format!("--app={start_url}"),
+        format!("--disk-cache-size={WEB_AM_DISK_CACHE_BYTES}"),
+        format!("--media-cache-size={WEB_AM_MEDIA_CACHE_BYTES}"),
+        "--autoplay-policy=no-user-gesture-required".to_string(),
+        "--no-first-run".to_string(),
+        "--no-default-browser-check".to_string(),
+        "--disable-background-timer-throttling".to_string(),
+        "--disable-renderer-backgrounding".to_string(),
+        "--disable-features=HardwareMediaKeyHandling,MediaSessionService".to_string(),
+        "--window-size=980,700".to_string(),
+    ];
+    if !show_window {
+        args.push("--window-position=-2400,-2400".to_string());
+    }
+    args
+}
+
+type StatusFingerprint = (bool, bool, bool, bool, String, String);
+
 struct WebAmRuntime {
     child: Option<Child>,
     child_pid: Option<u32>,
@@ -44,6 +78,7 @@ struct WebAmRuntime {
     ready: bool,
     captured_user_token: Option<String>,
     last_state: SmtcState,
+    last_emitted_status_fp: Option<StatusFingerprint>,
     queue: Vec<AgentTrackInput>,
     queue_index: usize,
     last_error: Option<String>,
@@ -62,6 +97,7 @@ impl Default for WebAmRuntime {
             ready: false,
             captured_user_token: None,
             last_state: SmtcState::default(),
+            last_emitted_status_fp: None,
             queue: Vec::new(),
             queue_index: 0,
             last_error: None,
@@ -116,10 +152,7 @@ pub fn take_captured_user_token() -> Option<String> {
     RUNTIME.lock().ok().and_then(|mut g| g.captured_user_token.take())
 }
 
-pub fn get_status() -> WebAmStatus {
-    let Ok(g) = RUNTIME.lock() else {
-        return WebAmStatus::default();
-    };
+fn build_status_from_runtime(g: &WebAmRuntime) -> WebAmStatus {
     let running = g.cdp_port != 0;
     let status_text = if !running {
         "未启动（点击「启动 / 网页登录」或在曲库点击播放自动拉起 Edge 引擎）".to_string()
@@ -144,6 +177,48 @@ pub fn get_status() -> WebAmStatus {
         storefront: g.storefront.clone(),
         status_text,
     }
+}
+
+fn status_fingerprint(st: &WebAmStatus) -> StatusFingerprint {
+    (
+        st.running,
+        st.ready,
+        st.authorized,
+        st.window_visible,
+        st.storefront.clone(),
+        st.status_text.clone(),
+    )
+}
+
+pub fn status_eq(a: &WebAmStatus, b: &WebAmStatus) -> bool {
+    a.running == b.running
+        && a.ready == b.ready
+        && a.authorized == b.authorized
+        && a.window_visible == b.window_visible
+        && a.storefront == b.storefront
+        && a.status_text == b.status_text
+}
+
+pub fn get_status() -> WebAmStatus {
+    let Ok(g) = RUNTIME.lock() else {
+        return WebAmStatus::default();
+    };
+    build_status_from_runtime(&g)
+}
+
+/// Returns `Some(WebAmStatus)` ONLY when at least one status field changed since the last
+/// emitted snapshot, eliminating redundant `AsyncMsg::WebAmStatusUpdated` spam every 360ms.
+pub fn take_status_if_changed() -> Option<WebAmStatus> {
+    let Ok(mut g) = RUNTIME.lock() else {
+        return None;
+    };
+    let st = build_status_from_runtime(&g);
+    let fp = status_fingerprint(&st);
+    if g.last_emitted_status_fp.as_ref() == Some(&fp) {
+        return None;
+    }
+    g.last_emitted_status_fp = Some(fp);
+    Some(st)
 }
 
 fn find_chromium_browser() -> Option<PathBuf> {
@@ -220,20 +295,10 @@ pub async fn ensure_started(storefront: &str, show_window: bool) -> Result<u16, 
     let start_url = format!("https://music.apple.com/{sf}/home");
 
     let mut cmd = Command::new(&browser);
-    cmd.arg(format!("--user-data-dir={}", profile.display()))
-        .arg(format!("--remote-debugging-port={port}"))
-        .arg(format!("--app={start_url}"))
-        .arg("--autoplay-policy=no-user-gesture-required")
-        .arg("--no-first-run")
-        .arg("--no-default-browser-check")
-        .arg("--disable-background-timer-throttling")
-        .arg("--disable-renderer-backgrounding")
-        .arg("--window-size=980,700")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    if !show_window {
-        cmd.arg("--window-position=-2400,-2400");
+    for arg in build_edge_launch_args(&profile, port, &start_url, show_window) {
+        cmd.arg(arg);
     }
+    cmd.stdout(Stdio::null()).stderr(Stdio::null());
 
     let child = cmd
         .spawn()
@@ -255,20 +320,24 @@ pub async fn ensure_started(storefront: &str, show_window: bool) -> Result<u16, 
     // Wait up to 9 seconds for music.apple.com tab + MusicKit.getInstance()
     for _ in 0..36 {
         tokio::time::sleep(Duration::from_millis(250)).await;
-        if let Ok(ws) = find_am_tab_ws_url(port).await {
-            if let Ok(val) = cdp_eval(&ws, "Boolean(window.MusicKit && window.MusicKit.getInstance && window.MusicKit.getInstance())", false).await {
-                if val.as_bool() == Some(true) {
-                    if let Ok(mut g) = RUNTIME.lock() {
-                        g.ready = true;
-                        g.last_error = None;
-                    }
-                    if !show_window {
-                        set_window_visible(false);
-                    }
-                    let _ = poll_playback_state().await;
-                    wake_ui();
-                    return Ok(port);
+        if let Ok(val) = cdp_eval_on_port(
+            port,
+            "Boolean(window.MusicKit && window.MusicKit.getInstance && window.MusicKit.getInstance())",
+            false,
+        )
+        .await
+        {
+            if val.as_bool() == Some(true) {
+                if let Ok(mut g) = RUNTIME.lock() {
+                    g.ready = true;
+                    g.last_error = None;
                 }
+                if !show_window {
+                    set_window_visible(false);
+                }
+                let _ = poll_playback_state().await;
+                wake_ui();
+                return Ok(port);
             }
         }
     }
@@ -334,6 +403,7 @@ pub fn shutdown() {
         g.ready = false;
         g.authorized = false;
         g.last_state = SmtcState::default();
+        g.last_emitted_status_fp = None;
         let p = g.cdp_port;
         g.cdp_port = 0;
         g.child_pid = None;
@@ -341,6 +411,9 @@ pub fn shutdown() {
         (p, g.child.take())
     };
     let _ = port;
+    if let Ok(mut sess_guard) = CDP_SESSION.try_lock() {
+        *sess_guard = None;
+    }
     if let Some(mut ch) = child_opt {
         let _ = ch.kill();
         let _ = ch.wait();
@@ -404,18 +477,24 @@ pub async fn play_tracks(
     if tracks.is_empty() {
         return Err("播放队列为空".to_string());
     }
-    let idx = start_index.min(tracks.len() - 1);
+    let target_orig_idx = start_index.min(tracks.len() - 1);
     let port = ensure_started(storefront, !hide_window).await?;
-    let ws = find_am_tab_ws_url(port).await?;
 
-    let ids: Vec<String> = tracks
-        .iter()
-        .map(|t| t.effective_adam_id())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let mut ids: Vec<String> = Vec::with_capacity(tracks.len());
+    let mut idx = 0usize;
+    for (orig_i, t) in tracks.iter().enumerate() {
+        let aid = t.effective_adam_id();
+        if !aid.is_empty() {
+            if orig_i == target_orig_idx {
+                idx = ids.len();
+            }
+            ids.push(aid);
+        }
+    }
     if ids.is_empty() {
         return Err("未找到有效的 Apple Music 曲目 ID".to_string());
     }
+    idx = idx.min(ids.len() - 1);
     let ids_json = serde_json::to_string(&ids).unwrap_or_else(|_| "[]".to_string());
     let desired_vol = get_saved_volume().clamp(0.0, 1.0);
     let js = format!(
@@ -430,7 +509,7 @@ pub async fn play_tracks(
             return "OK";
         }})()"#
     );
-    let res = cdp_eval(&ws, &js, true).await?;
+    let res = cdp_eval_on_port(port, &js, true).await?;
     if res.as_str() == Some("NO_MK") {
         return Err("网页版 MusicKit 仍在加载中，请稍候 2 秒重试".to_string());
     }
@@ -450,7 +529,6 @@ pub async fn play_container(
     hide_window: bool,
 ) -> Result<SmtcState, String> {
     let port = ensure_started(storefront, !hide_window).await?;
-    let ws = find_am_tab_ws_url(port).await?;
     let id_json = serde_json::to_string(id).unwrap_or_else(|_| "\"\"".to_string());
     let desired_vol = get_saved_volume().clamp(0.0, 1.0);
     let js = if kind.contains("station") {
@@ -491,7 +569,7 @@ pub async fn play_container(
             }})()"#
         )
     };
-    let res = cdp_eval(&ws, &js, true).await?;
+    let res = cdp_eval_on_port(port, &js, true).await?;
     if res.as_str() == Some("NO_MK") {
         return Err("网页版 MusicKit 仍在加载中，请稍候重试".to_string());
     }
@@ -507,7 +585,6 @@ pub async fn control(action: &str, value: Option<f64>) -> Result<SmtcState, Stri
     if port == 0 {
         return Err("网页 Apple Music 引擎尚未启动".to_string());
     }
-    let ws = find_am_tab_ws_url(port).await?;
     let act = action.trim().to_ascii_lowercase();
     let js = match act.as_str() {
         "play" => "(async () => { const mk = MusicKit.getInstance(); await mk.play(); return 'ok'; })()".to_string(),
@@ -526,7 +603,7 @@ pub async fn control(action: &str, value: Option<f64>) -> Result<SmtcState, Stri
         }
         _ => "(() => 'ok')()".to_string(),
     };
-    let _ = cdp_eval(&ws, &js, act != "volume").await?;
+    let _ = cdp_eval_on_port(port, &js, act != "volume").await?;
     poll_playback_state().await
 }
 
@@ -540,15 +617,6 @@ pub async fn poll_playback_state() -> Result<SmtcState, String> {
     if port == 0 {
         return Ok(SmtcState::default());
     }
-    let ws = match find_am_tab_ws_url(port).await {
-        Ok(u) => u,
-        Err(e) => {
-            if let Ok(mut g) = RUNTIME.lock() {
-                g.last_error = Some(e.clone());
-            }
-            return Err(e);
-        }
-    };
 
     let js = r#"(() => {
         const mk = window.MusicKit && window.MusicKit.getInstance ? window.MusicKit.getInstance() : null;
@@ -574,7 +642,15 @@ pub async fn poll_playback_state() -> Result<SmtcState, String> {
         });
     })()"#;
 
-    let val = cdp_eval(&ws, js, false).await?;
+    let val = match cdp_eval_on_port(port, js, false).await {
+        Ok(v) => v,
+        Err(e) => {
+            if let Ok(mut g) = RUNTIME.lock() {
+                g.last_error = Some(e.clone());
+            }
+            return Err(e);
+        }
+    };
     let raw_str = val.as_str().unwrap_or("{}");
     let parsed: Value = serde_json::from_str(raw_str).unwrap_or(Value::Null);
     let ready = parsed.get("ready").and_then(Value::as_bool).unwrap_or(false);
@@ -600,11 +676,15 @@ pub async fn poll_playback_state() -> Result<SmtcState, String> {
     let title = parsed.get("title").and_then(Value::as_str).unwrap_or_default().to_string();
     let artist = parsed.get("artist").and_then(Value::as_str).unwrap_or_default().to_string();
     let album = parsed.get("album").and_then(Value::as_str).unwrap_or_default().to_string();
-    let art_raw = parsed.get("artwork").and_then(Value::as_str).unwrap_or_default();
-    let artwork_url = if art_raw.is_empty() {
-        None
-    } else {
+    let art_raw = parsed
+        .get("artwork")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    let artwork_url = if art_raw.starts_with("http://") || art_raw.starts_with("https://") {
         Some(format_artwork_template(art_raw, 600))
+    } else {
+        None
     };
 
     let st = SmtcState {
@@ -650,94 +730,210 @@ pub async fn poll_playback_state() -> Result<SmtcState, String> {
 }
 
 // ============================================================================
-// Zero-Dependency Pure-Rust RFC 6455 Local WebSocket CDP Client
+// Persistent Reusable RFC 6455 Local WebSocket CDP Client (Zero TIME_WAIT!)
 // ============================================================================
 
-async fn cdp_eval(ws_url: &str, expression: &str, await_promise: bool) -> Result<Value, String> {
-    let stripped = ws_url
-        .strip_prefix("ws://")
-        .ok_or_else(|| format!("不支持的 WebSocket 地址: {ws_url}"))?;
-    let (host_port, path) = stripped
-        .split_once('/')
-        .ok_or_else(|| "无效的 CDP WebSocket 路径".to_string())?;
+struct CdpSession {
+    port: u16,
+    ws_url: String,
+    reader: tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
+    writer: tokio::net::tcp::OwnedWriteHalf,
+}
 
-    let mut stream = tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(host_port))
-        .await
-        .map_err(|_| "连接 Edge CDP 超时".to_string())?
-        .map_err(|e| format!("连接 Edge CDP 失败: {e}"))?;
+static CDP_SESSION: Lazy<tokio::sync::Mutex<Option<CdpSession>>> =
+    Lazy::new(|| tokio::sync::Mutex::new(None));
 
-    let ws_key = general_purpose::STANDARD.encode(b"amlight-cdp-key!");
-    let req = format!(
-        "GET /{path} HTTP/1.1\r\nHost: {host_port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {ws_key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
-    );
-    stream
-        .write_all(req.as_bytes())
-        .await
-        .map_err(|e| format!("CDP 握手发送失败: {e}"))?;
+impl CdpSession {
+    async fn connect(port: u16, ws_url: String) -> Result<Self, String> {
+        let stripped = ws_url
+            .strip_prefix("ws://")
+            .ok_or_else(|| format!("不支持的 WebSocket 地址: {ws_url}"))?;
+        let (host_port, path) = stripped
+            .split_once('/')
+            .ok_or_else(|| "无效的 CDP WebSocket 路径".to_string())?;
 
-    // Read HTTP 101 Switching Protocols header
-    let mut hdr_buf = Vec::with_capacity(512);
-    let mut byte = [0u8; 1];
-    loop {
-        tokio::time::timeout(Duration::from_secs(3), stream.read_exact(&mut byte))
+        let mut stream =
+            tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(host_port))
+                .await
+                .map_err(|_| "连接 Edge CDP 超时".to_string())?
+                .map_err(|e| format!("连接 Edge CDP 失败: {e}"))?;
+        let _ = stream.set_nodelay(true);
+
+        let ws_key = general_purpose::STANDARD.encode(b"amlight-cdp-key!");
+        let req = format!(
+            "GET /{path} HTTP/1.1\r\nHost: {host_port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {ws_key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+        stream
+            .write_all(req.as_bytes())
+            .await
+            .map_err(|e| format!("CDP 握手发送失败: {e}"))?;
+
+        let (read_half, writer) = stream.into_split();
+        let mut reader = tokio::io::BufReader::with_capacity(2048, read_half);
+        let mut hdr_buf = Vec::with_capacity(512);
+        loop {
+            let mut line = Vec::with_capacity(128);
+            let n = tokio::time::timeout(
+                Duration::from_secs(3),
+                tokio::io::AsyncBufReadExt::read_until(&mut reader, b'\n', &mut line),
+            )
             .await
             .map_err(|_| "CDP 握手读取超时".to_string())?
             .map_err(|e| format!("CDP 握手读取失败: {e}"))?;
-        hdr_buf.push(byte[0]);
-        if hdr_buf.ends_with(b"\r\n\r\n") || hdr_buf.len() > 8192 {
-            break;
+            if n == 0 {
+                break;
+            }
+            hdr_buf.extend_from_slice(&line);
+            if hdr_buf.ends_with(b"\r\n\r\n") || hdr_buf.len() > 8192 {
+                break;
+            }
         }
+        let hdr_str = String::from_utf8_lossy(&hdr_buf);
+        if !hdr_str.contains("101") {
+            return Err(format!(
+                "CDP 握手被拒绝: {}",
+                hdr_str.lines().next().unwrap_or("")
+            ));
+        }
+        Ok(Self {
+            port,
+            ws_url,
+            reader,
+            writer,
+        })
     }
-    let hdr_str = String::from_utf8_lossy(&hdr_buf);
-    if !hdr_str.contains("101") {
-        return Err(format!("CDP 握手被拒绝: {}", hdr_str.lines().next().unwrap_or("")));
-    }
 
-    let id = CDP_CMD_ID.fetch_add(1, Ordering::Relaxed);
-    let msg = json!({
-        "id": id,
-        "method": "Runtime.evaluate",
-        "params": {
-            "expression": expression,
-            "returnByValue": true,
-            "awaitPromise": await_promise
-        }
-    })
-    .to_string();
+    async fn eval(&mut self, expression: &str, await_promise: bool) -> Result<Value, String> {
+        let id = CDP_CMD_ID.fetch_add(1, Ordering::Relaxed);
+        let msg = json!({
+            "id": id,
+            "method": "Runtime.evaluate",
+            "params": {
+                "expression": expression,
+                "returnByValue": true,
+                "awaitPromise": await_promise
+            }
+        })
+        .to_string();
 
-    ws_write_text(&mut stream, &msg).await?;
+        ws_write_frame(&mut self.writer, 0x81, msg.as_bytes()).await?;
 
-    let timeout_sec = if await_promise { 8 } else { 4 };
-    let deadline = Instant::now() + Duration::from_secs(timeout_sec);
-    loop {
-        let rem = deadline.saturating_duration_since(Instant::now());
-        if rem.is_zero() {
-            return Err("MusicKit JS 执行超时".to_string());
-        }
-        let frame_txt = tokio::time::timeout(rem, ws_read_text(&mut stream))
+        let timeout_sec = if await_promise { 8 } else { 4 };
+        let deadline = Instant::now() + Duration::from_secs(timeout_sec);
+        loop {
+            let rem = deadline.saturating_duration_since(Instant::now());
+            if rem.is_zero() {
+                return Err("MusicKit JS 执行超时".to_string());
+            }
+            let frame_txt = tokio::time::timeout(
+                rem,
+                ws_read_text_with_pong(&mut self.reader, &mut self.writer),
+            )
             .await
             .map_err(|_| "MusicKit JS 响应超时".to_string())??;
-        let Ok(resp) = serde_json::from_str::<Value>(&frame_txt) else {
-            continue;
-        };
-        if resp.get("id").and_then(Value::as_u64) != Some(id) {
-            continue;
+            let Ok(resp) = serde_json::from_str::<Value>(&frame_txt) else {
+                continue;
+            };
+            if resp.get("id").and_then(Value::as_u64) != Some(id) {
+                continue;
+            }
+            if let Some(ex) = resp
+                .pointer("/result/exceptionDetails/text")
+                .and_then(Value::as_str)
+            {
+                return Err(format!("MusicKit 异常: {ex}"));
+            }
+            return Ok(resp
+                .pointer("/result/result/value")
+                .cloned()
+                .unwrap_or(Value::Null));
         }
-        if let Some(ex) = resp.pointer("/result/exceptionDetails/text").and_then(Value::as_str) {
-            return Err(format!("MusicKit 异常: {ex}"));
-        }
-        return Ok(resp
-            .pointer("/result/result/value")
-            .cloned()
-            .unwrap_or(Value::Null));
     }
 }
 
-async fn ws_write_text(stream: &mut TcpStream, text: &str) -> Result<(), String> {
-    let payload = text.as_bytes();
+/// Evaluates JS on the cached persistent CDP WebSocket for `port`, avoiding per-poll `/json` +
+/// TCP/WebSocket handshakes (~333 TIME_WAIT sockets/min). Auto-reconnects transparently on drop.
+async fn cdp_eval_on_port(
+    port: u16,
+    expression: &str,
+    await_promise: bool,
+) -> Result<Value, String> {
+    let mut guard = CDP_SESSION.lock().await;
+    if let Some(ref mut sess) = *guard {
+        if sess.port == port {
+            match sess.eval(expression, await_promise).await {
+                Ok(v) => return Ok(v),
+                Err(e) if e.starts_with("MusicKit 异常:") => return Err(e),
+                Err(_) => {
+                    *guard = None;
+                }
+            }
+        } else {
+            *guard = None;
+        }
+    }
+
+    let ws_url = find_am_tab_ws_url(port).await?;
+    let mut sess = CdpSession::connect(port, ws_url).await?;
+    match sess.eval(expression, await_promise).await {
+        Ok(v) => {
+            *guard = Some(sess);
+            Ok(v)
+        }
+        Err(e) => {
+            if e.starts_with("MusicKit 异常:") {
+                *guard = Some(sess);
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Persistent reusable CDP WebSocket eval directly against a known `ws://` endpoint (auto-reconnects
+/// on broken pipe/EOF). Also used by offline unit tests to verify single-socket connection reuse!
+pub async fn cdp_eval_reused_url(
+    ws_url: &str,
+    expression: &str,
+    await_promise: bool,
+) -> Result<Value, String> {
+    let mut guard = CDP_SESSION.lock().await;
+    if let Some(ref mut sess) = *guard {
+        if sess.ws_url == ws_url {
+            match sess.eval(expression, await_promise).await {
+                Ok(v) => return Ok(v),
+                Err(e) if e.starts_with("MusicKit 异常:") => return Err(e),
+                Err(_) => {
+                    *guard = None;
+                }
+            }
+        } else {
+            *guard = None;
+        }
+    }
+
+    let mut sess = CdpSession::connect(0, ws_url.to_string()).await?;
+    match sess.eval(expression, await_promise).await {
+        Ok(v) => {
+            *guard = Some(sess);
+            Ok(v)
+        }
+        Err(e) => {
+            if e.starts_with("MusicKit 异常:") {
+                *guard = Some(sess);
+            }
+            Err(e)
+        }
+    }
+}
+
+async fn ws_write_frame<W: AsyncWriteExt + Unpin>(
+    stream: &mut W,
+    first_byte: u8,
+    payload: &[u8],
+) -> Result<(), String> {
     let mask = [0x37u8, 0xFA, 0x21, 0x9C];
     let mut frame = Vec::with_capacity(payload.len() + 14);
-    frame.push(0x81); // FIN + Text
+    frame.push(first_byte);
     let n = payload.len();
     if n < 126 {
         frame.push(0x80 | (n as u8));
@@ -758,11 +954,15 @@ async fn ws_write_text(stream: &mut TcpStream, text: &str) -> Result<(), String>
         .map_err(|e| format!("CDP 发送失败: {e}"))
 }
 
-async fn ws_read_text(stream: &mut TcpStream) -> Result<String, String> {
+async fn ws_read_text_with_pong<R, W>(reader: &mut R, writer: &mut W) -> Result<String, String>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
     let mut acc = Vec::new();
     loop {
         let mut hdr = [0u8; 2];
-        stream
+        reader
             .read_exact(&mut hdr)
             .await
             .map_err(|e| format!("CDP 读取帧头失败: {e}"))?;
@@ -772,14 +972,14 @@ async fn ws_read_text(stream: &mut TcpStream) -> Result<String, String> {
         let mut len = (hdr[1] & 0x7F) as u64;
         if len == 126 {
             let mut ext = [0u8; 2];
-            stream
+            reader
                 .read_exact(&mut ext)
                 .await
                 .map_err(|e| format!("CDP 长度读取失败: {e}"))?;
             len = u16::from_be_bytes(ext) as u64;
         } else if len == 127 {
             let mut ext = [0u8; 8];
-            stream
+            reader
                 .read_exact(&mut ext)
                 .await
                 .map_err(|e| format!("CDP 长度读取失败: {e}"))?;
@@ -787,14 +987,14 @@ async fn ws_read_text(stream: &mut TcpStream) -> Result<String, String> {
         }
         let mut mask_key = [0u8; 4];
         if masked {
-            stream
+            reader
                 .read_exact(&mut mask_key)
                 .await
                 .map_err(|e| format!("CDP 掩码读取失败: {e}"))?;
         }
         let mut buf = vec![0u8; (len as usize).min(4 * 1024 * 1024)];
         if !buf.is_empty() {
-            stream
+            reader
                 .read_exact(&mut buf)
                 .await
                 .map_err(|e| format!("CDP 载荷读取失败: {e}"))?;
@@ -807,7 +1007,8 @@ async fn ws_read_text(stream: &mut TcpStream) -> Result<String, String> {
         match opcode {
             0x8 => return Err("CDP 连接已关闭".to_string()),
             0x9 => {
-                // Ping -> ignore or continue
+                // RFC 6455 Ping -> reply with Pong so persistent connections stay alive
+                let _ = ws_write_frame(writer, 0x8A, &buf).await;
                 continue;
             }
             0xA => continue, // Pong

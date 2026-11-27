@@ -3,7 +3,7 @@ use crate::smtc::SmtcState;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Mutex, RwLock};
@@ -117,14 +117,19 @@ pub struct AgentTrackInput {
 }
 
 impl AgentTrackInput {
-    pub fn effective_adam_id(&self) -> String {
+    #[inline]
+    pub fn effective_adam_id_str(&self) -> &str {
         if let Some(cid) = &self.catalog_id {
             let trimmed = cid.trim();
-            if !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit()) {
-                return trimmed.to_string();
+            if !trimmed.is_empty() && trimmed.bytes().all(|b| b.is_ascii_digit()) {
+                return trimmed;
             }
         }
-        self.id.trim().to_string()
+        self.id.trim()
+    }
+
+    pub fn effective_adam_id(&self) -> String {
+        self.effective_adam_id_str().to_string()
     }
 }
 
@@ -286,7 +291,15 @@ pub fn parse_track_from_am_json(
     let album_name = attrs
         .get("albumName")
         .and_then(Value::as_str)
-        .or(fallback_album)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            item.pointer("/relationships/catalog/data/0/attributes/albumName")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| fallback_album.map(str::trim).filter(|s| !s.is_empty()))
         .unwrap_or_default()
         .to_string();
     let duration_sec = attrs
@@ -298,13 +311,29 @@ pub fn parse_track_from_am_json(
     let artwork_url = attrs
         .pointer("/artwork/url")
         .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
         .map(|u| format_artwork_template(u, 600))
         .or_else(|| {
             item.pointer("/relationships/catalog/data/0/attributes/artwork/url")
                 .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
                 .map(|u| format_artwork_template(u, 600))
         })
-        .or_else(|| fallback_artwork.map(|s| s.to_string()));
+        .or_else(|| {
+            item.pointer("/relationships/albums/data/0/attributes/artwork/url")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|u| format_artwork_template(u, 600))
+        })
+        .or_else(|| {
+            fallback_artwork
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        });
 
     let mut audio_traits: Vec<String> = attrs
         .get("audioTraits")
@@ -341,6 +370,161 @@ pub fn parse_track_from_am_json(
         artwork_url,
         audio_traits,
     })
+}
+
+/// Validates whether `cur_aid`'s cached metadata/cover may be safely aliased under `resolved_aid`.
+/// Allows library IDs (`i.*`) resolving to their catalog `storeAdamID` (unless the incoming title
+/// explicitly identifies a different song) or exact title+artist storefront remaps, while strictly
+/// preventing Track A's cover art from ever poisoning Track B's cache entry on track transitions.
+pub fn should_alias_cached_track_meta(
+    cur_aid: &str,
+    resolved_aid: &str,
+    cur_meta: &CachedTrackMeta,
+    incoming_title: Option<&str>,
+    incoming_artist: Option<&str>,
+) -> bool {
+    let ca = cur_aid.trim();
+    let ra = resolved_aid.trim();
+    if ca.is_empty() || ra.is_empty() || ca == ra {
+        return false;
+    }
+    let inc_title_norm = incoming_title
+        .map(crate::backends::normalize_match_text)
+        .filter(|s| !s.is_empty());
+    let cur_title_norm = crate::backends::normalize_match_text(&cur_meta.title);
+
+    if let Some(ref it) = inc_title_norm {
+        if !cur_title_norm.is_empty()
+            && it != &cur_title_norm
+            && !it.contains(&cur_title_norm)
+            && !cur_title_norm.contains(it)
+        {
+            return false;
+        }
+        let inc_artist_norm = incoming_artist
+            .map(crate::backends::normalize_match_text)
+            .filter(|s| !s.is_empty());
+        let cur_artist_norm = crate::backends::normalize_match_text(&cur_meta.artist);
+        if let Some(ref ia) = inc_artist_norm {
+            if !cur_artist_norm.is_empty()
+                && ia != &cur_artist_norm
+                && !ia.contains(&cur_artist_norm)
+                && !cur_artist_norm.contains(ia)
+            {
+                return false;
+            }
+        }
+        return !cur_title_norm.is_empty() || ca.starts_with("i.");
+    }
+
+    // Without an incoming title to confirm track identity, only allow library ID -> catalog ID resolution.
+    ca.starts_with("i.")
+}
+
+pub const TRACK_META_CACHE_MAX_ENTRIES: usize = 4096;
+pub const TRACK_TRAITS_CACHE_MAX_ENTRIES: usize = 4096;
+pub const HLS_MANIFEST_CACHE_MAX_ENTRIES: usize = 2048;
+pub const AGENT_LYRICS_CACHE_MAX_ENTRIES: usize = 32;
+
+/// Amortized-O(1) bounded true-LRU map backed by a `HashMap` + monotonic stamp `VecDeque`.
+/// Eliminates both unbounded long-session memory growth and full-`.clear()` cache avalanches.
+#[derive(Clone, Debug)]
+pub struct BoundedLruMap<V> {
+    map: HashMap<String, (V, u64)>,
+    order: VecDeque<(String, u64)>,
+    tick: u64,
+    max_entries: usize,
+}
+
+impl<V> BoundedLruMap<V> {
+    pub fn new(max_entries: usize) -> Self {
+        let cap = max_entries.max(1);
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            tick: 0,
+            max_entries: cap,
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    #[inline]
+    pub fn max_entries(&self) -> usize {
+        self.max_entries
+    }
+
+    #[inline]
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.map.contains_key(key)
+    }
+
+    #[inline]
+    pub fn get(&self, key: &str) -> Option<&V> {
+        self.map.get(key).map(|(v, _)| v)
+    }
+
+    fn next_tick(&mut self) -> u64 {
+        self.tick = self.tick.wrapping_add(1);
+        self.tick
+    }
+
+    fn compact_if_bloated(&mut self) {
+        if self.order.len() <= self.max_entries.saturating_mul(4).max(32) {
+            return;
+        }
+        let map = &self.map;
+        self.order
+            .retain(|(k, stamp)| map.get(k).is_some_and(|(_, cur)| *cur == *stamp));
+    }
+
+    pub fn insert(&mut self, key: String, value: V) {
+        let stamp = self.next_tick();
+        self.map.insert(key.clone(), (value, stamp));
+        self.order.push_back((key, stamp));
+        while self.map.len() > self.max_entries {
+            let Some((old_k, old_stamp)) = self.order.pop_front() else {
+                break;
+            };
+            let is_live = self
+                .map
+                .get(&old_k)
+                .is_some_and(|(_, cur)| *cur == old_stamp);
+            if is_live {
+                self.map.remove(&old_k);
+            }
+        }
+        self.compact_if_bloated();
+    }
+
+    pub fn touch(&mut self, key: &str) {
+        if !self.map.contains_key(key) {
+            return;
+        }
+        let stamp = self.next_tick();
+        if let Some(entry) = self.map.get_mut(key) {
+            entry.1 = stamp;
+        }
+        self.order.push_back((key.to_string(), stamp));
+        self.compact_if_bloated();
+    }
+
+    pub fn get_cloned_touch(&mut self, key: &str) -> Option<V>
+    where
+        V: Clone,
+    {
+        let val = self.map.get(key).map(|(v, _)| v.clone())?;
+        self.touch(key);
+        Some(val)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -384,10 +568,10 @@ struct SharedSnapshot {
     volume: f64,
     prefs: AudioPrefs,
     stream_specs: Option<crate::audio_viz::StreamAudioSpecs>,
-    track_cache: HashMap<String, CachedTrackMeta>,
-    track_traits_cache: HashMap<String, Vec<String>>,
-    hls_cache: HashMap<String, String>,
-    agent_lyrics_cache: HashMap<String, (String, bool)>,
+    track_cache: BoundedLruMap<CachedTrackMeta>,
+    track_traits_cache: BoundedLruMap<Vec<String>>,
+    hls_cache: BoundedLruMap<String>,
+    agent_lyrics_cache: BoundedLruMap<(String, bool)>,
     queue_tracks: Vec<AgentTrackInput>,
 }
 
@@ -433,10 +617,10 @@ impl Default for SharedSnapshot {
             volume: 0.75,
             prefs: AudioPrefs::default(),
             stream_specs: None,
-            track_cache: HashMap::new(),
-            track_traits_cache: HashMap::new(),
-            hls_cache: HashMap::new(),
-            agent_lyrics_cache: HashMap::new(),
+            track_cache: BoundedLruMap::new(TRACK_META_CACHE_MAX_ENTRIES),
+            track_traits_cache: BoundedLruMap::new(TRACK_TRAITS_CACHE_MAX_ENTRIES),
+            hls_cache: BoundedLruMap::new(HLS_MANIFEST_CACHE_MAX_ENTRIES),
+            agent_lyrics_cache: BoundedLruMap::new(AGENT_LYRICS_CACHE_MAX_ENTRIES),
             queue_tracks: Vec::new(),
         }
     }
@@ -485,9 +669,6 @@ impl SharedSnapshot {
     fn cache_lyrics_bounded(&mut self, aid: String, lyrics_body: String, is_ttml: bool) {
         if aid.is_empty() || lyrics_body.trim().is_empty() {
             return;
-        }
-        if self.agent_lyrics_cache.len() >= 24 {
-            self.agent_lyrics_cache.clear();
         }
         self.agent_lyrics_cache.insert(aid, (lyrics_body, is_ttml));
     }
@@ -722,6 +903,7 @@ mod win {
     #[link(name = "ole32")]
     extern "system" {
         fn CoInitializeEx(pv_reserved: *mut c_void, dw_coinit: u32) -> HRESULT;
+        fn CoUninitialize();
         fn CoInitializeSecurity(
             p_sec_desc: *mut c_void,
             c_auth_svc: i32,
@@ -1059,6 +1241,14 @@ mod win {
                     snap.current_descriptor = Some(desc);
                 }
 
+                let incoming_artist = np_artist
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| {
+                        np_line2
+                            .filter(|s| !s.is_empty())
+                            .map(|l2| l2.split_once(" — ").map(|(ar, _)| ar).unwrap_or(l2))
+                    });
+
                 if snap.pending_play_tracks {
                     snap.pqi_id = Some(pqi);
                     snap.transition_from_pqi = None;
@@ -1067,10 +1257,56 @@ mod win {
                     if let Some(ref resolved_aid) = np_aid {
                         if let Some(ref cur_aid) = snap.adam_id.clone() {
                             if cur_aid != resolved_aid {
-                                if let Some(meta) = snap.track_cache.get(cur_aid).cloned() {
-                                    snap.track_cache.entry(resolved_aid.clone()).or_insert(meta);
-                                }
+                                let aliased = if !snap.track_cache.contains_key(resolved_aid) {
+                                    if let Some(meta) = snap.track_cache.get(cur_aid).cloned() {
+                                        if should_alias_cached_track_meta(
+                                            cur_aid,
+                                            resolved_aid,
+                                            &meta,
+                                            np_title,
+                                            incoming_artist,
+                                        ) {
+                                            snap.track_cache.insert(resolved_aid.clone(), meta);
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                };
                                 snap.adam_id = Some(resolved_aid.clone());
+                                if !aliased {
+                                    if let Some(meta) = snap.track_cache.get_cloned_touch(resolved_aid) {
+                                        if !meta.title.is_empty() {
+                                            snap.title = meta.title;
+                                        }
+                                        snap.artist = meta.artist;
+                                        snap.album = meta.album;
+                                        snap.artwork_url = meta.artwork_url;
+                                        snap.audio_quality = meta.audio_quality;
+                                        if meta.duration_sec > 0.0 {
+                                            snap.duration_sec = meta.duration_sec;
+                                        }
+                                    } else if np_title
+                                        .is_some_and(|t| !t.is_empty() && t != snap.title)
+                                    {
+                                        snap.artwork_url = None;
+                                        snap.audio_quality = None;
+                                        if let Some(t) = np_title.filter(|s| !s.is_empty()) {
+                                            snap.title = t.to_string();
+                                        }
+                                        if let Some(ar) = incoming_artist.filter(|s| !s.is_empty())
+                                        {
+                                            snap.artist = ar.to_string();
+                                        }
+                                        if let Some(al) = np_album.filter(|s| !s.is_empty()) {
+                                            snap.album = al.to_string();
+                                        }
+                                    }
+                                }
                             }
                         } else {
                             snap.adam_id = Some(resolved_aid.clone());
@@ -1112,7 +1348,7 @@ mod win {
                         }
                         if let Some(ref aid) = np_aid {
                             snap.adam_id = Some(aid.clone());
-                            if let Some(meta) = snap.track_cache.get(aid).cloned() {
+                            if let Some(meta) = snap.track_cache.get_cloned_touch(aid) {
                                 if !meta.title.is_empty() {
                                     snap.title = meta.title;
                                 }
@@ -1153,16 +1389,72 @@ mod win {
                         changed = true;
                     } else if snap.adam_id.is_none() && np_aid.is_some() {
                         snap.adam_id = np_aid.clone();
+                        if let Some(ref aid) = np_aid {
+                            if let Some(meta) = snap.track_cache.get_cloned_touch(aid) {
+                                if snap.artwork_url.is_none() {
+                                    snap.artwork_url = meta.artwork_url;
+                                }
+                                if snap.audio_quality.is_none() {
+                                    snap.audio_quality = meta.audio_quality;
+                                }
+                            }
+                        }
+                        snap.recompute_current_stream_specs();
                         changed = true;
                     } else if snap.transition_from_pqi.is_none() {
                         if let (Some(ref cur_aid), Some(ref resolved_aid)) =
                             (&snap.adam_id.clone(), &np_aid)
                         {
                             if cur_aid != resolved_aid {
-                                if let Some(meta) = snap.track_cache.get(cur_aid).cloned() {
-                                    snap.track_cache.entry(resolved_aid.clone()).or_insert(meta);
-                                }
+                                let aliased = if !snap.track_cache.contains_key(resolved_aid) {
+                                    if let Some(meta) = snap.track_cache.get(cur_aid).cloned() {
+                                        if should_alias_cached_track_meta(
+                                            cur_aid,
+                                            resolved_aid,
+                                            &meta,
+                                            np_title,
+                                            incoming_artist,
+                                        ) {
+                                            snap.track_cache.insert(resolved_aid.clone(), meta);
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                };
                                 snap.adam_id = Some(resolved_aid.clone());
+                                if !aliased {
+                                    if let Some(meta) = snap.track_cache.get_cloned_touch(resolved_aid)
+                                    {
+                                        if !meta.title.is_empty() {
+                                            snap.title = meta.title;
+                                        }
+                                        snap.artist = meta.artist;
+                                        snap.album = meta.album;
+                                        snap.artwork_url = meta.artwork_url;
+                                        snap.audio_quality = meta.audio_quality;
+                                        if meta.duration_sec > 0.0 {
+                                            snap.duration_sec = meta.duration_sec;
+                                        }
+                                    } else {
+                                        snap.artwork_url = None;
+                                        snap.audio_quality = None;
+                                        if let Some(t) = np_title.filter(|s| !s.is_empty()) {
+                                            snap.title = t.to_string();
+                                        }
+                                        if let Some(ar) = incoming_artist.filter(|s| !s.is_empty())
+                                        {
+                                            snap.artist = ar.to_string();
+                                        }
+                                        if let Some(al) = np_album.filter(|s| !s.is_empty()) {
+                                            snap.album = al.to_string();
+                                        }
+                                    }
+                                }
                                 snap.recompute_current_stream_specs();
                                 changed = true;
                             }
@@ -1536,6 +1828,31 @@ mod win {
         Err("释放 amp_proxy.dll 失败".to_string())
     }
 
+    /// RAII COM MTA guard that balances every successful `CoInitializeEx` (`S_OK` / `S_FALSE`)
+    /// with `CoUninitialize` on Drop, eliminating COM initialization refcount leaks on worker threads.
+    struct ComGuard {
+        should_uninit: bool,
+    }
+
+    impl ComGuard {
+        unsafe fn init_mta() -> Self {
+            let hr = CoInitializeEx(null_mut(), 0); // COINIT_MULTITHREADED = 0
+            Self {
+                should_uninit: hr == 0 || hr == 1,
+            }
+        }
+    }
+
+    impl Drop for ComGuard {
+        fn drop(&mut self) {
+            if self.should_uninit {
+                unsafe {
+                    CoUninitialize();
+                }
+            }
+        }
+    }
+
     static COM_SEC_ONCE: Once = Once::new();
     static COM_SEC_HR: AtomicI32 = AtomicI32::new(i32::MIN);
 
@@ -1556,7 +1873,7 @@ mod win {
                     null_mut(),
                 );
                 if hr == 0x8004_01F0u32 as i32 {
-                    let _ = CoInitializeEx(null_mut(), 0);
+                    let _com_guard = ComGuard::init_mta();
                     hr = CoInitializeSecurity(
                         null_mut(),
                         -1,
@@ -1614,9 +1931,11 @@ mod win {
         handle_incoming_playback_event(plist);
     }
 
-    unsafe fn init_com_and_security() {
-        let _ = CoInitializeEx(null_mut(), 0); // COINIT_MULTITHREADED = 0
+    #[must_use]
+    unsafe fn init_com_and_security() -> ComGuard {
+        let guard = ComGuard::init_mta();
         let _ = init_process_com_security();
+        guard
     }
 
     pub fn list_matching_pids(exe_name_lower: &str) -> Vec<u32> {
@@ -1908,7 +2227,7 @@ mod win {
     impl AgentSession {
         unsafe fn connect() -> Result<Self, String> {
             let _ = ensure_amp_proxy_dll()?;
-            init_com_and_security();
+            let _connect_com = init_com_and_security();
 
             // Ensure AppleMusic.exe UI frontend is NOT occupying the single Music MediaApp slot.
             close_apple_music_frontend_if_running();
@@ -2468,21 +2787,65 @@ mod win {
                     return Ok(());
                 }
 
+                let line1_opt = (!line1.is_empty()).then_some(line1.as_str());
+                let line2_artist = (!line2.is_empty()).then(|| {
+                    line2
+                        .split_once(" — ")
+                        .map(|(ar, _)| ar)
+                        .unwrap_or(line2.as_str())
+                });
+
                 if snap.pending_play_tracks {
+                    let mut switched_unaliased = false;
                     if let (Some(ref prev_aid), Some(ref resolved_aid)) =
                         (&snap.adam_id.clone(), &adam_id)
                     {
                         if prev_aid != resolved_aid {
-                            if let Some(meta) = snap.track_cache.get(prev_aid).cloned() {
-                                snap.track_cache.entry(resolved_aid.clone()).or_insert(meta);
-                            }
+                            let aliased = if !snap.track_cache.contains_key(resolved_aid) {
+                                if let Some(meta) = snap.track_cache.get(prev_aid).cloned() {
+                                    if should_alias_cached_track_meta(
+                                        prev_aid,
+                                        resolved_aid,
+                                        &meta,
+                                        line1_opt,
+                                        line2_artist,
+                                    ) {
+                                        snap.track_cache.insert(resolved_aid.clone(), meta);
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            };
+                            switched_unaliased = !aliased;
                         }
                     }
                     if pqi_id.is_some() {
                         snap.pqi_id = pqi_id;
                     }
-                    if adam_id.is_some() {
-                        snap.adam_id = adam_id;
+                    if let Some(ref resolved_aid) = adam_id {
+                        snap.adam_id = Some(resolved_aid.clone());
+                        if switched_unaliased {
+                            if let Some(meta) = snap.track_cache.get_cloned_touch(resolved_aid) {
+                                if !meta.title.is_empty() {
+                                    snap.title = meta.title;
+                                }
+                                snap.artist = meta.artist;
+                                snap.album = meta.album;
+                                snap.artwork_url = meta.artwork_url;
+                                snap.audio_quality = meta.audio_quality;
+                                if meta.duration_sec > 0.0 {
+                                    snap.duration_sec = meta.duration_sec;
+                                }
+                            } else if line1_opt.is_some_and(|t| t != snap.title) {
+                                snap.artwork_url = None;
+                                snap.audio_quality = None;
+                            }
+                        }
                     }
                     if dur > 0.0 && snap.duration_sec <= 0.0 {
                         snap.duration_sec = dur;
@@ -2505,14 +2868,33 @@ mod win {
                         && !recently_started;
                     let track_changed = pqi_switched || aid_switched_without_pqi;
 
+                    let mut aid_switched_unaliased = false;
                     if snap.pqi_id.is_none() && pqi_id.is_some() && recently_started {
                         if let (Some(ref prev_aid), Some(ref resolved_aid)) =
                             (&snap.adam_id.clone(), &adam_id)
                         {
                             if prev_aid != resolved_aid {
-                                if let Some(meta) = snap.track_cache.get(prev_aid).cloned() {
-                                    snap.track_cache.entry(resolved_aid.clone()).or_insert(meta);
-                                }
+                                let aliased = if !snap.track_cache.contains_key(resolved_aid) {
+                                    if let Some(meta) = snap.track_cache.get(prev_aid).cloned() {
+                                        if should_alias_cached_track_meta(
+                                            prev_aid,
+                                            resolved_aid,
+                                            &meta,
+                                            line1_opt,
+                                            line2_artist,
+                                        ) {
+                                            snap.track_cache.insert(resolved_aid.clone(), meta);
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                };
+                                aid_switched_unaliased = !aliased;
                             }
                         }
                     }
@@ -2566,9 +2948,8 @@ mod win {
 
                     let lookup_aid = adam_id.as_ref().or(snap.adam_id.as_ref()).cloned();
                     let cached = lookup_aid
-                        .as_ref()
-                        .and_then(|id| snap.track_cache.get(id))
-                        .cloned();
+                        .as_deref()
+                        .and_then(|id| snap.track_cache.get_cloned_touch(id));
 
                     if let Some(aid) = adam_id {
                         snap.adam_id = Some(aid);
@@ -2587,6 +2968,10 @@ mod win {
                         snap.audio_quality = meta.audio_quality;
                         snap.duration_sec = if dur > 0.0 { dur } else { meta.duration_sec };
                     } else {
+                        if aid_switched_unaliased {
+                            snap.artwork_url = None;
+                            snap.audio_quality = None;
+                        }
                         if !line1.is_empty() {
                             snap.title = line1;
                         }
@@ -2634,7 +3019,18 @@ mod win {
                 SHARED
                     .read()
                     .ok()
-                    .map(|s| s.queue_tracks.iter().take(120).cloned().collect())
+                    .map(|s| {
+                        let all = &s.queue_tracks;
+                        if all.is_empty() {
+                            return Vec::new();
+                        }
+                        let anchor = preferred_aid
+                            .and_then(|aid| all.iter().position(|t| t.effective_adam_id() == aid))
+                            .unwrap_or(0);
+                        let win_start = anchor.saturating_sub(25);
+                        let win_end = (win_start + 120).min(all.len());
+                        all[win_start..win_end].to_vec()
+                    })
                     .unwrap_or_default()
             };
             if queue.is_empty() {
@@ -2765,7 +3161,7 @@ mod win {
             .name("am-playback-service".to_string())
             .stack_size(512 * 1024)
             .spawn(move || unsafe {
-                init_com_and_security();
+                let _com_guard = init_com_and_security();
                 let mut session: Option<AgentSession> = None;
                 let mut last_queue_sync = Instant::now();
 
@@ -4027,7 +4423,11 @@ pub fn get_cached_library_url() -> Option<String> {
         .and_then(|s| s.prefs.library_location_url.clone())
 }
 
-pub fn enrich_cached_track(adam_id: &str, meta: CachedTrackMeta) {
+pub fn enrich_cached_track(adam_id: &str, mut meta: CachedTrackMeta) {
+    meta.artwork_url = meta
+        .artwork_url
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty());
     if let Ok(mut snap) = SHARED.write() {
         if snap.adam_id.as_deref() == Some(adam_id) {
             if !meta.title.is_empty() {
@@ -4116,37 +4516,111 @@ pub async fn play_container_by_api(
         }
         "albums" | "playlists" => {
             let path = format!("v1/catalog/{sf}/{kind}/{id}?include=tracks&extend=audioTraits&l=zh-Hans-CN");
-            let json = crate::am_api::fetch_am_api(path, user_token, None, Some(sf)).await?;
+            let json =
+                crate::am_api::fetch_am_api(path, user_token.clone(), None, Some(sf.clone()))
+                    .await?;
             let root = json
                 .pointer("/data/0")
                 .ok_or_else(|| "未找到专辑/歌单详情".to_string())?;
-            let fallback_album = root.pointer("/attributes/name").and_then(Value::as_str);
-            let fallback_art = root
-                .pointer("/attributes/artwork/url")
-                .and_then(Value::as_str)
-                .map(|u| format_artwork_template(u, 600));
-            let arr = root
-                .pointer("/relationships/tracks/data")
-                .and_then(Value::as_array)
-                .ok_or_else(|| "该列表暂无可播放曲目".to_string())?;
-            arr.iter()
-                .filter_map(|t| parse_track_from_am_json(t, fallback_album, fallback_art.as_deref()))
+            let is_album = kind == "albums";
+            let fallback_album = is_album
+                .then(|| root.pointer("/attributes/name").and_then(Value::as_str))
+                .flatten();
+            let fallback_art = is_album
+                .then(|| {
+                    root.pointer("/attributes/artwork/url")
+                        .and_then(Value::as_str)
+                        .map(|u| format_artwork_template(u, 600))
+                })
+                .flatten();
+            let max_pages = if kind == "playlists" {
+                crate::am_api::DEFAULT_PLAYLIST_MAX_PAGES
+            } else {
+                20
+            };
+            let all_items = crate::am_api::fetch_catalog_container_remaining_tracks(
+                &sf,
+                &kind,
+                &id,
+                root,
+                user_token,
+                max_pages,
+            )
+            .await;
+            if all_items.is_empty() {
+                return Err("该列表暂无可播放曲目".to_string());
+            }
+            all_items
+                .iter()
+                .filter_map(|t| {
+                    parse_track_from_am_json(t, fallback_album, fallback_art.as_deref())
+                })
                 .collect()
         }
         "library-albums" | "library-playlists" => {
-            let sub = if kind == "library-albums" {
-                "albums"
+            let is_album = kind == "library-albums";
+            let sub = if is_album { "albums" } else { "playlists" };
+            let max_pages = if is_album {
+                20
             } else {
-                "playlists"
+                crate::am_api::DEFAULT_PLAYLIST_MAX_PAGES
             };
-            let path = format!("v1/me/library/{sub}/{id}/tracks?include=catalog&extend=audioTraits&l=zh-Hans-CN");
-            let json = crate::am_api::fetch_am_api(path, user_token, None, Some(sf)).await?;
-            let arr = json
-                .get("data")
-                .and_then(Value::as_array)
-                .ok_or_else(|| "资料库列表暂无可播放曲目".to_string())?;
-            arr.iter()
-                .filter_map(|t| parse_track_from_am_json(t, None, None))
+            let meta_path = format!("v1/me/library/{sub}/{id}?include=catalog&l=zh-Hans-CN");
+            let meta_json = crate::am_api::fetch_am_api(
+                meta_path,
+                user_token.clone(),
+                None,
+                Some(sf.clone()),
+            )
+            .await
+            .ok();
+            let root = meta_json.as_ref().and_then(|j| j.pointer("/data/0"));
+            let cat_id = root.and_then(|r| {
+                r.pointer("/relationships/catalog/data/0/id")
+                    .or_else(|| r.pointer("/attributes/playParams/globalId"))
+                    .or_else(|| r.pointer("/attributes/playParams/catalogId"))
+                    .and_then(Value::as_str)
+                    .map(|s| s.to_string())
+                    .filter(|s| !s.is_empty())
+            });
+            let fallback_album = is_album
+                .then(|| {
+                    root.and_then(|r| {
+                        r.pointer("/attributes/name")
+                            .or_else(|| r.pointer("/relationships/catalog/data/0/attributes/name"))
+                            .and_then(Value::as_str)
+                    })
+                })
+                .flatten();
+            let fallback_art = is_album
+                .then(|| {
+                    root.and_then(|r| {
+                        r.pointer("/attributes/artwork/url")
+                            .or_else(|| {
+                                r.pointer("/relationships/catalog/data/0/attributes/artwork/url")
+                            })
+                            .and_then(Value::as_str)
+                            .map(|u| format_artwork_template(u, 600))
+                    })
+                })
+                .flatten();
+            let all_items = crate::am_api::fetch_library_container_tracks(
+                sub,
+                &id,
+                cat_id.as_deref(),
+                user_token,
+                &sf,
+                max_pages,
+            )
+            .await?;
+            if all_items.is_empty() {
+                return Err("资料库列表暂无可播放曲目".to_string());
+            }
+            all_items
+                .iter()
+                .filter_map(|t| {
+                    parse_track_from_am_json(t, fallback_album, fallback_art.as_deref())
+                })
                 .collect()
         }
         "stations" | "station" | "radioStation" | "radio-stations" => {
@@ -4222,10 +4696,6 @@ pub async fn play_container_by_api(
                         .unwrap_or("")
                         .trim()
                         .to_string();
-                    let st_art = root
-                        .and_then(|r| r.pointer("/attributes/artwork/url"))
-                        .and_then(Value::as_str)
-                        .map(|u| format_artwork_template(u, 600));
                     let is_live = root
                         .and_then(|r| r.pointer("/attributes/isLive"))
                         .and_then(Value::as_bool)
@@ -4237,9 +4707,7 @@ pub async fn play_container_by_api(
                     {
                         station_tracks = arr
                             .iter()
-                            .filter_map(|t| {
-                                parse_track_from_am_json(t, Some(&st_name), st_art.as_deref())
-                            })
+                            .filter_map(|t| parse_track_from_am_json(t, None, None))
                             .collect();
                     }
 
@@ -4305,11 +4773,7 @@ pub async fn play_container_by_api(
                                             let parsed: Vec<AgentTrackInput> = arr
                                                 .iter()
                                                 .filter_map(|t| {
-                                                    parse_track_from_am_json(
-                                                        t,
-                                                        Some(&st_name),
-                                                        st_art.as_deref(),
-                                                    )
+                                                    parse_track_from_am_json(t, None, None)
                                                 })
                                                 .collect();
                                             if !parsed.is_empty() {
@@ -4327,13 +4791,7 @@ pub async fn play_container_by_api(
                                 {
                                     station_tracks = arr
                                         .iter()
-                                        .filter_map(|t| {
-                                            parse_track_from_am_json(
-                                                t,
-                                                Some(&st_name),
-                                                st_art.as_deref(),
-                                            )
-                                        })
+                                        .filter_map(|t| parse_track_from_am_json(t, None, None))
                                         .collect();
                                     if !station_tracks.is_empty() {
                                         break 'search_terms;

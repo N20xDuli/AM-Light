@@ -2,18 +2,34 @@ use crate::am_agent::AgentTrackInput;
 use crate::am_api::{EditorialItem, EditorialShelf, EditorialShelfKind};
 use crate::backends::{NetEaseQrState, NetEaseQuality, ResolvedAudioStream};
 use crate::lyrics::{self, ParsedLyrics};
+use base64::{engine::general_purpose, Engine as _};
 use once_cell::sync::Lazy;
 use qrcode::{Color as QrColor, QrCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 const NE_REFERER: &str = "https://music.163.com/";
 const NE_BASE_COOKIE: &str = "os=pc; appver=3.0.18.203152; channel=netease";
 
+/// Maximum song IDs sent per `/api/v3/song/detail` POST chunk.
+pub const NE_SONG_DETAIL_CHUNK_SIZE: usize = 300;
+/// Safe upper cap on tracks hydrated for a single NetEase playlist or batch request.
+pub const NE_PLAYLIST_MAX_TRACKS: usize = 5000;
+/// Inline tracks requested from `/api/v6/playlist/detail` before hydrating remaining `trackIds`.
+const NE_PLAYLIST_INLINE_N: usize = 1000;
+/// Bounded concurrency for `/api/v3/song/detail` chunk waves.
+const NE_SONG_DETAIL_CONCURRENCY: usize = 3;
+/// Fallback sub-chunk size if a full 300-ID `/api/v3/song/detail` chunk is rejected or times out.
+const NE_SONG_DETAIL_FALLBACK_CHUNK_SIZE: usize = 100;
+/// Known NetEase generic disc placeholder image ID returned by legacy/unhydrated song nodes.
+const NE_PLACEHOLDER_PIC_ID: &str = "5639395138885805";
+
 static NE_HTTP: Lazy<reqwest::Client> = Lazy::new(|| {
     reqwest::Client::builder()
-        .timeout(Duration::from_secs(12))
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
         .pool_max_idle_per_host(16)
         .tcp_nodelay(true)
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
@@ -208,21 +224,119 @@ pub fn strip_ne_id(raw: &str) -> String {
         .to_string()
 }
 
+pub fn is_netease_placeholder_cover(url: &str) -> bool {
+    let u = url.trim();
+    u.is_empty() || u.contains(NE_PLACEHOLDER_PIC_ID)
+}
+
 fn upgrade_https_cover(url: &str, dim: u32) -> String {
     let u = url.trim();
     if u.is_empty() {
         return String::new();
     }
-    let https = if let Some(rest) = u.strip_prefix("http://") {
+    let https = if let Some(rest) = u.strip_prefix("https://") {
+        if rest.trim().is_empty() {
+            return String::new();
+        }
+        u.to_string()
+    } else if let Some(rest) = u.strip_prefix("http://") {
+        if rest.trim().is_empty() {
+            return String::new();
+        }
+        format!("https://{rest}")
+    } else if let Some(rest) = u.strip_prefix("//") {
+        if rest.trim().is_empty() {
+            return String::new();
+        }
         format!("https://{rest}")
     } else {
-        u.to_string()
+        return String::new();
     };
     if https.contains('?') {
         https
     } else {
         format!("{https}?param={dim}y{dim}")
     }
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Computes the canonical NetEase CDN cover URL from a numeric `pic_str` / `pic` ID
+/// when an API song payload omits `al.picUrl`.
+pub fn cover_url_from_pic_id(pic_id: &str, dim: u32) -> Option<String> {
+    let pid = pic_id.trim();
+    if pid.is_empty()
+        || pid == "0"
+        || pid == NE_PLACEHOLDER_PIC_ID
+        || !pid.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    const MAGIC: &[u8] = b"3go8&$8*3*3h0k(2)2";
+    let xored: Vec<u8> = pid
+        .as_bytes()
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| b ^ MAGIC[i % MAGIC.len()])
+        .collect();
+    let md5_hex = crate::listen_together::md5_hex(&xored);
+    let hex_bytes = md5_hex.as_bytes();
+    if hex_bytes.len() != 32 {
+        return None;
+    }
+    let mut digest = [0u8; 16];
+    for i in 0..16 {
+        let hi = hex_nibble(hex_bytes[i * 2])?;
+        let lo = hex_nibble(hex_bytes[i * 2 + 1])?;
+        digest[i] = (hi << 4) | lo;
+    }
+    let enc = general_purpose::STANDARD
+        .encode(digest)
+        .replace('/', "_")
+        .replace('+', "-");
+    Some(format!(
+        "https://p1.music.126.net/{enc}/{pid}.jpg?param={dim}y{dim}"
+    ))
+}
+
+fn extract_positive_i64(v: &Value) -> Option<i64> {
+    v.as_i64()
+        .or_else(|| v.as_u64().and_then(|u| i64::try_from(u).ok()))
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+        .filter(|&id| id > 0)
+}
+
+fn non_placeholder_cover_url(raw: Option<&str>, dim: u32) -> Option<String> {
+    let s = raw?.trim();
+    if is_netease_placeholder_cover(s) {
+        return None;
+    }
+    let upgraded = upgrade_https_cover(s, dim);
+    if upgraded.is_empty() {
+        None
+    } else {
+        Some(upgraded)
+    }
+}
+
+fn track_numeric_id(tr: &AgentTrackInput) -> Option<i64> {
+    strip_ne_id(&tr.id)
+        .parse::<i64>()
+        .ok()
+        .filter(|&id| id > 0)
+        .or_else(|| {
+            tr.catalog_id
+                .as_deref()
+                .and_then(|s| strip_ne_id(s).parse::<i64>().ok())
+                .filter(|&id| id > 0)
+        })
 }
 
 fn format_play_count(n: u64) -> String {
@@ -237,8 +351,8 @@ fn format_play_count(n: u64) -> String {
     }
 }
 
-fn parse_ne_song(v: &Value, fallback_art: Option<&str>) -> Option<AgentTrackInput> {
-    let raw_id = v.get("id").and_then(Value::as_i64)?;
+pub fn parse_ne_song(v: &Value, fallback_art: Option<&str>) -> Option<AgentTrackInput> {
+    let raw_id = v.get("id").and_then(extract_positive_i64)?;
     let name = v.get("name").and_then(Value::as_str)?.trim().to_string();
     if name.is_empty() {
         return None;
@@ -263,16 +377,32 @@ fn parse_ne_song(v: &Value, fallback_art: Option<&str>) -> Option<AgentTrackInpu
         .unwrap_or_default()
         .to_string();
 
-    let art_raw = album_obj
-        .and_then(|a| a.get("picUrl"))
-        .and_then(Value::as_str)
-        .or_else(|| v.get("picUrl").and_then(Value::as_str))
-        .unwrap_or_default();
-    let artwork_url = if !art_raw.is_empty() {
-        Some(upgrade_https_cover(art_raw, 480))
-    } else {
-        fallback_art.map(|s| s.to_string())
-    };
+    let artwork_url = album_obj
+        .and_then(|a| non_placeholder_cover_url(a.get("picUrl").and_then(Value::as_str), 480))
+        .or_else(|| {
+            album_obj.and_then(|a| {
+                non_placeholder_cover_url(a.get("blurPicUrl").and_then(Value::as_str), 480)
+            })
+        })
+        .or_else(|| {
+            album_obj
+                .and_then(|a| a.get("pic_str").and_then(Value::as_str))
+                .and_then(|pid| cover_url_from_pic_id(pid, 480))
+        })
+        .or_else(|| {
+            album_obj
+                .and_then(|a| a.get("pic"))
+                .and_then(|p| {
+                    p.as_u64()
+                        .filter(|&n| n > 0)
+                        .map(|n| n.to_string())
+                        .or_else(|| p.as_i64().filter(|&n| n > 0).map(|n| n.to_string()))
+                        .or_else(|| p.as_str().map(|s| s.to_string()))
+                })
+                .and_then(|pid| cover_url_from_pic_id(&pid, 480))
+        })
+        .or_else(|| non_placeholder_cover_url(v.get("picUrl").and_then(Value::as_str), 480))
+        .or_else(|| non_placeholder_cover_url(fallback_art, 480));
 
     let dur_ms = v
         .get("dt")
@@ -959,7 +1089,7 @@ pub async fn fetch_station_tracks(station_id: &str, cookie: Option<&str>) -> Res
             }
         }
         if !tracks.is_empty() {
-            return Ok(tracks);
+            return Ok(enrich_tracks_missing_artwork(tracks, cookie).await);
         }
     }
     // Numeric playlist-backed radio channel (e.g. 19723756 / 3778678)
@@ -970,14 +1100,19 @@ pub async fn fetch_station_tracks(station_id: &str, cookie: Option<&str>) -> Res
 pub async fn search_catalog(
     query: &str,
     cookie: Option<&str>,
-) -> Result<(Vec<NetEaseCard>, Vec<NetEaseCard>, Vec<AgentTrackInput>), String> {
+) -> Result<(Vec<NetEaseCard>, Vec<NetEaseCard>, Vec<NetEaseCard>, Vec<AgentTrackInput>), String> {
     let enc: String = url::form_urlencoded::byte_serialize(query.trim().as_bytes()).collect();
-    let u_songs = format!("https://music.163.com/api/search/get/?s={enc}&type=1&limit=24&offset=0");
-    let u_albums = format!("https://music.163.com/api/search/get/?s={enc}&type=10&limit=12&offset=0");
-    let u_pls = format!("https://music.163.com/api/search/get/?s={enc}&type=1000&limit=12&offset=0");
+    // Use `/api/cloudsearch/pc` so song results ALREADY carry full album cover (`al.picUrl`),
+    // duration (`dt`), and Hi-Res/Lossless flags in ONE single round-trip (eliminating the
+    // previous blocking sequential `/api/v3/song/detail` round-trip!).
+    let u_songs = format!("https://music.163.com/api/cloudsearch/pc?s={enc}&type=1&limit=15&offset=0");
+    let u_artists = format!("https://music.163.com/api/cloudsearch/pc?s={enc}&type=100&limit=8&offset=0");
+    let u_albums = format!("https://music.163.com/api/cloudsearch/pc?s={enc}&type=10&limit=10&offset=0");
+    let u_pls = format!("https://music.163.com/api/cloudsearch/pc?s={enc}&type=1000&limit=10&offset=0");
 
-    let (r_s, r_a, r_p) = tokio::join!(
+    let (r_s, r_ar, r_a, r_p) = tokio::join!(
         ne_post_form_json(&u_songs, &[], cookie),
+        ne_post_form_json(&u_artists, &[], cookie),
         ne_post_form_json(&u_albums, &[], cookie),
         ne_post_form_json(&u_pls, &[], cookie),
     );
@@ -985,25 +1120,70 @@ pub async fn search_catalog(
     let mut songs = Vec::new();
     if let Ok(j) = r_s {
         if let Some(arr) = j.pointer("/result/songs").and_then(Value::as_array) {
-            // Note: /api/search/get song items sometimes omit album.picUrl; enrich first 18 via /api/v3/song/detail for crisp covers!
-            let ids: Vec<i64> = arr
-                .iter()
-                .filter_map(|v| v.get("id").and_then(Value::as_i64))
-                .take(24)
-                .collect();
-            if !ids.is_empty() {
-                if let Ok(enriched) = fetch_songs_detail_batch(&ids, cookie).await {
-                    if !enriched.is_empty() {
-                        songs = enriched;
+            for v in arr {
+                if let Some(tr) = parse_ne_song(v, None) {
+                    songs.push(tr);
+                }
+            }
+        }
+    }
+    // Graceful fallback to legacy `/api/search/get` only if `cloudsearch/pc` yielded zero songs
+    if songs.is_empty() {
+        let u_legacy = format!("https://music.163.com/api/search/get/?s={enc}&type=1&limit=15&offset=0");
+        if let Ok(j) = ne_post_form_json(&u_legacy, &[], cookie).await {
+            if let Some(arr) = j.pointer("/result/songs").and_then(Value::as_array) {
+                let ids: Vec<i64> = arr
+                    .iter()
+                    .filter_map(|v| v.get("id").and_then(Value::as_i64))
+                    .take(15)
+                    .collect();
+                if !ids.is_empty() {
+                    if let Ok(enriched) = fetch_songs_detail_batch(&ids, cookie).await {
+                        if !enriched.is_empty() {
+                            songs = enriched;
+                        }
+                    }
+                }
+                if songs.is_empty() {
+                    for v in arr {
+                        if let Some(tr) = parse_ne_song(v, None) {
+                            songs.push(tr);
+                        }
                     }
                 }
             }
-            if songs.is_empty() {
-                for v in arr {
-                    if let Some(tr) = parse_ne_song(v, None) {
-                        songs.push(tr);
-                    }
-                }
+        }
+    }
+
+    let mut artists = Vec::new();
+    if let Ok(j) = r_ar {
+        if let Some(arr) = j.pointer("/result/artists").and_then(Value::as_array) {
+            for v in arr {
+                let Some(id) = v.get("id").and_then(Value::as_i64) else { continue };
+                let title = v.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
+                let alb_cnt = v.get("albumSize").and_then(Value::as_u64).unwrap_or(0);
+                let subtitle = if alb_cnt > 0 {
+                    format!("艺人 · {alb_cnt} 张专辑")
+                } else {
+                    "网易云艺人".to_string()
+                };
+                let art = upgrade_https_cover(
+                    v.get("img1v1Url")
+                        .or_else(|| v.get("picUrl"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    480,
+                );
+                artists.push(NetEaseCard {
+                    id: id.to_string(),
+                    kind: "ne-artist".to_string(),
+                    title,
+                    subtitle,
+                    description: String::new(),
+                    artwork_url: if art.is_empty() { None } else { Some(art) },
+                    badge: Some("艺人".to_string()),
+                    track_input: None,
+                });
             }
         }
     }
@@ -1069,48 +1249,358 @@ pub async fn search_catalog(
         }
     }
 
-    Ok((albums, playlists, songs))
+    Ok((artists, albums, playlists, songs))
 }
 
-pub async fn fetch_songs_detail_batch(ids: &[i64], cookie: Option<&str>) -> Result<Vec<AgentTrackInput>, String> {
-    if ids.is_empty() {
+/// Extracts ordered, deduplicated positive numeric track IDs from a NetEase
+/// `/api/v6/playlist/detail` `playlist` object's `trackIds` array, capped at `max_tracks`.
+pub fn extract_playlist_track_ids(playlist: &Value, max_tracks: usize) -> Vec<i64> {
+    if max_tracks == 0 {
+        return Vec::new();
+    }
+    let Some(arr) = playlist.get("trackIds").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut seen = HashSet::with_capacity(arr.len().min(max_tracks));
+    let mut out = Vec::with_capacity(arr.len().min(max_tracks));
+    for item in arr {
+        let Some(id) = item.get("id").and_then(extract_positive_i64) else {
+            continue;
+        };
+        if seen.insert(id) {
+            out.push(id);
+            if out.len() >= max_tracks {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Splits an ordered slice of NetEase song IDs into deduplicated request chunks
+/// (skipping non-positive IDs and capping total IDs at `max_tracks`).
+pub fn plan_song_detail_chunks(ids: &[i64], chunk_size: usize, max_tracks: usize) -> Vec<Vec<i64>> {
+    if ids.is_empty() || max_tracks == 0 {
+        return Vec::new();
+    }
+    let step = chunk_size.max(1);
+    let mut seen = HashSet::with_capacity(ids.len().min(max_tracks));
+    let mut unique = Vec::with_capacity(ids.len().min(max_tracks));
+    for &id in ids {
+        if id > 0 && seen.insert(id) {
+            unique.push(id);
+            if unique.len() >= max_tracks {
+                break;
+            }
+        }
+    }
+    unique.chunks(step).map(|c| c.to_vec()).collect()
+}
+
+/// Builds the `/api/v3/song/detail` `c` form parameter JSON array for one chunk of song IDs.
+pub fn build_song_detail_c_param(chunk_ids: &[i64]) -> String {
+    let mut out = String::with_capacity(chunk_ids.len() * 18 + 2);
+    out.push('[');
+    for (idx, &id) in chunk_ids.iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        out.push_str(r#"{"id":"#);
+        out.push_str(&id.to_string());
+        out.push('}');
+    }
+    out.push(']');
+    out
+}
+
+/// Parses tracks from a `/api/v3/song/detail` JSON response (never stamping a shared fallback cover).
+pub fn parse_song_detail_response(json: &Value) -> Vec<AgentTrackInput> {
+    json.get("songs")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(|v| parse_ne_song(v, None)).collect())
+        .unwrap_or_default()
+}
+
+/// Reorders a collection of parsed NetEase tracks to match `ordered_ids` exactly
+/// (deduplicating repeated IDs and keeping whichever duplicate carries valid artwork).
+pub fn order_tracks_by_ids(
+    ordered_ids: &[i64],
+    tracks: Vec<AgentTrackInput>,
+) -> Vec<AgentTrackInput> {
+    if ordered_ids.is_empty() {
+        return tracks;
+    }
+    let mut by_id: HashMap<i64, AgentTrackInput> = HashMap::with_capacity(tracks.len());
+    for tr in tracks {
+        let Some(id) = track_numeric_id(&tr) else {
+            continue;
+        };
+        match by_id.get(&id) {
+            Some(existing) if existing.artwork_url.is_some() || tr.artwork_url.is_none() => {}
+            _ => {
+                by_id.insert(id, tr);
+            }
+        }
+    }
+    let mut seen = HashSet::with_capacity(ordered_ids.len());
+    let mut out = Vec::with_capacity(ordered_ids.len().min(by_id.len()));
+    for &id in ordered_ids {
+        if seen.insert(id) {
+            if let Some(tr) = by_id.remove(&id) {
+                out.push(tr);
+            }
+        }
+    }
+    out
+}
+
+/// Computes which ordered playlist track IDs still need `/api/v3/song/detail` hydration:
+/// any ID absent from `inline_tracks` OR present inline without a valid album cover URL.
+pub fn compute_missing_playlist_track_ids(
+    ordered_ids: &[i64],
+    inline_tracks: &[AgentTrackInput],
+) -> Vec<i64> {
+    if ordered_ids.is_empty() {
+        return Vec::new();
+    }
+    let mut hydrated_with_art: HashSet<i64> = HashSet::with_capacity(inline_tracks.len());
+    for tr in inline_tracks {
+        if tr.artwork_url.is_some() {
+            if let Some(id) = track_numeric_id(tr) {
+                hydrated_with_art.insert(id);
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    let mut missing = Vec::new();
+    for &id in ordered_ids {
+        if id > 0 && !hydrated_with_art.contains(&id) && seen.insert(id) {
+            missing.push(id);
+        }
+    }
+    missing
+}
+
+/// Merges inline `playlist.tracks` with batch-hydrated `song/detail` tracks in exact `ordered_ids`
+/// order, preferring entries that have valid album cover artwork and gracefully preserving
+/// available tracks on partial batch failure.
+pub fn merge_playlist_tracks_in_order(
+    ordered_ids: &[i64],
+    inline_tracks: Vec<AgentTrackInput>,
+    fetched_tracks: Vec<AgentTrackInput>,
+) -> Vec<AgentTrackInput> {
+    if ordered_ids.is_empty() {
+        return if !inline_tracks.is_empty() {
+            inline_tracks
+        } else {
+            fetched_tracks
+        };
+    }
+    let mut by_id: HashMap<i64, AgentTrackInput> =
+        HashMap::with_capacity(inline_tracks.len() + fetched_tracks.len());
+    for tr in inline_tracks {
+        if let Some(id) = track_numeric_id(&tr) {
+            by_id.entry(id).or_insert(tr);
+        }
+    }
+    for tr in fetched_tracks {
+        let Some(id) = track_numeric_id(&tr) else {
+            continue;
+        };
+        match by_id.get(&id) {
+            Some(existing) if existing.artwork_url.is_some() => {}
+            Some(_) if tr.artwork_url.is_none() => {}
+            _ => {
+                by_id.insert(id, tr);
+            }
+        }
+    }
+    let mut seen = HashSet::with_capacity(ordered_ids.len());
+    let mut out = Vec::with_capacity(ordered_ids.len().min(by_id.len()));
+    for &id in ordered_ids {
+        if seen.insert(id) {
+            if let Some(tr) = by_id.remove(&id) {
+                out.push(tr);
+            }
+        }
+    }
+    out
+}
+
+async fn fetch_songs_detail_single_chunk(
+    chunk_ids: &[i64],
+    cookie: Option<&str>,
+) -> Result<Vec<AgentTrackInput>, String> {
+    if chunk_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let c_param = format!(
-        "[{}]",
-        ids.iter()
-            .take(120)
-            .map(|id| format!(r#"{{"id":{id}}}"#))
-            .collect::<Vec<_>>()
-            .join(",")
-    );
+    let c_param = build_song_detail_c_param(chunk_ids);
     let json = ne_post_form_json(
         "https://music.163.com/api/v3/song/detail",
         &[("c", c_param)],
         cookie,
     )
     .await?;
-    let mut out = Vec::new();
-    if let Some(arr) = json.get("songs").and_then(Value::as_array) {
-        for v in arr {
-            if let Some(tr) = parse_ne_song(v, None) {
-                out.push(tr);
+    let parsed = parse_song_detail_response(&json);
+    if parsed.is_empty() {
+        if let Some(code) = json.get("code").and_then(Value::as_i64) {
+            if code != 200 {
+                return Err(format!("网易云曲目详情接口返回异常 (code {code})"));
             }
         }
     }
-    Ok(out)
+    Ok(parsed)
+}
+
+async fn fetch_songs_detail_chunk_with_retry(
+    chunk_ids: &[i64],
+    cookie: Option<&str>,
+) -> Result<Vec<AgentTrackInput>, String> {
+    let first_err = match fetch_songs_detail_single_chunk(chunk_ids, cookie).await {
+        Ok(tracks) => return Ok(tracks),
+        Err(e) => e,
+    };
+    tokio::time::sleep(Duration::from_millis(180)).await;
+    if let Ok(tracks) = fetch_songs_detail_single_chunk(chunk_ids, cookie).await {
+        return Ok(tracks);
+    }
+    if chunk_ids.len() > NE_SONG_DETAIL_FALLBACK_CHUNK_SIZE {
+        let mut partial = Vec::new();
+        let mut sub_err: Option<String> = None;
+        for sub in chunk_ids.chunks(NE_SONG_DETAIL_FALLBACK_CHUNK_SIZE) {
+            match fetch_songs_detail_single_chunk(sub, cookie).await {
+                Ok(batch) => partial.extend(batch),
+                Err(e) => {
+                    if sub_err.is_none() {
+                        sub_err = Some(e);
+                    }
+                }
+            }
+        }
+        if !partial.is_empty() {
+            return Ok(partial);
+        }
+        if let Some(e) = sub_err {
+            return Err(e);
+        }
+    }
+    Err(first_err)
+}
+
+async fn enrich_tracks_missing_artwork(
+    tracks: Vec<AgentTrackInput>,
+    cookie: Option<&str>,
+) -> Vec<AgentTrackInput> {
+    let missing_ids: Vec<i64> = tracks
+        .iter()
+        .filter(|t| t.artwork_url.is_none())
+        .filter_map(track_numeric_id)
+        .collect();
+    if missing_ids.is_empty() {
+        return tracks;
+    }
+    let Ok(fetched) = fetch_songs_detail_batch(&missing_ids, cookie).await else {
+        return tracks;
+    };
+    let mut fetched_art: HashMap<i64, String> = HashMap::with_capacity(fetched.len());
+    for tr in fetched {
+        if let (Some(id), Some(art)) = (track_numeric_id(&tr), tr.artwork_url) {
+            fetched_art.insert(id, art);
+        }
+    }
+    tracks
+        .into_iter()
+        .map(|mut tr| {
+            if tr.artwork_url.is_none() {
+                if let Some(id) = track_numeric_id(&tr) {
+                    if let Some(art) = fetched_art.get(&id) {
+                        tr.artwork_url = Some(art.clone());
+                    }
+                }
+            }
+            tr
+        })
+        .collect()
+}
+
+pub async fn fetch_songs_detail_batch(
+    ids: &[i64],
+    cookie: Option<&str>,
+) -> Result<Vec<AgentTrackInput>, String> {
+    let chunks = plan_song_detail_chunks(ids, NE_SONG_DETAIL_CHUNK_SIZE, NE_PLAYLIST_MAX_TRACKS);
+    if chunks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ordered_ids: Vec<i64> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
+    if chunks.len() == 1 {
+        let tracks = fetch_songs_detail_chunk_with_retry(&chunks[0], cookie).await?;
+        return Ok(order_tracks_by_ids(&ordered_ids, tracks));
+    }
+
+    let cookie_owned = cookie.map(|s| s.to_string());
+    let mut collected = Vec::with_capacity(ordered_ids.len());
+    let mut first_err: Option<String> = None;
+
+    for wave in chunks.chunks(NE_SONG_DETAIL_CONCURRENCY) {
+        let mut handles = Vec::with_capacity(wave.len());
+        for chunk in wave {
+            let chunk_ids = chunk.clone();
+            let ck = cookie_owned.clone();
+            handles.push(tokio::spawn(async move {
+                fetch_songs_detail_chunk_with_retry(&chunk_ids, ck.as_deref()).await
+            }));
+        }
+        for handle in handles {
+            match handle.await {
+                Ok(Ok(batch)) => collected.extend(batch),
+                Ok(Err(e)) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(format!("网易云曲目详情并发任务失败: {e}"));
+                    }
+                }
+            }
+        }
+    }
+
+    if collected.is_empty() {
+        if let Some(err) = first_err {
+            return Err(err);
+        }
+    }
+    Ok(order_tracks_by_ids(&ordered_ids, collected))
 }
 
 pub async fn fetch_user_playlists(uid: u64, cookie: &str) -> Result<Vec<NetEaseCard>, String> {
     if uid == 0 || cookie.trim().is_empty() {
         return Ok(Vec::new());
     }
-    let url = format!("https://music.163.com/api/user/playlist?uid={uid}&limit=32&offset=0");
-    let json = ne_get_json(&url, Some(cookie)).await?;
     let mut out = Vec::new();
-    if let Some(arr) = json.get("playlist").and_then(Value::as_array) {
+    let mut seen = HashSet::new();
+    let mut offset = 0usize;
+    for _page in 0..20 {
+        let url = format!("https://music.163.com/api/user/playlist?uid={uid}&limit=100&offset={offset}");
+        let json = match ne_get_json(&url, Some(cookie)).await {
+            Ok(j) => j,
+            Err(e) if out.is_empty() => return Err(e),
+            Err(_) => break,
+        };
+        let Some(arr) = json.get("playlist").and_then(Value::as_array) else {
+            break;
+        };
+        if arr.is_empty() {
+            break;
+        }
+        let batch_len = arr.len();
         for item in arr {
             let Some(id) = item.get("id").and_then(Value::as_i64) else { continue };
+            if !seen.insert(id) {
+                continue;
+            }
             let title = item.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
             let cnt = item.get("trackCount").and_then(Value::as_u64).unwrap_or(0);
             let art = upgrade_https_cover(
@@ -1132,6 +1622,11 @@ pub async fn fetch_user_playlists(uid: u64, cookie: &str) -> Result<Vec<NetEaseC
                 track_input: None,
             });
         }
+        let more = json.get("more").and_then(Value::as_bool).unwrap_or(false);
+        if !more || batch_len < 100 {
+            break;
+        }
+        offset += batch_len;
     }
     Ok(out)
 }
@@ -1203,7 +1698,8 @@ pub async fn fetch_container_detail(
             .get("picUrl")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
-            .map(|u| upgrade_https_cover(u, 600));
+            .map(|u| upgrade_https_cover(u, 600))
+            .filter(|s| !s.is_empty());
         let tracks = json
             .get("songs")
             .and_then(Value::as_array)
@@ -1249,16 +1745,18 @@ pub async fn fetch_container_detail(
             .or_else(|| artist.get("img1v1Url"))
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
-            .map(|u| upgrade_https_cover(u, 600));
+            .map(|u| upgrade_https_cover(u, 600))
+            .filter(|s| !s.is_empty());
         let tracks: Vec<AgentTrackInput> = json
             .get("hotSongs")
             .and_then(Value::as_array)
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|v| parse_ne_song(v, artwork_url.as_deref()))
+                    .filter_map(|v| parse_ne_song(v, None))
                     .collect()
             })
             .unwrap_or_default();
+        let tracks = enrich_tracks_missing_artwork(tracks, cookie).await;
         let mut related_albums = Vec::new();
         if let Ok(aj) = albums_res {
             if let Some(arr) = aj.get("hotAlbums").and_then(Value::as_array) {
@@ -1275,7 +1773,8 @@ pub async fn fetch_container_detail(
                         .get("picUrl")
                         .and_then(Value::as_str)
                         .filter(|s| !s.is_empty())
-                        .map(|u| upgrade_https_cover(u, 360));
+                        .map(|u| upgrade_https_cover(u, 360))
+                        .filter(|s| !s.is_empty());
                     let sz = a.get("size").and_then(Value::as_u64).unwrap_or(0);
                     related_albums.push(NetEaseCard {
                         id: aid.to_string(),
@@ -1303,10 +1802,13 @@ pub async fn fetch_container_detail(
     }
 
     // Default: ne-playlist / toplist
-    let url = format!("https://music.163.com/api/v6/playlist/detail?id={id}&n=200");
+    let url = format!(
+        "https://music.163.com/api/v6/playlist/detail?id={id}&n={NE_PLAYLIST_INLINE_N}&s=0"
+    );
     let json = ne_get_json(&url, cookie).await?;
     let pl = json
         .get("playlist")
+        .filter(|v| v.is_object())
         .ok_or_else(|| "未能加载网易云歌单详情".to_string())?;
     let title = pl
         .get("name")
@@ -1326,33 +1828,28 @@ pub async fn fetch_container_detail(
         .get("coverImgUrl")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
-        .map(|u| upgrade_https_cover(u, 600));
+        .map(|u| upgrade_https_cover(u, 600))
+        .filter(|s| !s.is_empty());
 
-    let mut tracks: Vec<AgentTrackInput> = pl
+    // Never stamp the playlist's coverImgUrl onto individual tracks — each track must carry its own album cover.
+    let inline_tracks: Vec<AgentTrackInput> = pl
         .get("tracks")
         .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| parse_ne_song(v, artwork_url.as_deref()))
-                .collect()
-        })
+        .map(|arr| arr.iter().filter_map(|v| parse_ne_song(v, None)).collect())
         .unwrap_or_default();
 
-    // If playlist has more trackIds than returned in `tracks`, fetch up to 100 tracks via batch detail!
-    if let Some(tids) = pl.get("trackIds").and_then(Value::as_array) {
-        if tids.len() > tracks.len() && tracks.len() < 80 {
-            let ids: Vec<i64> = tids
-                .iter()
-                .filter_map(|v| v.get("id").and_then(Value::as_i64))
-                .take(100)
-                .collect();
-            if let Ok(full) = fetch_songs_detail_batch(&ids, cookie).await {
-                if full.len() > tracks.len() {
-                    tracks = full;
-                }
-            }
+    let ordered_ids = extract_playlist_track_ids(pl, NE_PLAYLIST_MAX_TRACKS);
+    let missing_ids = compute_missing_playlist_track_ids(&ordered_ids, &inline_tracks);
+    let fetched_tracks = if !missing_ids.is_empty() {
+        match fetch_songs_detail_batch(&missing_ids, cookie).await {
+            Ok(batch) => batch,
+            Err(e) if inline_tracks.is_empty() => return Err(e),
+            Err(_) => Vec::new(),
         }
-    }
+    } else {
+        Vec::new()
+    };
+    let tracks = merge_playlist_tracks_in_order(&ordered_ids, inline_tracks, fetched_tracks);
 
     Ok(NetEaseDetail {
         id: id.to_string(),
@@ -1490,35 +1987,63 @@ pub async fn add_tracks_to_playlist(
     if cookie.trim().is_empty() {
         return Err("收藏歌曲到网易云歌单需要先登录网易云账号".to_string());
     }
+    let mut seen = HashSet::new();
     let clean_ids: Vec<String> = song_ids
         .iter()
         .map(|s| strip_ne_id(s))
         .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+        .filter(|s| seen.insert(s.clone()))
         .collect();
     if clean_ids.is_empty() {
         return Err("没有有效的网易云歌曲 ID".to_string());
     }
-    for chunk in clean_ids.chunks(50) {
+    for (idx, chunk) in clean_ids.chunks(50).enumerate() {
+        if idx > 0 {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+        }
         let arr_str = format!("[{}]", chunk.join(","));
-        let json = ne_post_form_json(
-            "https://music.163.com/api/playlist/tracks",
-            &[
-                ("op", "add".to_string()),
-                ("pid", playlist_id.trim().to_string()),
-                ("trackIds", arr_str),
-                ("imme", "true".to_string()),
-            ],
-            Some(cookie),
-        )
-        .await?;
-        let code = json.get("code").and_then(Value::as_i64).unwrap_or(-1);
-        if code != 200 && code != 502 {
-            let msg = json
-                .get("message")
-                .or_else(|| json.get("msg"))
-                .and_then(Value::as_str)
-                .unwrap_or("写入歌单曲目失败");
-            return Err(format!("网易云写入歌单失败 ({code}): {msg}"));
+        let mut last_err: Option<String> = None;
+        let mut ok = false;
+        for attempt in 0..2 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+            match ne_post_form_json(
+                "https://music.163.com/api/playlist/tracks",
+                &[
+                    ("op", "add".to_string()),
+                    ("pid", playlist_id.trim().to_string()),
+                    ("trackIds", arr_str.clone()),
+                    ("imme", "true".to_string()),
+                ],
+                Some(cookie),
+            )
+            .await
+            {
+                Ok(json) => {
+                    let code = json
+                        .get("code")
+                        .or_else(|| json.pointer("/body/code"))
+                        .and_then(Value::as_i64)
+                        .unwrap_or(-1);
+                    if code == 200 || code == 502 {
+                        ok = true;
+                        break;
+                    }
+                    let msg = json
+                        .get("message")
+                        .or_else(|| json.get("msg"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("写入歌单曲目失败");
+                    last_err = Some(format!("网易云写入歌单失败 ({code}): {msg}"));
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                }
+            }
+        }
+        if !ok {
+            return Err(last_err.unwrap_or_else(|| "网易云写入歌单失败".to_string()));
         }
     }
     Ok(())

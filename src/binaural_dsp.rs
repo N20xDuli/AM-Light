@@ -672,39 +672,76 @@ pub fn refresh_binaural_can_enable() -> bool {
     can_enable
 }
 
-fn restore_marker_path() -> Option<std::path::PathBuf> {
-    let local_app_data = std::env::var("LOCALAPPDATA").ok()?;
-    let dir = std::path::PathBuf::from(local_app_data).join("com.local.amlight");
-    let _ = std::fs::create_dir_all(&dir);
-    Some(dir.join("binaural_restore_device.txt"))
+pub fn restore_marker_path_in_base(local_app_data: &std::path::Path) -> std::path::PathBuf {
+    local_app_data
+        .join("AMLight")
+        .join("binaural_restore_device.txt")
+}
+
+pub fn legacy_restore_marker_path_in_base(local_app_data: &std::path::Path) -> std::path::PathBuf {
+    local_app_data
+        .join("com.local.amlight")
+        .join("binaural_restore_device.txt")
+}
+
+pub fn save_restore_marker_in_base(local_app_data: &std::path::Path, orig_device_id: &str) {
+    let trimmed = orig_device_id.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let p = restore_marker_path_in_base(local_app_data);
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&p, trimmed.as_bytes());
+    let legacy = legacy_restore_marker_path_in_base(local_app_data);
+    if legacy.exists() {
+        let _ = std::fs::remove_file(&legacy);
+    }
+}
+
+/// Reads and consumes any stale Binaural restore marker from the canonical `%LOCALAPPDATA%\AMLight\`
+/// path first, falling back to legacy `%LOCALAPPDATA%\com.local.amlight\` for seamless migration.
+pub fn pop_restore_marker_in_base(local_app_data: &std::path::Path) -> Option<String> {
+    let primary = restore_marker_path_in_base(local_app_data);
+    let legacy = legacy_restore_marker_path_in_base(local_app_data);
+    let mut restored: Option<String> = None;
+    for path in [&primary, &legacy] {
+        if let Ok(saved_id) = std::fs::read_to_string(path) {
+            let trimmed = saved_id.trim();
+            if restored.is_none() && !trimmed.is_empty() {
+                restored = Some(trimmed.to_string());
+            }
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    restored
+}
+
+fn local_app_data_root() -> Option<std::path::PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from)
 }
 
 fn save_restore_marker(orig_device_id: &str) {
-    if orig_device_id.trim().is_empty() {
-        return;
-    }
-    if let Some(p) = restore_marker_path() {
-        let _ = std::fs::write(p, orig_device_id.trim().as_bytes());
+    if let Some(base) = local_app_data_root() {
+        save_restore_marker_in_base(&base, orig_device_id);
     }
 }
 
 fn clear_restore_marker() {
-    if let Some(p) = restore_marker_path() {
-        let _ = std::fs::remove_file(p);
+    if let Some(base) = local_app_data_root() {
+        let _ = std::fs::remove_file(restore_marker_path_in_base(&base));
+        let _ = std::fs::remove_file(legacy_restore_marker_path_in_base(&base));
     }
 }
 
 /// Restores the user's physical audio device if a previous session terminated while Binaural routing was active.
 pub fn restore_stale_routing_on_startup() {
-    let Some(p) = restore_marker_path() else {
+    let Some(base) = local_app_data_root() else {
         return;
     };
-    if let Ok(saved_id) = std::fs::read_to_string(&p) {
-        let trimmed = saved_id.trim();
-        if !trimmed.is_empty() {
-            let _ = crate::audio_viz::set_output_device(trimmed);
-        }
-        let _ = std::fs::remove_file(&p);
+    if let Some(saved_id) = pop_restore_marker_in_base(&base) {
+        let _ = crate::audio_viz::set_output_device(&saved_id);
     }
 }
 
@@ -1070,6 +1107,7 @@ mod win {
     #[link(name = "ole32")]
     extern "system" {
         fn CoInitializeEx(pv_reserved: *mut c_void, dw_coinit: u32) -> HRESULT;
+        fn CoUninitialize();
         fn CoCreateInstance(
             rclsid: *const GUID,
             p_unk_outer: *mut c_void,
@@ -1078,6 +1116,15 @@ mod win {
             ppv: *mut *mut c_void,
         ) -> HRESULT;
         fn CoTaskMemFree(pv: *mut c_void);
+    }
+
+    struct ComGuard(bool);
+    impl Drop for ComGuard {
+        fn drop(&mut self) {
+            if self.0 {
+                unsafe { CoUninitialize() };
+            }
+        }
     }
 
     unsafe fn release_com(unk: *mut c_void) {
@@ -1718,7 +1765,7 @@ mod win {
         let jh = std::thread::Builder::new()
             .name("am-binaural-renderer".to_string())
             .spawn(move || unsafe {
-                let _ = CoInitializeEx(null_mut(), 0);
+                let _com_guard = ComGuard(CoInitializeEx(null_mut(), 0) >= 0);
                 let _ = crate::am_agent::init_process_com_security();
                 let keeper = SilentClockKeeper::open(&cap_id_thread);
                 let cap = match WasapiCaptureEndpoint::open_loopback(&cap_id_thread) {
